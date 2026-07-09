@@ -1,0 +1,94 @@
+config:
+  # The bind address to listen for Minecraft client connections.
+  bind: 0.0.0.0:25565
+
+  # Read-only JSON/HTTP status API (routes, backends, live connection/latency stats).
+  # Disabled by default - only bind it to a trusted interface.
+  api:
+    enabled: false
+    bind: localhost:8080
+
+  routes:
+    # Simple 1:1 host -> backend mapping.
+    - host: survival.example.com
+      backend: 127.0.0.1:25566
+
+    # Multiple hostnames routed to the same backend.
+    - host: [creative.example.com, creative-alt.example.com]
+      backend: 127.0.0.1:25567
+
+    # Wildcard subdomain routing with parameter substitution:
+    # abc.wildcard.example.com -> abc.servers.svc:25568
+    - host: "*.wildcard.example.com"
+      backend: "$1.servers.svc:25568"
+
+    # Multiple backends with a load balancing strategy.
+    # Options: sequential (default), random, round-robin, least-connections, lowest-latency
+    - host: lobby.example.com
+      backend: [127.0.0.1:25569, 127.0.0.1:25570, 127.0.0.1:25571]
+      strategy: round-robin
+      # How long to cache a backend's status/ping response. Default: 10s. Use -1s to disable.
+      cachePingTTL: 60s
+
+    # Fallback status response served when all backends of this route are offline.
+    - host: localhost
+      backend: 127.0.0.1:25572
+      fallback:
+        motd: |
+          Server is offline.
+          Check back later!
+        version:
+          name: "Try again later!"
+          protocol: -1
+
+    # Holding room shown to 1.20.2+ clients while all backends are offline, instead of a fallback
+    # status/kick: the player is spawned into a small waiting world and transparently moved onto
+    # the real backend once it's reachable again, no reconnect needed. Older clients still just
+    # get a kick with `kickMessage`. Disabled by default.
+    - host: limbo.example.com
+      backend: 127.0.0.1:25574
+      limbo:
+        enabled: true
+        # Also send players to limbo if this backend drops mid-session, not just on initial
+        # connect. Defaults to the same value as `enabled`.
+        onMidSessionDrop: true
+        # Backoff for backend reconnect attempts while in limbo.
+        retryInterval: 5s
+        maxRetryInterval: 30s
+        backoffMultiplier: 2.0
+        # How long to hold a player in limbo before giving up and kicking them. 0 = unlimited.
+        maxWait: 0s
+        motd: "&eServer is currently offline."
+        subtitle: "&7Waiting to reconnect..."
+        kickMessage: "&cServer is offline. Please reconnect shortly."
+
+    # Rewrites the handshake's virtual host to match the backend address,
+    # useful when backends require a specific domain to accept connections.
+    - host: rewrite.example.com
+      backend: play.example.com:25565
+      modifyVirtualHost: true
+
+    # Sends the PROXY protocol (HAProxy v1) header to the backend so it can
+    # see the real client IP. The backend must also be configured to accept it.
+    - host: behind-proxy.example.com
+      backend: 10.0.0.3:25566
+      proxyProtocol: true
+
+    # Higher priority routes are matched before lower ones, regardless of
+    # their order in this file. Default priority is 0; ties keep file order.
+    # Useful for making a specific host win over an overlapping wildcard.
+    - host: "vip.wildcard.example.com"
+      backend: 127.0.0.1:25573
+      priority: 10
+
+    # Catch-all: routes anything not matched above and shows a fallback
+    # status when the backend is unreachable. Kept at a low priority so
+    # more specific routes above always get first pick.
+    - host: "*"
+      backend: 127.0.0.1:25565
+      priority: -10
+      fallback:
+        motd: No server available for this host.
+        version:
+          name: "Try example.com"
+          protocol: -1

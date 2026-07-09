@@ -1,0 +1,108 @@
+# MCGate
+
+A Java/Kotlin thin, host-based reverse proxy for Minecraft servers. It routes client connections to backend servers by the hostname the client dialed, without acting as a full proxy - no session handling, no server switching, just fast connection forwarding.
+
+## Features
+
+- **Host-based routing** with `*` / `?` wildcards and `$1`, `$2`, ... parameter substitution in backend addresses
+- **Per-route `priority`** - higher priority routes are matched before lower ones, regardless of file order (default `0`, ties keep file order)
+- **Multiple backends per route** with load balancing strategies: `sequential`, `random`, `round-robin`, `least-connections`, `lowest-latency`, plus automatic failover on connect failure
+- **Status ping caching** per backend, with a configurable `cachePingTTL` (or `-1s` to disable)
+- **Fallback status response** (motd/version/players/favicon) when all of a route's backends are down
+- **`modifyVirtualHost`** - rewrites the handshake hostname before forwarding to the backend
+- **Per-route `proxyProtocol`** - sends a PROXY protocol v1 header so the backend sees the real client IP
+- **Hot config reload** - edits to the config file are picked up live, no restart needed (except for the `bind` address)
+- **Bootstraps a default config** on first run if none exists
+
+## Build
+
+Requires JDK 17+ and Maven.
+
+```
+mvn package -DskipTests
+```
+
+Produces `target/MCGate-1.0-SNAPSHOT.jar`.
+
+## Run
+
+```
+java -jar target/MCGate-1.0-SNAPSHOT.jar [path/to/config.yml]
+```
+
+If the config path doesn't exist yet, it's created from a bundled example covering every feature. Defaults to `config.yml` in the working directory.
+
+## Configuration
+
+```yaml
+config:
+  bind: 0.0.0.0:25565
+  routes:
+    - host: survival.example.com
+      backend: 127.0.0.1:25566
+
+    - host: "*.wildcard.example.com"
+      backend: "$1.servers.svc:25568"
+
+    - host: vip.wildcard.example.com
+      backend: 127.0.0.1:25573
+      priority: 10
+
+    - host: lobby.example.com
+      backend: [127.0.0.1:25569, 127.0.0.1:25570]
+      strategy: round-robin
+      cachePingTTL: 60s
+
+    - host: localhost
+      backend: 127.0.0.1:25572
+      fallback:
+        motd: Server is offline.
+        version:
+          name: "Try again later!"
+          protocol: -1
+```
+
+Routes are matched in descending `priority` order (ties keep the order they appear in the file), so a specific host like `vip.wildcard.example.com` can win over an overlapping wildcard such as `*.wildcard.example.com` even though the wildcard is listed first.
+
+See `src/main/resources/default-config.yml` for a complete annotated example.
+
+## API
+
+MCGate can expose a small read-only JSON/HTTP status API. Disabled by default:
+
+```yaml
+config:
+  api:
+    enabled: false
+    bind: localhost:8080
+```
+
+Endpoints (all `GET`):
+
+| Path | Description |
+| --- | --- |
+| `/v1/routes` | All routes: hosts, backend templates, strategy, TTL, flags |
+| `/v1/routes/{index}` | A single route by its index in the config |
+| `/v1/routes/{index}/backends` | Last-known per-backend stats (active connections, latency) for non-wildcard routes |
+| `/v1/routes/{index}/ping` | Dials each backend of the route **right now** (bypassing the ping cache) and returns live online status, latency, and the raw status JSON, or an error per backend that's unreachable |
+
+The API only binds when `enabled: true`; bind it to `localhost` or a private interface unless it's behind your own auth/network controls.
+
+## Project layout
+
+```
+src/main/kotlin/me/hippodev/
+  Main.kt               - bootstrap, config hot-reload wiring, connection dispatch
+  ConfigLoader.kt        - default-config bootstrapping + file watcher
+  Config.kt               - YAML config model and parsing
+  HostPattern.kt          - wildcard host matching and $N substitution
+  BackendSelector.kt      - load balancing strategies and per-route runtime state
+  HandshakeSniffer.kt     - reads just enough of the handshake packet to route
+  LoginRelayHandler.kt    - raw TCP relay for real (login) connections
+  StatusHandler.kt        - status ping handling, caching, fallback
+  PingCache.kt            - TTL cache for backend status responses
+  StatusJson.kt           - fallback status JSON building
+  MinecraftProtocol.kt    - varint/string/packet encode-decode helpers
+src/main/resources/
+  default-config.yml      - bundled example config, copied on first run
+```
