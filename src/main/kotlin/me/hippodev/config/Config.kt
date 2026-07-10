@@ -36,19 +36,23 @@ data class FallbackStatus(
 )
 
 /**
- * Holding-room behavior for when a route's backends are all unreachable. Only supported for
- * clients on protocol versions covered by [me.hippodev.protocol.LimboProtocol] (currently just
- * the latest bracket - see that file); other clients always get the plain [kickMessage] disconnect.
+ * Auto-reconnect behavior for when a route's backends are all unreachable - keeps the player
+ * connected to MCGate itself (no separate holding server needed) and transfers them onto the real
+ * backend once it's reachable again. Only supported for clients on protocol versions covered by
+ * [me.hippodev.protocol.ReconnectProtocol] (currently just the latest bracket - see that file);
+ * other clients always get the plain [kickMessage] disconnect.
  */
-data class LimboConfig(
+data class ReconnectConfig(
     val enabled: Boolean = false,
     val onMidSessionDrop: Boolean = enabled,
     val retryIntervalMillis: Long = 5000,
     val maxRetryIntervalMillis: Long = 30000,
     val backoffMultiplier: Double = 2.0,
     val maxWaitMillis: Long = 0, // 0 = unlimited
-    val motd: String = "&eServer is currently offline.",
+    val title: String = "&eServer is currently offline.",
     val subtitle: String = "&7Waiting to reconnect...",
+    val actionBarFrames: List<String> = listOf("&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."),
+    val animationIntervalMillis: Long = 500,
     val kickMessage: String = "&cServer is offline. Please reconnect shortly."
 )
 
@@ -61,7 +65,7 @@ data class Route(
     val modifyVirtualHost: Boolean,
     val proxyProtocol: Boolean,
     val priority: Int,
-    val limbo: LimboConfig
+    val reconnect: ReconnectConfig
 ) {
     /** Returns the wildcard captures of the first matching host pattern, or null if none match. */
     fun match(hostname: String): List<String>? {
@@ -146,7 +150,7 @@ data class GateConfig(
             val modifyVirtualHost = r["modifyVirtualHost"] as? Boolean ?: false
             val proxyProtocol = r["proxyProtocol"] as? Boolean ?: false
             val priority = r["priority"] as? Int ?: 0
-            val limbo = parseLimbo(r["limbo"] as? Map<String, Any>)
+            val reconnect = parseReconnect(r["reconnect"] as? Map<String, Any>)
 
             return Route(
                 hostPatterns = hostPatterns,
@@ -157,24 +161,28 @@ data class GateConfig(
                 modifyVirtualHost = modifyVirtualHost,
                 proxyProtocol = proxyProtocol,
                 priority = priority,
-                limbo = limbo
+                reconnect = reconnect
             )
         }
 
-        private fun parseLimbo(l: Map<String, Any>?): LimboConfig {
-            val defaults = LimboConfig()
-            if (l == null) return defaults
-            val enabled = l["enabled"] as? Boolean ?: defaults.enabled
-            return LimboConfig(
+        @Suppress("UNCHECKED_CAST")
+        private fun parseReconnect(r: Map<String, Any>?): ReconnectConfig {
+            val defaults = ReconnectConfig()
+            if (r == null) return defaults
+            val enabled = r["enabled"] as? Boolean ?: defaults.enabled
+            val frames = (r["actionBarFrames"] as? List<*>)?.map { it.toString() }
+            return ReconnectConfig(
                 enabled = enabled,
-                onMidSessionDrop = l["onMidSessionDrop"] as? Boolean ?: enabled,
-                retryIntervalMillis = (l["retryInterval"] as? String)?.let { parseDuration(it) } ?: defaults.retryIntervalMillis,
-                maxRetryIntervalMillis = (l["maxRetryInterval"] as? String)?.let { parseDuration(it) } ?: defaults.maxRetryIntervalMillis,
-                backoffMultiplier = (l["backoffMultiplier"] as? Number)?.toDouble() ?: defaults.backoffMultiplier,
-                maxWaitMillis = (l["maxWait"] as? String)?.let { parseDuration(it) } ?: defaults.maxWaitMillis,
-                motd = l["motd"] as? String ?: defaults.motd,
-                subtitle = l["subtitle"] as? String ?: defaults.subtitle,
-                kickMessage = l["kickMessage"] as? String ?: defaults.kickMessage
+                onMidSessionDrop = r["onMidSessionDrop"] as? Boolean ?: enabled,
+                retryIntervalMillis = (r["retryInterval"] as? String)?.let { parseDuration(it) } ?: defaults.retryIntervalMillis,
+                maxRetryIntervalMillis = (r["maxRetryInterval"] as? String)?.let { parseDuration(it) } ?: defaults.maxRetryIntervalMillis,
+                backoffMultiplier = (r["backoffMultiplier"] as? Number)?.toDouble() ?: defaults.backoffMultiplier,
+                maxWaitMillis = (r["maxWait"] as? String)?.let { parseDuration(it) } ?: defaults.maxWaitMillis,
+                title = r["title"] as? String ?: defaults.title,
+                subtitle = r["subtitle"] as? String ?: defaults.subtitle,
+                actionBarFrames = frames ?: defaults.actionBarFrames,
+                animationIntervalMillis = (r["animationInterval"] as? String)?.let { parseDuration(it) } ?: defaults.animationIntervalMillis,
+                kickMessage = r["kickMessage"] as? String ?: defaults.kickMessage
             )
         }
 

@@ -46,20 +46,22 @@ class LoginRelayHandler(
     private var awaitedLoginStart = false
     /** Compression threshold the *backend* negotiated with the client during login (-1 = none),
      *  captured by [BackendLoginSniffer] since MCGate's relay is otherwise byte-blind. Needed so
-     *  [LimboHandler] can frame the packets it synthesizes to match what the client's decoder is
-     *  already expecting if a mid-session drop sends the player to limbo. */
+     *  [ReconnectHandler] can frame the packets it synthesizes to match what the client's decoder
+     *  is already expecting if a mid-session drop puts the player into the reconnect wait. */
     private var compressionThreshold = -1
     /** True once the backend sent a Login-state Encryption Request (online-mode). From that
      *  point on the client and backend share an AES key MCGate never sees - the connection is a
      *  pure ciphertext pipe, and MCGate cannot inject any packet of its own into it without
-     *  desyncing the client's stream cipher. Mid-session limbo is impossible on such a
+     *  desyncing the client's stream cipher. Mid-session auto-reconnect is impossible on such a
      *  connection; see [handleBackendDrop]. */
     private var encrypted = false
+    private var clientRemoteAddress: String = "?"
 
     /** Must be called explicitly right after this handler is added to the pipeline -
      *  channelActive() will not fire since the channel is already active by then. */
     fun start(ctx: ChannelHandlerContext) {
         ctx.channel().config().isAutoRead = false
+        clientRemoteAddress = ctx.channel().remoteAddress()?.toString() ?: "?"
         connect(ctx, orderBackends(route, runtime, backends), 0)
     }
 
@@ -86,8 +88,8 @@ class LoginRelayHandler(
             // Login Start sniffing (channelRead) races with backend dialing; a fast "connection
             // refused" can resolve before the client's Login Start bytes have been read and
             // parsed. Give it one short grace period before falling back to a plain kick, since
-            // limbo needs the name/UUID it carries.
-            if (route.limbo.enabled && limboSupports(protocolVersion) && playerName == null && !awaitedLoginStart) {
+            // auto-reconnect needs the name/UUID it carries.
+            if (route.reconnect.enabled && reconnectSupported(protocolVersion) && playerName == null && !awaitedLoginStart) {
                 awaitedLoginStart = true
                 ctx.channel().eventLoop().schedule({ connect(ctx, ordered, attempt) }, 150, java.util.concurrent.TimeUnit.MILLISECONDS)
                 return
@@ -99,14 +101,15 @@ class LoginRelayHandler(
 
             val name = playerName
             val uuid = playerUuid
-            if (route.limbo.enabled && limboSupports(protocolVersion) && name != null && uuid != null) {
-                log.info("All backends unreachable for host '{}', sending '{}' to limbo", host, name)
-                val limboHandler = LimboHandler(route, runtime, backends, protocolVersion, host, port, name, uuid)
-                ctx.pipeline().replace(this, "limbo", limboHandler)
-                limboHandler.enter(ctx.pipeline().context(limboHandler))
+            if (route.reconnect.enabled && reconnectSupported(protocolVersion) && name != null && uuid != null) {
+                log.info("All backends unreachable for host '{}', holding '{}' for reconnect", host, name)
+                PlayerSessions.put(PlayerSession(name, uuid, host, clientRemoteAddress, null, System.currentTimeMillis()))
+                val reconnectHandler = ReconnectHandler(route, runtime, backends, protocolVersion, host, port, name, uuid)
+                ctx.pipeline().replace(this, "reconnect", reconnectHandler)
+                reconnectHandler.enter(ctx.pipeline().context(reconnectHandler))
             } else {
                 log.warn("All backends unreachable for host '{}', kicking client", host)
-                ctx.writeAndFlush(encodeLoginDisconnect(route.limbo.kickMessage)).addListener(ChannelFutureListener.CLOSE)
+                ctx.writeAndFlush(encodeLoginDisconnect(route.reconnect.kickMessage)).addListener(ChannelFutureListener.CLOSE)
             }
             return
         }
@@ -165,6 +168,7 @@ class LoginRelayHandler(
 
     override fun channelInactive(ctx: ChannelHandlerContext) {
         backendAddr?.let { logDisconnect(ctx.channel().remoteAddress(), it) }
+        playerUuid?.let { PlayerSessions.remove(it) }
         closeOnFlush(backendChannel)
     }
 
@@ -173,33 +177,44 @@ class LoginRelayHandler(
         closeOnFlush(ctx.channel())
     }
 
-    /** Called when a backend the client was already relaying to goes away mid-session. Sends the
-     *  client into limbo (matching whatever compression [BackendLoginSniffer] observed the
-     *  backend negotiate) if the route opts in via `limbo.onMidSessionDrop`; otherwise just
+    /** Called when a backend the client was already relaying to goes away mid-session. Holds the
+     *  client for reconnect (matching whatever compression [BackendLoginSniffer] observed the
+     *  backend negotiate) if the route opts in via `reconnect.onMidSessionDrop`; otherwise just
      *  closes the client connection like before this feature existed. */
     private fun handleBackendDrop(clientChannel: Channel) {
         val name = playerName
         val uuid = playerUuid
-        if (route.limbo.enabled && route.limbo.onMidSessionDrop && limboSupports(protocolVersion) &&
+        if (route.reconnect.enabled && route.reconnect.onMidSessionDrop && reconnectSupported(protocolVersion) &&
             !encrypted && name != null && uuid != null && clientChannel.isActive
         ) {
-            log.info("Backend dropped for '{}' ({}) on '{}', sending to limbo", name, uuid, host)
-            val limboHandler = LimboHandler(
+            log.info("Backend dropped for '{}' ({}) on '{}', holding for reconnect", name, uuid, host)
+            val existing = PlayerSessions.get(uuid)
+            PlayerSessions.put(
+                PlayerSession(name, uuid, host, existing?.remoteAddress ?: clientRemoteAddress, null, existing?.connectedAt ?: connectedAt)
+            )
+            val reconnectHandler = ReconnectHandler(
                 route, runtime, backends, protocolVersion, host, port, name, uuid, compressionThreshold
             )
-            clientChannel.pipeline().replace("relay", "limbo", limboHandler)
-            limboHandler.enterFromPlay(clientChannel.pipeline().context(limboHandler))
+            clientChannel.pipeline().replace("relay", "reconnect", reconnectHandler)
+            reconnectHandler.enterFromPlay(clientChannel.pipeline().context(reconnectHandler))
         } else {
+            log.info(
+                "Backend dropped for '{}' on '{}' but not holding for reconnect (enabled={}, onMidSessionDrop={}, " +
+                    "protocolVersion={}, reconnectSupported={}, encrypted={}, name={}, uuid={})",
+                name, host, route.reconnect.enabled, route.reconnect.onMidSessionDrop, protocolVersion,
+                reconnectSupported(protocolVersion), encrypted, name, uuid
+            )
+            uuid?.let { PlayerSessions.remove(it) }
             closeOnFlush(clientChannel)
         }
     }
 
     /** Installed on the backend channel during the original login. MCGate's relay is otherwise
      *  byte-blind, but needs to know if the backend enabled packet compression (via the Login
-     *  state's Set Compression packet, id 0x03 - stable since 1.8) so a later mid-session limbo
-     *  entry can frame its own synthesized packets the way the client's decoder now expects.
-     *  Forwards every frame to the client unchanged; once Login Success (id 0x02) goes by, login
-     *  is over and this swaps itself out for a dumb raw pipe. */
+     *  state's Set Compression packet, id 0x03 - stable since 1.8) so a later mid-session
+     *  reconnect entry can frame its own synthesized packets the way the client's decoder now
+     *  expects. Forwards every frame to the client unchanged; once Login Success (id 0x02) goes
+     *  by, login is over and this swaps itself out for a dumb raw pipe. */
     private inner class BackendLoginSniffer(private val clientChannel: Channel) : ByteToMessageDecoder() {
         override fun decode(ctx: ChannelHandlerContext, buf: ByteBuf, out: MutableList<Any>) {
             val frameStart = buf.readerIndex()
@@ -235,7 +250,7 @@ class LoginRelayHandler(
                 // onward is AES-encrypted ciphertext, which this decoder cannot parse - and which
                 // MCGate could never safely inject synthesized packets into anyway (it would
                 // desync the client's stream cipher). Stop trying to parse and mark the
-                // connection as ineligible for mid-session limbo (see handleBackendDrop).
+                // connection as ineligible for mid-session auto-reconnect (see handleBackendDrop).
                 encrypted = true
                 ctx.pipeline().replace(this, "relay", PlainBackendRelay(clientChannel))
             } else if (packetId == 0x02) {
@@ -277,6 +292,7 @@ class LoginRelayHandler(
         if (!loginLogged) {
             loginLogged = true
             log.info("Login: '{}'{} on '{}' -> {}", name, playerUuid?.let { " ($it)" } ?: "", host, addr)
+            playerUuid?.let { PlayerSessions.put(PlayerSession(name, it, host, clientRemoteAddress, addr, connectedAt)) }
         }
     }
 

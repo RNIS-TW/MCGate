@@ -8,7 +8,7 @@ class IncompleteVarIntException : Exception()
 
 /** Login state, clientbound - stable since the encryption handshake was introduced. Signals the
  *  backend is online-mode; everything after the client's Encryption Response is AES-CFB8
- *  ciphertext that a plain packet parser (like the ones in LoginRelayHandler/LimboHandler) can no
+ *  ciphertext that a plain packet parser (like the ones in LoginRelayHandler/ReconnectHandler) can no
  *  longer decode. */
 const val LOGIN_ENCRYPTION_REQUEST = 0x01
 

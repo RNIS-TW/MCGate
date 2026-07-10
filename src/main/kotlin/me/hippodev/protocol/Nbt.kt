@@ -4,7 +4,7 @@ import io.netty.buffer.ByteBuf
 
 /**
  * Minimal binary NBT writer covering just the tag types needed to build the tiny registry/dimension
- * blobs the limbo world sends during the Configuration phase (see LimboProtocol.kt). Not a general
+ * blobs the reconnect-wait world sends during the Configuration phase (see ReconnectProtocol.kt). Not a general
  * purpose NBT library - no reader, no long/int arrays, no lists-of-lists.
  */
 object Nbt {

@@ -18,8 +18,6 @@ import me.hippodev.protocol.*
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 
-private const val STATUS_PROBE_PROTOCOL_VERSION = -1
-
 /**
  * Handles a connection past the handshake once we know next_state == 1 (status).
  * Serves a cached or fallback status response without touching the backend when
@@ -130,11 +128,11 @@ class StatusHandler(
                     backendChannel.writeAndFlush(encodeProxyProtocolHeader(clientAddr, addr))
                 }
             }
-            // Use a fixed status-probe protocol version rather than relaying the connecting
-            // client's raw one: some backends/plugins error or return malformed status JSON
-            // when handed a protocol number they don't recognize (e.g. an unreleased snapshot).
-            // -1 is the conventional "unknown/status-only" value (matches ApiServer's own probes).
-            backendChannel.writeAndFlush(encodeHandshake(STATUS_PROBE_PROTOCOL_VERSION, host, port, 1))
+            // Forward the connecting client's real protocol version so version-multiplexing
+            // backends (e.g. ViaVersion) resolve and report the version the client actually
+            // asked for, instead of falling back to their own default/custom protocol name -
+            // which otherwise shows up as a version mismatch on the client's server list entry.
+            backendChannel.writeAndFlush(encodeHandshake(protocolVersion, host, port, 1))
             val requestFrame = Unpooled.buffer()
             writeVarInt(requestFrame, 1)
             writeVarInt(requestFrame, 0x00)

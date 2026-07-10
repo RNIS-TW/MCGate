@@ -41,25 +41,32 @@ config:
           name: "Try again later!"
           protocol: -1
 
-    # Holding room shown to 1.20.2+ clients while all backends are offline, instead of a fallback
-    # status/kick: the player is spawned into a small waiting world and transparently moved onto
-    # the real backend once it's reachable again, no reconnect needed. Older clients still just
-    # get a kick with `kickMessage`. Disabled by default.
-    - host: limbo.example.com
+    # Auto-reconnect shown to 1.20.2+ clients while all backends are offline, instead of a
+    # fallback status/kick (VelocityReconnect-style, no separate holding server needed): the
+    # player is kept connected to MCGate itself in a minimal waiting world (it reuses the
+    # client's own built-in minecraft:overworld dimension, nothing custom to register) and is
+    # transparently moved onto the real backend once it's reachable again - no manual reconnect
+    # needed. Older clients still just get a kick with `kickMessage`. Disabled by default.
+    - host: reconnect.example.com
       backend: 127.0.0.1:25574
-      limbo:
+      reconnect:
         enabled: true
-        # Also send players to limbo if this backend drops mid-session, not just on initial
+        # Also hold players for reconnect if this backend drops mid-session, not just on initial
         # connect. Defaults to the same value as `enabled`.
         onMidSessionDrop: true
-        # Backoff for backend reconnect attempts while in limbo.
+        # Backoff for backend reconnect attempts while waiting.
         retryInterval: 5s
         maxRetryInterval: 30s
         backoffMultiplier: 2.0
-        # How long to hold a player in limbo before giving up and kicking them. 0 = unlimited.
+        # How long to hold a player waiting before giving up and kicking them. 0 = unlimited.
         maxWait: 0s
-        motd: "&eServer is currently offline."
+        # Title/subtitle screen shown on entry; the subtitle gets "(attempt N)" appended each
+        # time a retry pass exhausts every backend.
+        title: "&eServer is currently offline."
         subtitle: "&7Waiting to reconnect..."
+        # Small animated action-bar message cycling through these frames.
+        actionBarFrames: ["&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."]
+        animationInterval: 500ms
         kickMessage: "&cServer is offline. Please reconnect shortly."
 
     # Rewrites the handshake's virtual host to match the backend address,

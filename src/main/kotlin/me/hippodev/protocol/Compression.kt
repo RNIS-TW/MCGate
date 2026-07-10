@@ -12,10 +12,10 @@ import java.util.zip.Inflater
  * uncompressed (below threshold) or the decompressed size for a zlib-deflated payload.
  *
  * MCGate's raw byte relay never needed this - it just tunnels whatever bytes the backend and
- * client exchange. It only matters for packets MCGate *synthesizes* itself (the limbo world),
+ * client exchange. It only matters for packets MCGate *synthesizes* itself (the reconnect-wait world),
  * which must match whatever framing the client's decoder is already expecting for that
  * connection - see [me.hippodev.handler.LoginRelayHandler]'s backend login sniffing and
- * [me.hippodev.handler.LimboHandler].
+ * [me.hippodev.handler.ReconnectHandler].
  */
 
 /** Frames [payload] (packet id + fields, unframed) for the wire, applying compression if
