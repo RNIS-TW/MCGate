@@ -171,7 +171,7 @@ data class GateConfig(
             val modifyVirtualHost = r["modifyVirtualHost"] as? Boolean ?: false
             val proxyProtocol = r["proxyProtocol"] as? Boolean ?: false
             val priority = r["priority"] as? Int ?: 0
-            val reconnect = parseReconnect(r["reconnect"] as? Map<String, Any>, messages.reconnect)
+            val reconnect = renderReconnectText(parseReconnect(r["reconnect"] as? Map<String, Any>, messages.reconnect))
 
             return Route(
                 hostPatterns = hostPatterns,
@@ -215,6 +215,23 @@ data class GateConfig(
                 kickMessage = r["kickMessage"] as? String ?: defaults.kickMessage
             )
         }
+
+        /** Pre-renders `title`/`subtitle`/`attemptSuffix`/`actionBarFrames` (legacy `&`-codes and
+         *  MiniMessage tags both parsed - see TextFormat.kt) once at config load, rather than
+         *  every single packet send. `title`/`subtitle` are sent at most a couple of times per
+         *  reconnect-wait session, but `actionBarFrames` is on the animation timer's hot path
+         *  (every `animationInterval`, 500ms by default, for every player currently waiting to
+         *  reconnect) - re-parsing MiniMessage there on every tick was real, needless CPU work on
+         *  the event-loop thread. `kickMessage` is deliberately left raw here: it's used via two
+         *  different renderers (JSON for the Login-state kick, legacy for the Play-state one) and
+         *  is only ever sent once per connection at most, so rendering it at each of those two
+         *  call sites instead is simpler and not a hot path either way. */
+        private fun renderReconnectText(reconnect: ReconnectConfig): ReconnectConfig = reconnect.copy(
+            title = toLegacyText(reconnect.title),
+            subtitle = toLegacyText(reconnect.subtitle),
+            attemptSuffix = toLegacyText(reconnect.attemptSuffix),
+            actionBarFrames = reconnect.actionBarFrames.map { toLegacyText(it) }
+        )
 
         /** Pre-resolves backend hostnames that don't depend on a wildcard capture, so the DNS
          *  cache is already warm before the first player connects - see [DnsCache]. Templated

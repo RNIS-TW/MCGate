@@ -116,7 +116,7 @@ class LoginRelayHandler(
                 reconnectHandler.enter(ctx.pipeline().context(reconnectHandler))
             } else {
                 log.warn("All backends unreachable for host '{}', kicking client", host)
-                ctx.writeAndFlush(encodeLoginDisconnect(route.reconnect.kickMessage)).addListener(ChannelFutureListener.CLOSE)
+                ctx.writeAndFlush(encodeLoginDisconnect(toJsonComponent(route.reconnect.kickMessage))).addListener(ChannelFutureListener.CLOSE)
             }
             return
         }

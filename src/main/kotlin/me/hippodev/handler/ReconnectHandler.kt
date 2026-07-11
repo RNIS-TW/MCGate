@@ -164,7 +164,7 @@ class ReconnectHandler(
             val suffix = route.reconnect.attemptSuffix.replace("{attempt}", attemptCount.toString())
             ctx.writeAndFlush(encodeSetSubtitleText(ids, route.reconnect.subtitle + suffix, compressionThreshold))
             if (route.reconnect.maxWaitMillis > 0 && System.currentTimeMillis() - enteredAt > route.reconnect.maxWaitMillis) {
-                kickWithMessage(ctx, route.reconnect.kickMessage)
+                kickWithMessage(ctx, toLegacyText(route.reconnect.kickMessage))
                 return
             }
             scheduleRetry(ctx)

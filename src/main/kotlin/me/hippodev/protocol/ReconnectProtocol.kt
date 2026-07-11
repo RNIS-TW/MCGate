@@ -77,11 +77,16 @@ fun reconnectPacketIds(protocolVersion: Int): ReconnectPacketIds =
 /** Login state (packet 0x00), stable across every protocol version - used for both the legacy
  *  kick fallback and any hard error while transferring out of the reconnect wait. Always sent
  *  before any compression is negotiated (Login state), so no [compressionThreshold] parameter
- *  needed. */
-fun encodeLoginDisconnect(reasonText: String): ByteBuf {
+ *  needed.
+ *
+ *  Takes an already-rendered rich-text string ([toJsonComponent] applied by the caller) rather
+ *  than parsing it here - the caller decides whether that's a one-off ad-hoc message (parse right
+ *  before sending) or a static config value that should be pre-rendered once and reused, rather
+ *  than every encoder call re-running MiniMessage parsing on every send. */
+fun encodeLoginDisconnect(renderedReasonJson: String): ByteBuf {
     val payload = Unpooled.buffer()
     writeVarInt(payload, 0x00)
-    writeString(payload, toJsonComponent(reasonText))
+    writeString(payload, renderedReasonJson)
     return frame(payload, -1)
 }
 
@@ -132,12 +137,15 @@ fun encodeStartConfiguration(ids: ReconnectPacketIds, compressionThreshold: Int)
 
 /** Play state (not Login) Disconnect - used to kick a player already waiting for reconnect
  *  (e.g. `reconnect.maxWait` expiring), since by that point the client is well past Login state
- *  and a Login-state Disconnect packet would be rejected as unexpected. */
-fun encodePlayDisconnect(ids: ReconnectPacketIds, reasonText: String, compressionThreshold: Int): ByteBuf {
+ *  and a Login-state Disconnect packet would be rejected as unexpected.
+ *
+ *  Takes already-rendered legacy text ([toLegacyText] applied by the caller) - see
+ *  [encodeLoginDisconnect]'s doc for why the parsing isn't done here. */
+fun encodePlayDisconnect(ids: ReconnectPacketIds, renderedReasonText: String, compressionThreshold: Int): ByteBuf {
     val payload = Unpooled.buffer()
     writeVarInt(payload, ids.playDisconnect)
     payload.writeByte(Nbt.STRING)
-    Nbt.writeString(payload, toLegacyText(reasonText))
+    Nbt.writeString(payload, renderedReasonText)
     return frame(payload, compressionThreshold)
 }
 
@@ -225,30 +233,38 @@ fun encodeEmptyChunk(ids: ReconnectPacketIds, compressionThreshold: Int, chunkX:
 }
 
 /** Action bar text (Play state). 1.20.3+ text components are network NBT rather than JSON; a bare
- *  NBT string tag is valid as a text component ("just the text"), which keeps this simple. */
-fun encodeActionBar(ids: ReconnectPacketIds, text: String, compressionThreshold: Int): ByteBuf {
+ *  NBT string tag is valid as a text component ("just the text"), which keeps this simple.
+ *
+ *  Takes already-rendered legacy text ([toLegacyText] applied by the caller), since this is on
+ *  the animation timer's hot path (fires every `animationInterval`, 500ms by default, for every
+ *  player waiting to reconnect) - re-running MiniMessage parsing on every single tick was real,
+ *  needless work piling onto the event-loop thread. Callers should render once (e.g. at config
+ *  load) and reuse the result, not parse per-send. */
+fun encodeActionBar(ids: ReconnectPacketIds, renderedText: String, compressionThreshold: Int): ByteBuf {
     val payload = Unpooled.buffer()
     writeVarInt(payload, ids.playSetActionBarText)
     payload.writeByte(Nbt.STRING)
-    Nbt.writeString(payload, toLegacyText(text))
+    Nbt.writeString(payload, renderedText)
     return frame(payload, compressionThreshold)
 }
 
-/** Title text (Play state) - the large centered text shown while waiting to reconnect. */
-fun encodeSetTitleText(ids: ReconnectPacketIds, text: String, compressionThreshold: Int): ByteBuf {
+/** Title text (Play state) - the large centered text shown while waiting to reconnect. Takes
+ *  already-rendered legacy text - see [encodeActionBar]'s doc for why. */
+fun encodeSetTitleText(ids: ReconnectPacketIds, renderedText: String, compressionThreshold: Int): ByteBuf {
     val payload = Unpooled.buffer()
     writeVarInt(payload, ids.playSetTitleText)
     payload.writeByte(Nbt.STRING)
-    Nbt.writeString(payload, toLegacyText(text))
+    Nbt.writeString(payload, renderedText)
     return frame(payload, compressionThreshold)
 }
 
-/** Subtitle text (Play state) - the smaller text shown under the title. */
-fun encodeSetSubtitleText(ids: ReconnectPacketIds, text: String, compressionThreshold: Int): ByteBuf {
+/** Subtitle text (Play state) - the smaller text shown under the title. Takes already-rendered
+ *  legacy text - see [encodeActionBar]'s doc for why. */
+fun encodeSetSubtitleText(ids: ReconnectPacketIds, renderedText: String, compressionThreshold: Int): ByteBuf {
     val payload = Unpooled.buffer()
     writeVarInt(payload, ids.playSetSubtitleText)
     payload.writeByte(Nbt.STRING)
-    Nbt.writeString(payload, toLegacyText(text))
+    Nbt.writeString(payload, renderedText)
     return frame(payload, compressionThreshold)
 }
 

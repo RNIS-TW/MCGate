@@ -1,5 +1,7 @@
 package me.hippodev.handler
 
+import com.google.gson.JsonParser
+import com.google.gson.JsonSyntaxException
 import io.netty.bootstrap.Bootstrap
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.Unpooled
@@ -13,10 +15,29 @@ import io.netty.handler.codec.ByteToMessageDecoder
 import me.hippodev.config.*
 import me.hippodev.routing.*
 import me.hippodev.protocol.*
-
-
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
+
+/** Whether [json] is a well-formed Server List Ping status response - specifically, that
+ *  `version.protocol` is present and numeric, since that's the field a malformed/misbehaving
+ *  backend most often gets wrong and the one whose absence produces the most confusing
+ *  client-side error. Deliberately permissive about everything else in the JSON. */
+private fun isValidStatusJson(json: String): Boolean {
+    return try {
+        @Suppress("DEPRECATION") // JsonParser().parse(...) - the transitively-pulled gson version
+        // (2.8.0, via adventure-text-serializer-gson) predates the modern static
+        // JsonParser.parseString API; this instance-method form still works fine on it.
+        val root = JsonParser().parse(json).asJsonObject
+        val version = root.getAsJsonObject("version") ?: return false
+        val protocol = version.get("protocol") ?: return false
+        protocol.asJsonPrimitive.isNumber
+    } catch (e: JsonSyntaxException) {
+        false
+    } catch (e: IllegalStateException) {
+        // e.g. asJsonObject/asJsonPrimitive called on something that isn't one
+        false
+    }
+}
 
 /**
  * Handles a connection past the handshake once we know next_state == 1 (status).
@@ -75,13 +96,21 @@ class StatusHandler(
             return
         }
         val addr = ordered[attempt]
-        val cacheKey = "${addr.hostString}:${addr.port}"
-        val cached = pingCache.get(cacheKey)
+        // The response cache key includes protocolVersion - a version-multiplexing backend (e.g.
+        // ViaVersion) resolves and reports a different version string/name per client, so a
+        // response cached for one client's protocol version must never be served back to a
+        // different one; that would silently defeat the whole point of forwarding the client's
+        // real protocol version to the backend in the first place (see dialBackendForStatus).
+        // Reachability (down-tracking) is different - a dead backend is dead regardless of which
+        // protocol version asked, so that still just keys off host:port.
+        val downKey = "${addr.hostString}:${addr.port}"
+        val responseCacheKey = "$downKey:$protocolVersion"
+        val cached = pingCache.get(responseCacheKey)
         if (cached != null) {
             ctx.writeAndFlush(encodeStatusResponse(cached))
             return
         }
-        if (pingCache.isKnownDown(cacheKey)) {
+        if (pingCache.isKnownDown(downKey)) {
             tryBackend(ctx, ordered, attempt + 1)
             return
         }
@@ -90,7 +119,8 @@ class StatusHandler(
 
     private fun dialBackendForStatus(ctx: ChannelHandlerContext, ordered: List<InetSocketAddress>, attempt: Int) {
         val addr = ordered[attempt]
-        val cacheKey = "${addr.hostString}:${addr.port}"
+        val downKey = "${addr.hostString}:${addr.port}"
+        val responseCacheKey = "$downKey:$protocolVersion"
         val startTime = System.currentTimeMillis()
 
         val bootstrap = Bootstrap()
@@ -101,7 +131,21 @@ class StatusHandler(
                 override fun initChannel(ch: SocketChannel) {
                     ch.pipeline().addLast(BackendStatusFetcher { json ->
                         runtime.recordLatency(addr, System.currentTimeMillis() - startTime)
-                        pingCache.put(cacheKey, json, route.cachePingTTLMillis)
+                        // MCGate otherwise relays this straight to the connecting client with zero
+                        // validation - a backend sending a malformed response (missing/non-numeric
+                        // version.protocol, truncated JSON, a misbehaving plugin, whatever) used to
+                        // get forwarded as-is, which the client then fails to parse and surfaces as
+                        // a confusing client-side error. Worse, it also got cached and served to
+                        // every other client hitting this backend for the TTL window. Validate
+                        // first and treat a bad response the same as an unreachable backend -
+                        // never expose it to a player, just fail over to the next backend/fallback.
+                        if (!isValidStatusJson(json)) {
+                            log.warn("Backend {} sent a malformed status response, treating as down", addr)
+                            pingCache.markDown(downKey)
+                            if (ctx.channel().isActive) tryBackend(ctx, ordered, attempt + 1)
+                            return@BackendStatusFetcher
+                        }
+                        pingCache.put(responseCacheKey, json, route.cachePingTTLMillis)
                         if (ctx.channel().isActive) {
                             ctx.writeAndFlush(encodeStatusResponse(json))
                         }
@@ -112,7 +156,7 @@ class StatusHandler(
         bootstrap.connect(addr).addListener(ChannelFutureListener { future ->
             if (!future.isSuccess) {
                 log.debug("Status dial to {} failed: {}", addr, future.cause()?.message)
-                pingCache.markDown(cacheKey)
+                pingCache.markDown(downKey)
                 tryBackend(ctx, ordered, attempt + 1)
                 return@ChannelFutureListener
             }

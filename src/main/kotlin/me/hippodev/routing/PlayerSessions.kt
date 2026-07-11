@@ -6,6 +6,7 @@ import io.netty.channel.ChannelFutureListener
 import me.hippodev.protocol.encodePlayDisconnect
 import me.hippodev.protocol.reconnectPacketIds
 import me.hippodev.protocol.reconnectSupported
+import me.hippodev.protocol.toLegacyText
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.util.UUID
@@ -76,7 +77,7 @@ object PlayerSessions {
         val session = sessions[uuid] ?: return null
         if (message != null && !session.encrypted && reconnectSupported(session.protocolVersion)) {
             val ids = reconnectPacketIds(session.protocolVersion)
-            session.channel.writeAndFlush(encodePlayDisconnect(ids, message, session.compressionThreshold))
+            session.channel.writeAndFlush(encodePlayDisconnect(ids, toLegacyText(message), session.compressionThreshold))
                 .addListener(ChannelFutureListener.CLOSE)
         } else {
             if (message != null) {
