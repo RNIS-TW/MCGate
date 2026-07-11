@@ -143,7 +143,8 @@ class ReconnectHandler(
     private fun tryBackends(ctx: ChannelHandlerContext, ordered: List<InetSocketAddress>, i: Int) {
         if (done) return
         if (i >= ordered.size) {
-            ctx.writeAndFlush(encodeSetSubtitleText(ids, "${route.reconnect.subtitle} (attempt $attemptCount)", compressionThreshold))
+            val suffix = route.reconnect.attemptSuffix.replace("{attempt}", attemptCount.toString())
+            ctx.writeAndFlush(encodeSetSubtitleText(ids, route.reconnect.subtitle + suffix, compressionThreshold))
             if (route.reconnect.maxWaitMillis > 0 && System.currentTimeMillis() - enteredAt > route.reconnect.maxWaitMillis) {
                 kickWithMessage(ctx, route.reconnect.kickMessage)
                 return

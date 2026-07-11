@@ -51,6 +51,7 @@ data class ReconnectConfig(
     val maxWaitMillis: Long = 0, // 0 = unlimited
     val title: String = "&eServer is currently offline.",
     val subtitle: String = "&7Waiting to reconnect...",
+    val attemptSuffix: String = " (attempt {attempt})",
     val actionBarFrames: List<String> = listOf("&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."),
     val animationIntervalMillis: Long = 500,
     val kickMessage: String = "&cServer is offline. Please reconnect shortly."
@@ -98,7 +99,7 @@ data class GateConfig(
         private val log = org.slf4j.LoggerFactory.getLogger(GateConfig::class.java)
 
         @Suppress("UNCHECKED_CAST")
-        fun load(path: String): GateConfig {
+        fun load(path: String, messages: GateMessages = GateMessages()): GateConfig {
             val file = File(path)
             if (!file.exists()) {
                 error("Config file not found: $path")
@@ -111,7 +112,7 @@ data class GateConfig(
             val rawRoutes = configSection["routes"] as? List<Map<String, Any>> ?: emptyList()
 
             // Higher priority routes are matched first; ties keep config file order.
-            val routes = rawRoutes.mapIndexed { index, r -> parseRoute(r, index) }
+            val routes = rawRoutes.mapIndexed { index, r -> parseRoute(r, index, messages) }
                 .sortedWith(compareByDescending<Route> { it.priority })
             val api = parseApi(configSection["api"] as? Map<String, Any>)
 
@@ -126,7 +127,7 @@ data class GateConfig(
             )
         }
 
-        private fun parseRoute(r: Map<String, Any>, index: Int): Route {
+        private fun parseRoute(r: Map<String, Any>, index: Int, messages: GateMessages): Route {
             val hostRaw = r["host"]
             val hosts = when (hostRaw) {
                 is List<*> -> hostRaw.map { it.toString() }
@@ -150,7 +151,7 @@ data class GateConfig(
             val modifyVirtualHost = r["modifyVirtualHost"] as? Boolean ?: false
             val proxyProtocol = r["proxyProtocol"] as? Boolean ?: false
             val priority = r["priority"] as? Int ?: 0
-            val reconnect = parseReconnect(r["reconnect"] as? Map<String, Any>)
+            val reconnect = parseReconnect(r["reconnect"] as? Map<String, Any>, messages.reconnect)
 
             return Route(
                 hostPatterns = hostPatterns,
@@ -166,8 +167,16 @@ data class GateConfig(
         }
 
         @Suppress("UNCHECKED_CAST")
-        private fun parseReconnect(r: Map<String, Any>?): ReconnectConfig {
-            val defaults = ReconnectConfig()
+        private fun parseReconnect(r: Map<String, Any>?, messageDefaults: ReconnectMessages): ReconnectConfig {
+            // Message text defaults to messages.yml (hot-reloadable, shared across routes);
+            // a route can still override any of it individually via config.yml.
+            val defaults = ReconnectConfig(
+                title = messageDefaults.title,
+                subtitle = messageDefaults.subtitle,
+                attemptSuffix = messageDefaults.attemptSuffix,
+                actionBarFrames = messageDefaults.actionBarFrames,
+                kickMessage = messageDefaults.kickMessage
+            )
             if (r == null) return defaults
             val enabled = r["enabled"] as? Boolean ?: defaults.enabled
             val frames = (r["actionBarFrames"] as? List<*>)?.map { it.toString() }
@@ -180,6 +189,7 @@ data class GateConfig(
                 maxWaitMillis = (r["maxWait"] as? String)?.let { parseDuration(it) } ?: defaults.maxWaitMillis,
                 title = r["title"] as? String ?: defaults.title,
                 subtitle = r["subtitle"] as? String ?: defaults.subtitle,
+                attemptSuffix = r["attemptSuffix"] as? String ?: defaults.attemptSuffix,
                 actionBarFrames = frames ?: defaults.actionBarFrames,
                 animationIntervalMillis = (r["animationInterval"] as? String)?.let { parseDuration(it) } ?: defaults.animationIntervalMillis,
                 kickMessage = r["kickMessage"] as? String ?: defaults.kickMessage

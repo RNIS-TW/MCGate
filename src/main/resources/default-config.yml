@@ -40,6 +40,10 @@ config:
         version:
           name: "Try again later!"
           protocol: -1
+        # Optional server list icon shown for this fallback status. Either a path to an
+        # image file (resolved relative to the working directory, base64-encoded automatically)
+        # or an already-encoded "data:image/png;base64,..." string. Ideally a 64x64 PNG.
+        favicon: icon.png
 
     # Auto-reconnect shown to 1.20.2+ clients while all backends are offline, instead of a
     # fallback status/kick (VelocityReconnect-style, no separate holding server needed): the
@@ -60,14 +64,14 @@ config:
         backoffMultiplier: 2.0
         # How long to hold a player waiting before giving up and kicking them. 0 = unlimited.
         maxWait: 0s
-        # Title/subtitle screen shown on entry; the subtitle gets "(attempt N)" appended each
-        # time a retry pass exhausts every backend.
-        title: "&eServer is currently offline."
-        subtitle: "&7Waiting to reconnect..."
-        # Small animated action-bar message cycling through these frames.
-        actionBarFrames: ["&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."]
+        # All text below defaults to messages.yml (hot-reloadable, shared across every route) -
+        # uncomment any of these to override it just for this route.
+        # title: "&eServer is currently offline."
+        # subtitle: "&7Waiting to reconnect..."
+        # attemptSuffix: " (attempt {attempt})"
+        # actionBarFrames: ["&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."]
+        # kickMessage: "&cServer is offline. Please reconnect shortly."
         animationInterval: 500ms
-        kickMessage: "&cServer is offline. Please reconnect shortly."
 
     # Rewrites the handshake's virtual host to match the backend address,
     # useful when backends require a specific domain to accept connections.

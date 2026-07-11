@@ -43,14 +43,28 @@ fun main(args: Array<String>) {
     log.info("MCGate v{}", version)
 
     val configPath = args.firstOrNull() ?: "config.yml"
-    val initialConfig = ConfigLoader.loadOrCreateDefault(configPath)
+    val messagesPath = args.getOrNull(1) ?: "messages.yml"
+
+    val messagesRef = AtomicReference(MessagesLoader.loadOrCreateDefault(messagesPath))
+    log.info("Loaded messages from {}", messagesPath)
+
+    val initialConfig = ConfigLoader.loadOrCreateDefault(configPath, messagesRef.get())
     log.info("Loaded {} route(s) from {}", initialConfig.routes.size, configPath)
 
     val stateRef = AtomicReference(GateState(initialConfig))
     val pingCache = PingCache()
 
-    ConfigLoader.watch(configPath) { newConfig ->
+    ConfigLoader.watch(configPath, { messagesRef.get() }) { newConfig ->
         log.info("Config changed, loaded {} route(s)", newConfig.routes.size)
+        stateRef.set(GateState(newConfig))
+    }
+
+    // Reload config.yml too so routes that don't override a message pick up the new default
+    // immediately, without needing to touch config.yml themselves.
+    MessagesLoader.watch(messagesPath) { newMessages ->
+        messagesRef.set(newMessages)
+        log.info("Messages changed, reloading {} with new defaults", configPath)
+        val newConfig = GateConfig.load(configPath, newMessages)
         stateRef.set(GateState(newConfig))
     }
 
