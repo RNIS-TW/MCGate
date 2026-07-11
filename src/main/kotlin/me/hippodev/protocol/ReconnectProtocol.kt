@@ -6,14 +6,16 @@ import java.util.UUID
 
 /**
  * Packet IDs and encoders for the auto-reconnect holding state (see ReconnectHandler). Minecraft's
- * Configuration/Play packet IDs are NOT stable across versions - they shift release to release -
- * so unlike the handshake/status packets in MinecraftProtocol.kt, this table only covers a single
- * verified protocol bracket and must be extended (a new entry in [BRACKETS]) to support others.
+ * Configuration/Play packet IDs are NOT stable across versions in general - they shift release to
+ * release - so unlike the handshake/status packets in MinecraftProtocol.kt, this table only
+ * covers verified protocol brackets ([BRACKETS]: currently 774-776, i.e. 1.21.11 through 26.2 -
+ * see the comment above that map for how that range was verified) and must be extended (a new
+ * entry in [BRACKETS]) to support others.
  *
  * IDs below were confirmed against the current minecraft.wiki protocol packet reference at
  * implementation time. The chunk data encoding in this file is best-effort from protocol
  * knowledge and was NOT verified against a live client in this environment - test against a real
- * 1.20.2+ client before relying on this in production, per the plan's testing section.
+ * client before relying on this in production, per the plan's testing section.
  */
 data class ReconnectPacketIds(
     val loginSuccess: Int,
@@ -33,27 +35,37 @@ data class ReconnectPacketIds(
     val playDisconnect: Int
 )
 
+// Protocol 774 (1.21.11), 775 (26.1/26.1.1/26.1.2), and 776 (26.2) share this exact packet-ID
+// table - cross-checked against minecraft.wiki's Protocol History changelog
+// (Minecraft_Wiki:Projects/wiki.vg_merge/Protocol_History), which lists every packet ID change
+// release to release: from protocol 767 (1.21) through 776 (26.2) there is no recorded ID change
+// for any packet used here (only an unrelated field removed from Login Success at 1.21.2/768).
+// Extend this map with additional protocol -> ReconnectPacketIds entries for other brackets once
+// similarly verified - don't assume older versions match without checking, since packet IDs do
+// shift release to release in general (see e.g. the 19w36a entry in that changelog for how much
+// churn a single snapshot can have).
+private val CURRENT_BRACKET = ReconnectPacketIds(
+    loginSuccess = 0x02,
+    configFinishConfiguration = 0x03,
+    configKeepAlive = 0x04,
+    configAckFinishConfiguration = 0x03,
+    playLogin = 0x31,
+    playKeepAliveClientbound = 0x2C,
+    playKeepAliveServerbound = 0x1C,
+    playSetActionBarText = 0x57,
+    playSetTitleText = 0x72,
+    playSetSubtitleText = 0x70,
+    playSetCenterChunk = 0x5E,
+    playChunkDataAndUpdateLight = 0x2D,
+    playStartConfiguration = 0x76,
+    playAckConfiguration = 0x10,
+    playDisconnect = 0x20
+)
+
 private val BRACKETS: Map<Int, ReconnectPacketIds> = mapOf(
-    // Protocol 776 - current stable at implementation time. Verified via minecraft.wiki packet
-    // tables; extend this map with additional protocol -> ReconnectPacketIds entries for other
-    // brackets once verified.
-    776 to ReconnectPacketIds(
-        loginSuccess = 0x02,
-        configFinishConfiguration = 0x03,
-        configKeepAlive = 0x04,
-        configAckFinishConfiguration = 0x03,
-        playLogin = 0x31,
-        playKeepAliveClientbound = 0x2C,
-        playKeepAliveServerbound = 0x1C,
-        playSetActionBarText = 0x57,
-        playSetTitleText = 0x72,
-        playSetSubtitleText = 0x70,
-        playSetCenterChunk = 0x5E,
-        playChunkDataAndUpdateLight = 0x2D,
-        playStartConfiguration = 0x76,
-        playAckConfiguration = 0x10,
-        playDisconnect = 0x20
-    )
+    774 to CURRENT_BRACKET, // 1.21.11
+    775 to CURRENT_BRACKET, // 26.1, 26.1.1, 26.1.2
+    776 to CURRENT_BRACKET  // 26.2
 )
 
 /** Whether auto-reconnect can serve this protocol version - i.e. we have a verified packet-ID bracket for it. */
@@ -69,7 +81,7 @@ fun reconnectPacketIds(protocolVersion: Int): ReconnectPacketIds =
 fun encodeLoginDisconnect(reasonText: String): ByteBuf {
     val payload = Unpooled.buffer()
     writeVarInt(payload, 0x00)
-    writeString(payload, "{\"text\":\"${jsonEscape(translateColorCodes(reasonText))}\"}")
+    writeString(payload, toJsonComponent(reasonText))
     return frame(payload, -1)
 }
 
@@ -125,7 +137,7 @@ fun encodePlayDisconnect(ids: ReconnectPacketIds, reasonText: String, compressio
     val payload = Unpooled.buffer()
     writeVarInt(payload, ids.playDisconnect)
     payload.writeByte(Nbt.STRING)
-    Nbt.writeString(payload, translateColorCodes(reasonText))
+    Nbt.writeString(payload, toLegacyText(reasonText))
     return frame(payload, compressionThreshold)
 }
 
@@ -218,7 +230,7 @@ fun encodeActionBar(ids: ReconnectPacketIds, text: String, compressionThreshold:
     val payload = Unpooled.buffer()
     writeVarInt(payload, ids.playSetActionBarText)
     payload.writeByte(Nbt.STRING)
-    Nbt.writeString(payload, translateColorCodes(text))
+    Nbt.writeString(payload, toLegacyText(text))
     return frame(payload, compressionThreshold)
 }
 
@@ -227,7 +239,7 @@ fun encodeSetTitleText(ids: ReconnectPacketIds, text: String, compressionThresho
     val payload = Unpooled.buffer()
     writeVarInt(payload, ids.playSetTitleText)
     payload.writeByte(Nbt.STRING)
-    Nbt.writeString(payload, translateColorCodes(text))
+    Nbt.writeString(payload, toLegacyText(text))
     return frame(payload, compressionThreshold)
 }
 
@@ -236,37 +248,7 @@ fun encodeSetSubtitleText(ids: ReconnectPacketIds, text: String, compressionThre
     val payload = Unpooled.buffer()
     writeVarInt(payload, ids.playSetSubtitleText)
     payload.writeByte(Nbt.STRING)
-    Nbt.writeString(payload, translateColorCodes(text))
+    Nbt.writeString(payload, toLegacyText(text))
     return frame(payload, compressionThreshold)
 }
 
-/** Translates `&`-prefixed legacy color codes (e.g. `&e`) into the `§` codes Minecraft's chat
- *  renderer recognizes inline in a plain-text component. */
-fun translateColorCodes(value: String): String {
-    val sb = StringBuilder(value.length)
-    var i = 0
-    while (i < value.length) {
-        val c = value[i]
-        if (c == '&' && i + 1 < value.length && value[i + 1].lowercaseChar() in "0123456789abcdefklmnor") {
-            sb.append('§').append(value[i + 1])
-            i += 2
-        } else {
-            sb.append(c)
-            i++
-        }
-    }
-    return sb.toString()
-}
-
-private fun jsonEscape(value: String): String {
-    val sb = StringBuilder(value.length)
-    for (c in value) {
-        when (c) {
-            '"' -> sb.append("\\\"")
-            '\\' -> sb.append("\\\\")
-            '\n' -> sb.append("\\n")
-            else -> sb.append(c)
-        }
-    }
-    return sb.toString()
-}

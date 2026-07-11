@@ -2,6 +2,18 @@ config:
   # The bind address to listen for Minecraft client connections.
   bind: 0.0.0.0:25565
 
+  # Number of Netty worker threads. 0 (default) = max(4, 2x CPU cores). Every player's connection
+  # is pinned to one of these threads for its whole session, so too few threads on a small
+  # VPS/container can make lag/stalls appear to hit "half the players" at a time - only takes
+  # effect on (re)start, not a live config reload.
+  workerThreads: 0
+
+  # Logs every incoming connection at INFO as soon as the handshake is read - host, remote
+  # address, whether it's a status ping or a login, and protocol version. Off by default: logins
+  # are already logged (see LoginRelayHandler), and status pings from server-list refreshes/
+  # scanners can be frequent enough to be noisy. Hot-reloadable, no restart needed.
+  logConnections: false
+
   # Read-only JSON/HTTP status API (routes, backends, live connection/latency stats).
   # Disabled by default - only bind it to a trusted interface.
   api:
@@ -34,9 +46,11 @@ config:
     - host: localhost
       backend: 127.0.0.1:25572
       fallback:
+        # Supports legacy &-codes and MiniMessage tags (<red>, <gradient:...>, <bold>, <#ff0000>,
+        # etc.) - see https://docs.advntr.dev/minimessage/format.html.
         motd: |
-          Server is offline.
-          Check back later!
+          &cServer is offline.
+          <gradient:red:gold>Check back later!</gradient>
         version:
           name: "Try again later!"
           protocol: -1

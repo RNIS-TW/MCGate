@@ -56,12 +56,14 @@ class LoginRelayHandler(
      *  connection; see [handleBackendDrop]. */
     private var encrypted = false
     private var clientRemoteAddress: String = "?"
+    private lateinit var frontendChannel: Channel
 
     /** Must be called explicitly right after this handler is added to the pipeline -
      *  channelActive() will not fire since the channel is already active by then. */
     fun start(ctx: ChannelHandlerContext) {
         ctx.channel().config().isAutoRead = false
         clientRemoteAddress = ctx.channel().remoteAddress()?.toString() ?: "?"
+        frontendChannel = ctx.channel()
         connect(ctx, orderBackends(route, runtime, backends), 0)
     }
 
@@ -103,7 +105,12 @@ class LoginRelayHandler(
             val uuid = playerUuid
             if (route.reconnect.enabled && reconnectSupported(protocolVersion) && name != null && uuid != null) {
                 log.info("All backends unreachable for host '{}', holding '{}' for reconnect", host, name)
-                PlayerSessions.put(PlayerSession(name, uuid, host, clientRemoteAddress, null, System.currentTimeMillis()))
+                PlayerSessions.put(
+                    PlayerSession(
+                        name, uuid, host, clientRemoteAddress, null, System.currentTimeMillis(),
+                        ctx.channel(), protocolVersion, compressionThreshold, encrypted
+                    )
+                )
                 val reconnectHandler = ReconnectHandler(route, runtime, backends, protocolVersion, host, port, name, uuid)
                 ctx.pipeline().replace(this, "reconnect", reconnectHandler)
                 reconnectHandler.enter(ctx.pipeline().context(reconnectHandler))
@@ -116,6 +123,7 @@ class LoginRelayHandler(
 
         val addr = ordered[attempt]
         val clientChannel = ctx.channel()
+        val dialStartedAt = System.currentTimeMillis()
 
         val bootstrap = Bootstrap()
             .group(clientChannel.eventLoop())
@@ -140,6 +148,7 @@ class LoginRelayHandler(
             backendAddr = addr
             connectedAt = System.currentTimeMillis()
             runtime.recordConnectOpened(addr)
+            runtime.recordLatency(addr, connectedAt - dialStartedAt)
             log.info("Connected: '{}' from {} -> {}", host, clientChannel.remoteAddress(), addr)
             logLoginIfReady()
 
@@ -190,7 +199,11 @@ class LoginRelayHandler(
             log.info("Backend dropped for '{}' ({}) on '{}', holding for reconnect", name, uuid, host)
             val existing = PlayerSessions.get(uuid)
             PlayerSessions.put(
-                PlayerSession(name, uuid, host, existing?.remoteAddress ?: clientRemoteAddress, null, existing?.connectedAt ?: connectedAt)
+                PlayerSession(
+                    name, uuid, host, existing?.remoteAddress ?: clientRemoteAddress, null,
+                    existing?.connectedAt ?: connectedAt, clientChannel, protocolVersion, compressionThreshold,
+                    encrypted = false // this branch requires !encrypted (see the guard above), so always false here
+                )
             )
             val reconnectHandler = ReconnectHandler(
                 route, runtime, backends, protocolVersion, host, port, name, uuid, compressionThreshold
@@ -198,12 +211,16 @@ class LoginRelayHandler(
             clientChannel.pipeline().replace("relay", "reconnect", reconnectHandler)
             reconnectHandler.enterFromPlay(clientChannel.pipeline().context(reconnectHandler))
         } else {
-            log.info(
-                "Backend dropped for '{}' on '{}' but not holding for reconnect (enabled={}, onMidSessionDrop={}, " +
-                    "protocolVersion={}, reconnectSupported={}, encrypted={}, name={}, uuid={})",
-                name, host, route.reconnect.enabled, route.reconnect.onMidSessionDrop, protocolVersion,
-                reconnectSupported(protocolVersion), encrypted, name, uuid
-            )
+            // Only worth logging when reconnect is actually enabled for this route - otherwise
+            // this fires on every ordinary disconnect and is just noise, not a diagnostic signal.
+            if (route.reconnect.enabled) {
+                log.info(
+                    "Backend dropped for '{}' on '{}' but not holding for reconnect (enabled={}, onMidSessionDrop={}, " +
+                        "protocolVersion={}, reconnectSupported={}, encrypted={}, name={}, uuid={})",
+                    name, host, route.reconnect.enabled, route.reconnect.onMidSessionDrop, protocolVersion,
+                    reconnectSupported(protocolVersion), encrypted, name, uuid
+                )
+            }
             uuid?.let { PlayerSessions.remove(it) }
             closeOnFlush(clientChannel)
         }
@@ -250,11 +267,24 @@ class LoginRelayHandler(
                 // onward is AES-encrypted ciphertext, which this decoder cannot parse - and which
                 // MCGate could never safely inject synthesized packets into anyway (it would
                 // desync the client's stream cipher). Stop trying to parse and mark the
-                // connection as ineligible for mid-session auto-reconnect (see handleBackendDrop).
+                // connection as ineligible for mid-session auto-reconnect (see handleBackendDrop)
+                // *and* for a kick message (see PlayerSessions.kick) - writing anything into this
+                // connection from here on would corrupt the client's cipher stream, which is
+                // itself indistinguishable from a generic "Connection Lost" to the player.
                 encrypted = true
+                refreshSession()
                 ctx.pipeline().replace(this, "relay", PlainBackendRelay(clientChannel))
             } else if (packetId == 0x02) {
-                // Login Success - login phase over, fall back to a dumb byte pipe.
+                // Login Success - login phase over, fall back to a dumb byte pipe. Compression
+                // (if any) is always negotiated via Set Compression before this, so
+                // compressionThreshold is final now - refresh the PlayerSessions record with it.
+                // logLoginIfReady() runs the instant the backend TCP connect succeeds, well
+                // before Set Compression could have arrived, so the value it captured was almost
+                // always a stale -1; a kick sent using that stale value would frame the Disconnect
+                // packet as uncompressed on a connection the client actually expects compressed,
+                // producing garbage bytes the client can't parse - which shows up as a generic
+                // "Connection Lost" instead of the kick message ever being seen.
+                refreshSession()
                 ctx.pipeline().replace(this, "relay", PlainBackendRelay(clientChannel))
             }
         }
@@ -292,8 +322,24 @@ class LoginRelayHandler(
         if (!loginLogged) {
             loginLogged = true
             log.info("Login: '{}'{} on '{}' -> {}", name, playerUuid?.let { " ($it)" } ?: "", host, addr)
-            playerUuid?.let { PlayerSessions.put(PlayerSession(name, it, host, clientRemoteAddress, addr, connectedAt)) }
+            playerUuid?.let {
+                PlayerSessions.put(
+                    PlayerSession(
+                        name, it, host, clientRemoteAddress, addr, connectedAt, frontendChannel,
+                        protocolVersion, compressionThreshold, encrypted
+                    )
+                )
+            }
         }
+    }
+
+    /** Re-puts the current PlayerSessions record (if any) with the now-current
+     *  [compressionThreshold]/[encrypted] - see the call sites in [BackendLoginSniffer] for why
+     *  this matters. */
+    private fun refreshSession() {
+        val uuid = playerUuid ?: return
+        val existing = PlayerSessions.get(uuid) ?: return
+        PlayerSessions.put(existing.copy(compressionThreshold = compressionThreshold, encrypted = encrypted))
     }
 
     private fun logDisconnect(clientAddr: java.net.SocketAddress, addr: InetSocketAddress) {

@@ -9,7 +9,10 @@ fun buildFallbackJson(fallback: FallbackStatus): String {
     sb.append("\"name\":\"").append(escapeJson(fallback.version.name)).append("\",")
     sb.append("\"protocol\":").append(fallback.version.protocol)
     sb.append("},")
-    sb.append("\"description\":{\"text\":\"").append(escapeJson(fallback.motd)).append("\"}")
+    // Previously this dropped fallback.motd in as flat, unformatted text - no legacy &-codes, no
+    // MiniMessage. Now it goes through the same rich-text pipeline as every other message (see
+    // TextFormat.kt), so &-codes and MiniMessage tags both work in the MOTD too.
+    sb.append("\"description\":").append(toJsonComponent(fallback.motd))
     fallback.players?.let {
         sb.append(",\"players\":{\"online\":").append(it.online)
             .append(",\"max\":").append(it.max).append('}')

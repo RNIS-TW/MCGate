@@ -91,4 +91,12 @@ class HandshakeSniffer(
         onHandshake(ctx, protocolVersion, host, port, nextState, rawFrame)
         ctx.pipeline().remove(this)
     }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        // Benign in practice - server-list pingers/scanners routinely RST instead of a clean
+        // close before or during the handshake. Log quietly instead of letting it fall through
+        // to Netty's tail-context WARN + full stack trace.
+        log.debug("Handshake connection error", cause)
+        ctx.close()
+    }
 }

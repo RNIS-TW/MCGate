@@ -2,6 +2,11 @@ messages:
   # Player-facing text for the auto-reconnect waiting screen (route `reconnect:` config).
   # Routes can still override any of these per-route in config.yml; these are just the defaults
   # used when a route doesn't set its own.
+  #
+  # Every message below supports both legacy `&`-codes (e.g. `&e`, `&l`) and MiniMessage tags -
+  # `<red>`, `<gradient:red:blue>text</gradient>`, `<bold>`, `<#ff0000>`, `<rainbow>`, etc. See
+  # https://docs.advntr.dev/minimessage/format.html for the full tag reference. Mix both freely,
+  # e.g. "&e<bold>Offline</bold>".
   reconnect:
     # Title/subtitle shown while a player is held waiting to reconnect.
     title: "&eServer is currently offline."

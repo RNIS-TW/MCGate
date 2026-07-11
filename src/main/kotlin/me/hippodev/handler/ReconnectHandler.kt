@@ -110,8 +110,15 @@ class ReconnectHandler(
 
     private fun startKeepAlive(ctx: ChannelHandlerContext) {
         keepAliveTask = ctx.channel().eventLoop().scheduleAtFixedRate({
-            if (ctx.channel().isActive) {
-                ctx.writeAndFlush(encodePlayKeepAlive(ids, System.currentTimeMillis(), compressionThreshold))
+            // A repeating Netty task that throws just gets silently cancelled - no more
+            // keepalives, no log, and that one player eventually times out with nothing in the
+            // logs to explain why. Catching and logging keeps the failure isolated but visible.
+            try {
+                if (ctx.channel().isActive) {
+                    ctx.writeAndFlush(encodePlayKeepAlive(ids, System.currentTimeMillis(), compressionThreshold))
+                }
+            } catch (e: Exception) {
+                log.warn("Keep-alive task failed for '{}'", playerName, e)
             }
         }, KEEP_ALIVE_INTERVAL_MILLIS, KEEP_ALIVE_INTERVAL_MILLIS, TimeUnit.MILLISECONDS)
     }
@@ -123,18 +130,29 @@ class ReconnectHandler(
         val frames = route.reconnect.actionBarFrames
         if (frames.isEmpty()) return
         animationTask = ctx.channel().eventLoop().scheduleAtFixedRate({
-            if (ctx.channel().isActive) {
-                ctx.writeAndFlush(encodeActionBar(ids, frames[animationFrame % frames.size], compressionThreshold))
-                animationFrame++
+            try {
+                if (ctx.channel().isActive) {
+                    ctx.writeAndFlush(encodeActionBar(ids, frames[animationFrame % frames.size], compressionThreshold))
+                    animationFrame++
+                }
+            } catch (e: Exception) {
+                log.warn("Animation task failed for '{}'", playerName, e)
             }
         }, 0, route.reconnect.animationIntervalMillis, TimeUnit.MILLISECONDS)
     }
 
     private fun scheduleRetry(ctx: ChannelHandlerContext) {
         retryTask = ctx.channel().eventLoop().schedule({
-            attemptCount++
-            val ordered = orderBackends(route, runtime, backends)
-            tryBackends(ctx, ordered, 0)
+            try {
+                attemptCount++
+                val ordered = orderBackends(route, runtime, backends)
+                tryBackends(ctx, ordered, 0)
+            } catch (e: Exception) {
+                // A one-shot task's exception just vanishes silently otherwise, leaving this
+                // player stuck waiting forever with no further retries and nothing logged.
+                log.warn("Retry task failed for '{}', rescheduling", playerName, e)
+                scheduleRetry(ctx)
+            }
         }, currentIntervalMillis, TimeUnit.MILLISECONDS)
         currentIntervalMillis = (currentIntervalMillis * route.reconnect.backoffMultiplier)
             .toLong().coerceAtMost(route.reconnect.maxRetryIntervalMillis)
@@ -207,6 +225,7 @@ class ReconnectHandler(
 
     private fun connectToBackend(ctx: ChannelHandlerContext, addr: InetSocketAddress) {
         val clientChannel = ctx.channel()
+        val dialStartedAt = System.currentTimeMillis()
         val bootstrap = Bootstrap()
             .group(clientChannel.eventLoop())
             .channel(clientChannel.javaClass)
@@ -240,9 +259,17 @@ class ReconnectHandler(
             backendChannel.writeAndFlush(encodeLoginStart(playerName, playerUuid))
             val existing = PlayerSessions.get(playerUuid)
             PlayerSessions.put(
-                PlayerSession(playerName, playerUuid, host, existing?.remoteAddress ?: "?", addr, existing?.connectedAt ?: enteredAt)
+                PlayerSession(
+                    playerName, playerUuid, host, existing?.remoteAddress ?: "?", addr,
+                    existing?.connectedAt ?: enteredAt, clientChannel, protocolVersion, compressionThreshold,
+                    // A backend requiring encryption aborts this transfer entirely (see
+                    // BackendLoginRelay below) rather than completing it, so reaching this point
+                    // always means the new backend didn't require it.
+                    encrypted = false
+                )
             )
             runtime.recordConnectOpened(addr)
+            runtime.recordLatency(addr, System.currentTimeMillis() - dialStartedAt)
             backendChannel.closeFuture().addListener(ChannelFutureListener { runtime.recordConnectClosed(addr) })
             // The client pipeline deliberately stays on this ReconnectHandler for now - see
             // BackendLoginRelay, which only swaps it to a raw pipe once the backend's login

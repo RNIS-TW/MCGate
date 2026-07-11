@@ -14,6 +14,7 @@
         <kotlin.compiler.jvmTarget>17</kotlin.compiler.jvmTarget>
         <kotlin.version>2.3.10</kotlin.version>
         <netty.version>4.1.135.Final</netty.version>
+        <adventure.version>4.17.0</adventure.version>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
     </properties>
@@ -144,6 +145,35 @@
             <groupId>org.yaml</groupId>
             <artifactId>snakeyaml</artifactId>
             <version>2.2</version>
+        </dependency>
+        <dependency>
+            <!-- Console input with line-editing (history via up/down arrows, etc.) - a plain
+                 BufferedReader over stdin has no editing/history support at all. -->
+            <groupId>org.jline</groupId>
+            <artifactId>jline</artifactId>
+            <version>3.24.1</version>
+        </dependency>
+        <dependency>
+            <!-- MiniMessage (<red>, <gradient:...>, hex colors, <bold>, etc.) for messages.yml/
+                 config.yml text, alongside the existing legacy &-code support. -->
+            <groupId>net.kyori</groupId>
+            <artifactId>adventure-api</artifactId>
+            <version>${adventure.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>net.kyori</groupId>
+            <artifactId>adventure-text-minimessage</artifactId>
+            <version>${adventure.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>net.kyori</groupId>
+            <artifactId>adventure-text-serializer-gson</artifactId>
+            <version>${adventure.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>net.kyori</groupId>
+            <artifactId>adventure-text-serializer-legacy</artifactId>
+            <version>${adventure.version}</version>
         </dependency>
     </dependencies>
 

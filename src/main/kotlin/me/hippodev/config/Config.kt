@@ -78,7 +78,7 @@ data class Route(
     }
 
     fun resolveBackends(captures: List<String>): List<InetSocketAddress> =
-        backendTemplates.map { parseHostPort(substituteParams(it, captures)) }
+        backendTemplates.map { resolveBackendAddress(substituteParams(it, captures)) }
 }
 
 data class ApiConfig(
@@ -91,7 +91,21 @@ data class ApiConfig(
 data class GateConfig(
     val bind: String = "0.0.0.0:25565",
     val routes: List<Route> = emptyList(),
-    val api: ApiConfig = ApiConfig()
+    val api: ApiConfig = ApiConfig(),
+    /** Netty worker event-loop thread count. 0 = auto (max(4, 2x CPU cores)).
+     *
+     * Every client channel is pinned to exactly one of these threads for its whole connection -
+     * if a small VPS only gets Netty's CPU-count-based default (as few as 2 threads on a 1-2
+     * vCPU box), players split roughly evenly across them, and anything that stalls one thread
+     * (a GC pause, a slow log write, etc.) stalls every player pinned to it while the rest are
+     * unaffected - the "half the players lag" symptom. MCGate is I/O-bound, not CPU-bound, so
+     * more threads than cores is fine and just spreads players thinner across them. */
+    val workerThreads: Int = 0,
+    /** Logs every incoming connection at INFO (host, remote address, protocol version, and
+     *  whether it's a status ping or a login) as soon as the handshake is read - including status
+     *  pings, which otherwise aren't logged at all. Off by default since server-list pingers/
+     *  scanners can hit a public port frequently enough to be noisy. */
+    val logConnections: Boolean = false
 ) {
     val bindAddress: InetSocketAddress by lazy { parseHostPort(bind) }
 
@@ -114,9 +128,15 @@ data class GateConfig(
             // Higher priority routes are matched first; ties keep config file order.
             val routes = rawRoutes.mapIndexed { index, r -> parseRoute(r, index, messages) }
                 .sortedWith(compareByDescending<Route> { it.priority })
+            warmStaticBackends(routes)
             val api = parseApi(configSection["api"] as? Map<String, Any>)
+            val workerThreads = configSection["workerThreads"] as? Int ?: 0
+            val logConnections = configSection["logConnections"] as? Boolean ?: false
 
-            return GateConfig(bind = bind, routes = routes, api = api)
+            return GateConfig(
+                bind = bind, routes = routes, api = api,
+                workerThreads = workerThreads, logConnections = logConnections
+            )
         }
 
         private fun parseApi(a: Map<String, Any>?): ApiConfig {
@@ -196,6 +216,21 @@ data class GateConfig(
             )
         }
 
+        /** Pre-resolves backend hostnames that don't depend on a wildcard capture, so the DNS
+         *  cache is already warm before the first player connects - see [DnsCache]. Templated
+         *  backends (containing `$N`) can't be pre-warmed since the real hostname isn't known
+         *  until a matching connection arrives. */
+        private fun warmStaticBackends(routes: List<Route>) {
+            for (route in routes) {
+                for (template in route.backendTemplates) {
+                    if (template.contains('$')) continue
+                    val idx = template.lastIndexOf(':')
+                    if (idx < 0) continue
+                    DnsCache.warm(template.substring(0, idx), template.substring(idx + 1).toIntOrNull() ?: continue)
+                }
+            }
+        }
+
         private fun validateParams(hosts: List<String>, backends: List<String>, index: Int) {
             val maxWildcards = hosts.maxOfOrNull { HostPattern(it).wildcardCount } ?: 0
             for (backend in backends) {
@@ -257,6 +292,17 @@ fun parseHostPort(value: String, defaultPort: Int = 25565): InetSocketAddress {
         InetSocketAddress(hostPart, portPart)
     } else {
         InetSocketAddress(value, defaultPort)
+    }
+}
+
+/** Like [parseHostPort] but resolves the hostname through [DnsCache] instead of blocking
+ *  directly - see [DnsCache] for why that matters on the connection dispatch hot path. */
+fun resolveBackendAddress(value: String, defaultPort: Int = 25565): InetSocketAddress {
+    val idx = value.lastIndexOf(':')
+    return if (idx >= 0) {
+        DnsCache.resolve(value.substring(0, idx), value.substring(idx + 1).toInt())
+    } else {
+        DnsCache.resolve(value, defaultPort)
     }
 }
 

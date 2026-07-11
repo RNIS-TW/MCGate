@@ -148,11 +148,20 @@ class StatusHandler(
         }
         ctx.writeAndFlush(encodeStatusResponse(buildFallbackJson(fallback)))
     }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        // Benign in practice - server-list pingers/scanners routinely RST instead of a clean
+        // close. Log quietly instead of letting it fall through to Netty's tail-context WARN.
+        log.debug("Status connection error", cause)
+        ctx.close()
+    }
 }
 
 /** Connects to a backend just long enough to read its Status Response JSON. */
 private class BackendStatusFetcher(private val onResult: (String) -> Unit) :
     ByteToMessageDecoder() {
+
+    private val log = LoggerFactory.getLogger(BackendStatusFetcher::class.java)
 
     override fun decode(ctx: ChannelHandlerContext, buf: ByteBuf, out: MutableList<Any>) {
         val frameStart = buf.readerIndex()
@@ -171,10 +180,17 @@ private class BackendStatusFetcher(private val onResult: (String) -> Unit) :
         }
         ctx.close()
     }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        log.debug("Backend status connection error", cause)
+        ctx.close()
+    }
 }
 
 /** Echoes the client's Ping payload back as a Pong, then closes. */
 private class PingPongHandler : SimpleChannelInboundHandler<ByteBuf>() {
+    private val log = LoggerFactory.getLogger(PingPongHandler::class.java)
+
     override fun channelRead0(ctx: ChannelHandlerContext, msg: ByteBuf) {
         val frameStart = msg.readerIndex()
         val length = readVarInt(msg)
@@ -189,5 +205,12 @@ private class PingPongHandler : SimpleChannelInboundHandler<ByteBuf>() {
         } else {
             ctx.close()
         }
+    }
+
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        // Benign in practice - clients frequently RST right after reading the pong instead of
+        // a clean close.
+        log.debug("Ping connection error", cause)
+        ctx.close()
     }
 }
