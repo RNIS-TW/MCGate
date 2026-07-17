@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Console pattern intentionally mirrors the old slf4j-simple output ("HH:mm:ss [LEVEL] msg")
+     since ConsoleColors.kt regex-matches that exact shape to colorize/re-route it through JLine. -->
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>%d{HH:mm:ss} [%level] %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Plain FileAppender, not a rolling one: LogArchiver.kt gzips the previous run's
+         log/latest.log into a timestamped log/<date>_<time>.log.gz before this appender opens,
+         so every run starts a fresh latest.log rather than logback managing rotation itself. -->
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <file>log/latest.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} [%level] %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="info">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="FILE" />
+    </root>
+</configuration>

@@ -17,8 +17,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
-// Must run before the first Logger is created (see installColorConsole's doc).
-private val colorConsoleInstalled = run { installColorConsole(); true }
+// Must run before the first Logger is created (see archivePreviousLog's and
+// installColorConsole's doc).
+private val colorConsoleInstalled = run { archivePreviousLog(); installColorConsole(); true }
 private val log = LoggerFactory.getLogger("MCGate")
 
 private const val BANNER = """

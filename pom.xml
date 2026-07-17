@@ -137,9 +137,11 @@
             <version>2.0.16</version>
         </dependency>
         <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-simple</artifactId>
-            <version>2.0.16</version>
+            <!-- Replaces slf4j-simple: needed for the log/latest.log file appender (slf4j-simple
+                 is console-only). -->
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>1.5.13</version>
         </dependency>
         <dependency>
             <groupId>org.yaml</groupId>
