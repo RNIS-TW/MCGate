@@ -3,6 +3,16 @@ package me.hippodev
 import org.jline.reader.LineReader
 import java.io.PrintStream
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
+
+/** Cap on queued-but-not-yet-written console lines. Bounded deliberately: the writer thread
+ *  (below) can only drain as fast as the terminal/log collector on the other end accepts bytes,
+ *  and an unbounded queue here means a slow/stalled console (laggy SSH session, a hosting panel
+ *  scraping stdout slowly, a stuck Docker log driver) grows this queue forever - an actual
+ *  unbounded memory leak that scales with how much the server logs, never shrinks, and eventually
+ *  OOMs. Every line is still written in full to log/latest.log via the FILE appender regardless
+ *  of what happens here, so dropping console lines under backpressure loses nothing durable. */
+private const val MAX_QUEUED_LINES = 10_000
 
 /** Set by [me.hippodev.startConsole] once JLine has taken over the terminal for line editing.
  *  Log lines printed while the user is mid-command must go through [LineReader.printAbove]
@@ -44,7 +54,8 @@ fun installColorConsole() {
     val original = System.err
     val useColor = System.getenv("NO_COLOR") == null && System.console() != null
 
-    val queue = LinkedBlockingQueue<String>()
+    val queue = LinkedBlockingQueue<String>(MAX_QUEUED_LINES)
+    val droppedSinceLastNotice = AtomicLong(0)
     val writer = Thread({
         while (true) {
             val line = try {
@@ -54,6 +65,12 @@ fun installColorConsole() {
             }
             val reader = activeLineReader
             if (reader != null) reader.printAbove(line) else original.println(line)
+
+            val dropped = droppedSinceLastNotice.getAndSet(0)
+            if (dropped > 0) {
+                val notice = "... $dropped console line(s) dropped (console was falling behind)"
+                if (reader != null) reader.printAbove(notice) else original.println(notice)
+            }
         }
     }, "console-writer")
     writer.isDaemon = true
@@ -62,7 +79,13 @@ fun installColorConsole() {
     System.setErr(object : PrintStream(original, true) {
         override fun println(x: String?) {
             val text = x ?: ""
-            queue.put(if (useColor) colorize(text) else text)
+            // offer(), not put(): if the writer thread can't keep up (slow terminal/SSH
+            // session/log collector), drop the line instead of growing the queue without bound -
+            // see MAX_QUEUED_LINES. Every line is still durably written to log/latest.log by the
+            // FILE appender independently of this console path.
+            if (!queue.offer(if (useColor) colorize(text) else text)) {
+                droppedSinceLastNotice.incrementAndGet()
+            }
         }
     })
 }

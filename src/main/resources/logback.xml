@@ -9,12 +9,22 @@
         </encoder>
     </appender>
 
-    <!-- Plain FileAppender, not a rolling one: LogArchiver.kt gzips the previous run's
-         log/latest.log into a timestamped log/<date>_<time>.log.gz before this appender opens,
-         so every run starts a fresh latest.log rather than logback managing rotation itself. -->
-    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+    <!-- LogArchiver.kt gzips the *previous run's* log/latest.log into a timestamped
+         log/<date>_<time>.log.gz before this appender opens, so every run starts a fresh
+         latest.log. Within a single run, this RollingFileAppender additionally rolls latest.log
+         itself every 10,000 lines (see LineCountTriggeringPolicy) - log/latest.log becomes
+         log/latest.1.log.gz (bumping any existing latest.1.log.gz to latest.2.log.gz, etc.) and
+         logging continues into a fresh latest.log - so one long-lived run never grows a single
+         endless log file. -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <file>log/latest.log</file>
         <append>true</append>
+        <rollingPolicy class="ch.qos.logback.core.rolling.FixedWindowRollingPolicy">
+            <fileNamePattern>log/latest.%i.log.gz</fileNamePattern>
+            <minIndex>1</minIndex>
+            <maxIndex>30</maxIndex>
+        </rollingPolicy>
+        <triggeringPolicy class="me.hippodev.LineCountTriggeringPolicy" />
         <encoder>
             <pattern>%d{yyyy-MM-dd HH:mm:ss} [%level] %msg%n</pattern>
         </encoder>

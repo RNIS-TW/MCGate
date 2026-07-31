@@ -57,6 +57,15 @@ class LoginRelayHandler(
     private var encrypted = false
     private var clientRemoteAddress: String = "?"
     private lateinit var frontendChannel: Channel
+    /** Guards [handshakeFrame]/[pending] against a double-release: they're normally released once
+     *  the backend dial resolves (success or all-attempts-exhausted, in [connect]), but if the
+     *  client disconnects *while a dial is still in flight*, [channelInactive] releases them right
+     *  away instead of leaving them held for however long the in-flight dial takes to time out -
+     *  see [releasePendingBuffers]. Only ever touched on this channel's event-loop thread (every
+     *  caller - channelRead, channelInactive, and the connect()/bootstrap listeners below, since
+     *  the backend Bootstrap is built with `.group(clientChannel.eventLoop())` - runs on it), so
+     *  a plain Boolean is enough. */
+    private var pendingReleased = false
 
     /** Must be called explicitly right after this handler is added to the pipeline -
      *  channelActive() will not fire since the channel is already active by then. */
@@ -97,9 +106,7 @@ class LoginRelayHandler(
                 return
             }
 
-            handshakeFrame.release()
-            pending.forEach { it.release() }
-            pending.clear()
+            releasePendingBuffers()
 
             val name = playerName
             val uuid = playerUuid
@@ -144,6 +151,14 @@ class LoginRelayHandler(
             }
 
             val channel = future.channel()
+            if (pendingReleased) {
+                // Client disconnected while this dial was in flight - channelInactive already
+                // released handshakeFrame/pending (see releasePendingBuffers), so there's nothing
+                // left to relay to this backend. Don't touch either buffer again (would
+                // double-release) and don't leave this now-pointless backend connection open.
+                channel.close()
+                return@ChannelFutureListener
+            }
             backendChannel = channel
             backendAddr = addr
             connectedAt = System.currentTimeMillis()
@@ -167,6 +182,7 @@ class LoginRelayHandler(
             } else {
                 channel.writeAndFlush(handshakeFrame)
             }
+            pendingReleased = true // handshakeFrame is now spent either way - see the guard above
 
             clientChannel.config().isAutoRead = true
             while (pending.isNotEmpty()) {
@@ -175,10 +191,30 @@ class LoginRelayHandler(
         })
     }
 
+    /** Releases [handshakeFrame]/[pending] exactly once, however the dial ends up resolving - see
+     *  [pendingReleased]. */
+    private fun releasePendingBuffers() {
+        if (pendingReleased) return
+        pendingReleased = true
+        handshakeFrame.release()
+        pending.forEach { it.release() }
+        pending.clear()
+    }
+
     override fun channelInactive(ctx: ChannelHandlerContext) {
         backendAddr?.let { logDisconnect(ctx.channel().remoteAddress(), it) }
         playerUuid?.let { PlayerSessions.remove(it) }
         closeOnFlush(backendChannel)
+        // If a backend dial is still in flight when the client disconnects, this is what actually
+        // frees handshakeFrame/pending - previously they just sat there, still referenced, until
+        // whatever backend dial was in progress happened to resolve on its own (up to
+        // CONNECT_TIMEOUT_MILLIS per remaining backend in the route) - a real, if bounded, delay
+        // in freeing memory that shows up under Netty's leak detector as a ByteBuf whose access
+        // trail is empty (this handler is a raw ChannelInboundHandlerAdapter, not a
+        // ByteToMessageDecoder, so it never calls touch()) once GC finally collects it. The
+        // connect()/bootstrap-listener continuation now checks [pendingReleased] and backs off
+        // instead of touching either buffer again.
+        releasePendingBuffers()
     }
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {

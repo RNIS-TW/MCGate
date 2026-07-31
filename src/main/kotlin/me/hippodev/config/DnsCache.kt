@@ -7,6 +7,13 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val CACHE_TTL_MILLIS = 60_000L
+/** How long an entry can go un-looked-up before the periodic sweep evicts it. Matters for
+ *  wildcard routes with hostname (not IP-literal) backend templates: every distinct captured
+ *  value resolves to its own cache key, and without this, a hostname nobody connects to anymore
+ *  (an old/rotated subdomain, a one-off captured value) would sit in [DnsCache.cache] forever -
+ *  unbounded growth over the process's lifetime. A host still being actively used gets refreshed
+ *  well within this window (see [DnsCache.resolve]) and is never swept. */
+private const val ENTRY_IDLE_EVICT_MILLIS = 10 * 60_000L
 private val ipLiteralPattern = Regex("""^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$""")
 
 /**
@@ -35,6 +42,27 @@ object DnsCache {
     }
     private val cache = ConcurrentHashMap<String, Entry>()
     private val refreshing = ConcurrentHashMap<String, AtomicBoolean>()
+
+    init {
+        val reaper = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "dns-cache-reaper").apply { isDaemon = true }
+        }
+        reaper.scheduleAtFixedRate(
+            { evictIdleEntries() }, ENTRY_IDLE_EVICT_MILLIS, ENTRY_IDLE_EVICT_MILLIS,
+            java.util.concurrent.TimeUnit.MILLISECONDS
+        )
+    }
+
+    /** A still-live entry's [Entry.expiresAt] keeps getting pushed forward every [resolve] call
+     *  (directly on first lookup, via [refreshAsync] afterward) - so an entry whose expiry is more
+     *  than [ENTRY_IDLE_EVICT_MILLIS] in the past hasn't been looked up in at least that long and
+     *  is safe to drop; the next [resolve] for that host just pays a fresh lookup, identical to a
+     *  never-before-seen host. */
+    private fun evictIdleEntries() {
+        val cutoff = System.currentTimeMillis() - ENTRY_IDLE_EVICT_MILLIS
+        cache.entries.removeIf { it.value.expiresAt < cutoff }
+        refreshing.keys.retainAll(cache.keys)
+    }
 
     /** Resolves `host:port`. May block the calling thread on the first-ever lookup for a given
      *  hostname; never blocks for IP literals or once a value is cached. */

@@ -19,17 +19,30 @@ class RouteRuntime {
         activeConnections.computeIfAbsent(addr) { AtomicInteger(0) }.incrementAndGet()
     }
 
+    /** Removes [addr]'s entry once its count drops to zero rather than leaving a permanent
+     *  zero-valued entry behind - matters for wildcard routes (`$N`-templated backends), where
+     *  every distinct captured value resolves to a different address and, without this, would
+     *  leave one entry here forever for every backend ever dialed over the process's lifetime. */
     fun recordConnectClosed(addr: InetSocketAddress) {
-        activeConnections[addr]?.decrementAndGet()
+        activeConnections.computeIfPresent(addr) { _, count ->
+            if (count.decrementAndGet() <= 0) null else count
+        }
     }
 
     fun recordLatency(addr: InetSocketAddress, millis: Long) {
         latency[addr] = millis to System.currentTimeMillis()
     }
 
+    /** Same unbounded-growth concern as [recordConnectClosed] applies here - an expired reading
+     *  is actively evicted rather than just reported as absent, so a backend address that stops
+     *  being dialed (e.g. a wildcard route's captured value nobody uses anymore) doesn't leave its
+     *  latency entry in the map forever. */
     fun latencyOf(addr: InetSocketAddress): Long? {
         val (millis, measuredAt) = latency[addr] ?: return null
-        if (System.currentTimeMillis() - measuredAt > LATENCY_TTL_MILLIS) return null
+        if (System.currentTimeMillis() - measuredAt > LATENCY_TTL_MILLIS) {
+            latency.remove(addr)
+            return null
+        }
         return millis
     }
 }
