@@ -80,6 +80,10 @@ class HandshakeSniffer(
         val nulIdx = host.indexOf('\u0000')
         if (nulIdx >= 0) host = host.substring(0, nulIdx)
 
+        // Strip a trailing DNS root dot (e.g. "sv.xxx.com."), which some clients/launchers
+        // send, so a single route pattern matches without needing a duplicate "host." entry.
+        if (host.endsWith('.')) host = host.trimEnd('.')
+
         val port = buf.readUnsignedShort()
         val nextState = readVarInt(buf)
 

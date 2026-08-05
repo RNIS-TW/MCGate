@@ -4,6 +4,7 @@ import io.netty.channel.Channel
 import io.netty.channel.ChannelFuture
 import io.netty.channel.ChannelFutureListener
 import me.hippodev.protocol.encodePlayDisconnect
+import me.hippodev.protocol.encodeTransfer
 import me.hippodev.protocol.reconnectPacketIds
 import me.hippodev.protocol.reconnectSupported
 import me.hippodev.protocol.toLegacyText
@@ -88,5 +89,24 @@ object PlayerSessions {
             session.channel.close()
         }
         return session.channel.closeFuture()
+    }
+
+    /** Sends a Play-state `transfer` packet telling [uuid]'s client to close this connection and
+     *  open a brand-new one directly to [host]:[port] - MCGate is no longer in that new
+     *  connection's path at all afterward (see [encodeTransfer]'s doc). Requires the same
+     *  framing prerequisites as a kick message ([reconnectSupported] protocol, not
+     *  [PlayerSession.encrypted]) since it's just another synthesized packet on this connection.
+     *
+     *  Returns null on success, or a reason string if the session couldn't be transferred (no such
+     *  player, encrypted connection, or unsupported protocol) - the console `transfer` command logs
+     *  whichever comes back. */
+    fun transfer(uuid: UUID, host: String, port: Int): String? {
+        val session = sessions[uuid] ?: return "no such player is connected"
+        if (session.encrypted) return "connection is online-mode encrypted"
+        if (!reconnectSupported(session.protocolVersion)) return "protocol ${session.protocolVersion} has no packet-ID table"
+        val ids = reconnectPacketIds(session.protocolVersion)
+        session.channel.writeAndFlush(encodeTransfer(ids, host, port, session.compressionThreshold))
+            .addListener(ChannelFutureListener.CLOSE)
+        return null
     }
 }

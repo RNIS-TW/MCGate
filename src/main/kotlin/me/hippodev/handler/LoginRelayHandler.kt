@@ -12,9 +12,11 @@ import io.netty.channel.ChannelOption
 import io.netty.channel.SimpleChannelInboundHandler
 import io.netty.channel.socket.SocketChannel
 import io.netty.handler.codec.ByteToMessageDecoder
+import me.hippodev.applyTunedKeepalive
 import me.hippodev.config.*
 import me.hippodev.routing.*
 import me.hippodev.protocol.*
+import me.hippodev.voice.VoiceRouting
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 
@@ -71,7 +73,7 @@ class LoginRelayHandler(
      *  channelActive() will not fire since the channel is already active by then. */
     fun start(ctx: ChannelHandlerContext) {
         ctx.channel().config().isAutoRead = false
-        clientRemoteAddress = ctx.channel().remoteAddress()?.toString() ?: "?"
+        clientRemoteAddress = ctx.channel().effectiveRemoteAddress().toString()
         frontendChannel = ctx.channel()
         connect(ctx, orderBackends(route, runtime, backends), 0)
     }
@@ -137,6 +139,12 @@ class LoginRelayHandler(
             .channel(clientChannel.javaClass)
             .option(ChannelOption.TCP_NODELAY, true)
             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
+            // Same reasoning as the client-facing listener's SO_KEEPALIVE (see Main.kt) - a NAT/
+            // firewall between MCGate and the backend can just as easily decide this leg looks
+            // idle and drop it, especially since the backend often sits on internal/private
+            // infrastructure with its own middleboxes.
+            .option(ChannelOption.SO_KEEPALIVE, true)
+            .applyTunedKeepalive()
             .handler(object : ChannelInitializer<SocketChannel>() {
                 override fun initChannel(ch: SocketChannel) {
                     ch.pipeline().addLast(BackendLoginSniffer(clientChannel))
@@ -164,16 +172,16 @@ class LoginRelayHandler(
             connectedAt = System.currentTimeMillis()
             runtime.recordConnectOpened(addr)
             runtime.recordLatency(addr, connectedAt - dialStartedAt)
-            log.info("Connected: '{}' from {} -> {}", host, clientChannel.remoteAddress(), addr)
+            log.info("Connected: '{}' from {} -> {}", host, clientChannel.effectiveRemoteAddress(), addr)
             logLoginIfReady()
 
             channel.closeFuture().addListener(ChannelFutureListener {
                 runtime.recordConnectClosed(addr)
-                logDisconnect(clientChannel.remoteAddress(), addr)
+                logDisconnect(clientChannel.effectiveRemoteAddress(), addr)
             })
 
             if (route.proxyProtocol) {
-                channel.writeAndFlush(buildProxyProtocolHeader(clientChannel.remoteAddress(), addr))
+                channel.writeAndFlush(buildProxyProtocolHeader(clientChannel.effectiveRemoteAddress(), addr))
             }
 
             if (route.modifyVirtualHost) {
@@ -202,8 +210,9 @@ class LoginRelayHandler(
     }
 
     override fun channelInactive(ctx: ChannelHandlerContext) {
-        backendAddr?.let { logDisconnect(ctx.channel().remoteAddress(), it) }
+        backendAddr?.let { logDisconnect(ctx.channel().effectiveRemoteAddress(), it) }
         playerUuid?.let { PlayerSessions.remove(it) }
+        VoiceRouting.unregisterChannel(ctx.channel())
         closeOnFlush(backendChannel)
         // If a backend dial is still in flight when the client disconnects, this is what actually
         // frees handshakeFrame/pending - previously they just sat there, still referenced, until

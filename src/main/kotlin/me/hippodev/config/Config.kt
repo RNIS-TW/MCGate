@@ -66,7 +66,13 @@ data class Route(
     val modifyVirtualHost: Boolean,
     val proxyProtocol: Boolean,
     val priority: Int,
-    val reconnect: ReconnectConfig
+    val reconnect: ReconnectConfig,
+    /** Optional UDP backend (Simple Voice Chat or similar mods) for this route, relayed by
+     *  [me.hippodev.voice.VoiceRelay] on the same port as the Minecraft TCP listener - no
+     *  separate port to open. Empty when the route has no `voicechat:` entry. Only the first
+     *  template is used: unlike `backend`, there's no failover/load-balancing concept for a UDP
+     *  relay session once it's been handed off to a backend. */
+    val voicechatTemplates: List<String> = emptyList()
 ) {
     /** Returns the wildcard captures of the first matching host pattern, or null if none match. */
     fun match(hostname: String): List<String>? {
@@ -79,6 +85,11 @@ data class Route(
 
     fun resolveBackends(captures: List<String>): List<InetSocketAddress> =
         backendTemplates.map { resolveBackendAddress(substituteParams(it, captures)) }
+
+    /** Same resolution (param substitution + [DnsCache]) as [resolveBackends], for the optional
+     *  `voicechat:` backend. Null when this route has none configured. */
+    fun resolveVoicechat(captures: List<String>): InetSocketAddress? =
+        voicechatTemplates.firstOrNull()?.let { resolveBackendAddress(substituteParams(it, captures)) }
 }
 
 data class ApiConfig(
@@ -105,7 +116,16 @@ data class GateConfig(
      *  whether it's a status ping or a login) as soon as the handshake is read - including status
      *  pings, which otherwise aren't logged at all. Off by default since server-list pingers/
      *  scanners can hit a public port frequently enough to be noisy. */
-    val logConnections: Boolean = false
+    val logConnections: Boolean = false,
+    /** Accept a PROXY protocol (v1/v2) header at the start of every incoming connection, before
+     *  the Minecraft handshake - for when MCGate itself sits behind another load balancer/proxy
+     *  that needs to hand it the real client address. Distinct from a [Route]'s own
+     *  `proxyProtocol`, which is MCGate *sending* that header onward to its backend; this is
+     *  MCGate *receiving* one from whatever's in front of it. Off by default: a plain client
+     *  connecting straight to MCGate does not send this header, so turning it on when nothing
+     *  upstream actually sends one just makes every real connection look like garbage and get
+     *  dropped. */
+    val proxyProtocol: Boolean = false
 ) {
     val bindAddress: InetSocketAddress by lazy { parseHostPort(bind) }
 
@@ -132,10 +152,11 @@ data class GateConfig(
             val api = parseApi(configSection["api"] as? Map<String, Any>)
             val workerThreads = configSection["workerThreads"] as? Int ?: 0
             val logConnections = configSection["logConnections"] as? Boolean ?: false
+            val proxyProtocol = configSection["proxyProtocol"] as? Boolean ?: false
 
             return GateConfig(
                 bind = bind, routes = routes, api = api,
-                workerThreads = workerThreads, logConnections = logConnections
+                workerThreads = workerThreads, logConnections = logConnections, proxyProtocol = proxyProtocol
             )
         }
 
@@ -165,6 +186,14 @@ data class GateConfig(
 
             validateParams(hosts, backends, index)
 
+            val voicechatRaw = r["voicechat"]
+            val voicechatBackends = when (voicechatRaw) {
+                is List<*> -> voicechatRaw.map { it.toString() }
+                is String -> listOf(voicechatRaw)
+                else -> emptyList()
+            }
+            if (voicechatBackends.isNotEmpty()) validateParams(hosts, voicechatBackends, index, "voicechat")
+
             val strategy = Strategy.parse(r["strategy"] as? String)
             val ttl = parseDuration(r["cachePingTTL"] as? String ?: "10s")
             val fallback = parseFallback(r["fallback"] as? Map<String, Any>)
@@ -182,7 +211,8 @@ data class GateConfig(
                 modifyVirtualHost = modifyVirtualHost,
                 proxyProtocol = proxyProtocol,
                 priority = priority,
-                reconnect = reconnect
+                reconnect = reconnect,
+                voicechatTemplates = voicechatBackends
             )
         }
 
@@ -239,7 +269,7 @@ data class GateConfig(
          *  until a matching connection arrives. */
         private fun warmStaticBackends(routes: List<Route>) {
             for (route in routes) {
-                for (template in route.backendTemplates) {
+                for (template in route.backendTemplates + route.voicechatTemplates) {
                     if (template.contains('$')) continue
                     val idx = template.lastIndexOf(':')
                     if (idx < 0) continue
@@ -248,7 +278,7 @@ data class GateConfig(
             }
         }
 
-        private fun validateParams(hosts: List<String>, backends: List<String>, index: Int) {
+        private fun validateParams(hosts: List<String>, backends: List<String>, index: Int, label: String = "backend") {
             val maxWildcards = hosts.maxOfOrNull { HostPattern(it).wildcardCount } ?: 0
             for (backend in backends) {
                 val matcher = paramRefPattern.matcher(backend)
@@ -256,13 +286,13 @@ data class GateConfig(
                     val n = matcher.group(1).toInt()
                     if (maxWildcards == 0) {
                         log.warn(
-                            "Route #{}: backend '{}' references \${}, but host pattern has no wildcards - it won't be substituted",
-                            index, backend, n
+                            "Route #{}: {} '{}' references \${}, but host pattern has no wildcards - it won't be substituted",
+                            index, label, backend, n
                         )
                     } else if (n > maxWildcards) {
                         log.warn(
-                            "Route #{}: backend '{}' references \${}, but only {} wildcard(s) are captured",
-                            index, backend, n, maxWildcards
+                            "Route #{}: {} '{}' references \${}, but only {} wildcard(s) are captured",
+                            index, label, backend, n, maxWildcards
                         )
                     }
                 }

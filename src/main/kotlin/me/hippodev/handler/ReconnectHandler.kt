@@ -19,6 +19,7 @@ import me.hippodev.routing.PlayerSessions
 import me.hippodev.routing.RouteRuntime
 import me.hippodev.routing.orderBackends
 import me.hippodev.routing.pingBackendLive
+import me.hippodev.voice.VoiceRouting
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.util.UUID
@@ -383,6 +384,7 @@ class ReconnectHandler(
         done = true
         cancelSchedules()
         PlayerSessions.remove(playerUuid)
+        VoiceRouting.unregisterChannel(ctx.channel())
         super.channelInactive(ctx)
     }
 

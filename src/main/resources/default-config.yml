@@ -20,10 +20,27 @@ config:
     enabled: false
     bind: localhost:8080
 
+  # Accept a PROXY protocol (v1/v2) header at the start of every incoming connection, before the
+  # Minecraft handshake - for when MCGate itself sits behind another load balancer/proxy that
+  # needs to hand it the real client address (bind above then becomes the load balancer's address,
+  # not the public one). Distinct from a route's own `proxyProtocol`, which is MCGate *sending*
+  # that header onward to its backend - this is MCGate *receiving* one from whatever's in front of
+  # it. Whatever sits in front of MCGate must actually send this header on every connection, or
+  # every real client gets dropped as a malformed handshake. Off by default.
+  proxyProtocol: false
+
   routes:
     # Simple 1:1 host -> backend mapping.
     - host: survival.example.com
       backend: 127.0.0.1:25566
+
+    # Optional UDP passthrough for voice mods (Simple Voice Chat and similar) - relayed on the
+    # same bind port above, no extra port to open. Resolved the same way as `backend` (DNS
+    # caching, $N param substitution from wildcard hosts), but only a single address, since a UDP
+    # relay session has no failover/load-balancing concept once it's handed off to a backend.
+    - host: voice.example.com
+      backend: 127.0.0.1:25566
+      voicechat: 127.0.0.1:24454
 
     # Multiple hostnames routed to the same backend.
     - host: [creative.example.com, creative-alt.example.com]

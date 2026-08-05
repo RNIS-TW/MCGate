@@ -167,7 +167,7 @@ class StatusHandler(
             // backend from here. Client's real remote address is available since this probe
             // rides on the same ctx as the actual player connection.
             if (route.proxyProtocol) {
-                val clientAddr = ctx.channel().remoteAddress() as? InetSocketAddress
+                val clientAddr = ctx.channel().effectiveRemoteAddress() as? InetSocketAddress
                 if (clientAddr != null) {
                     backendChannel.writeAndFlush(encodeProxyProtocolHeader(clientAddr, addr))
                 }

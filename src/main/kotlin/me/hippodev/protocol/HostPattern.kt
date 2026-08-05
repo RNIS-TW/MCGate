@@ -11,9 +11,12 @@ class HostPattern(val raw: String) {
     private val regex: Pattern
 
     init {
+        // Normalize a trailing DNS root dot in the pattern itself, matching the trim
+        // applied to client-sent hostnames in HandshakeSniffer.
+        val normalized = raw.trimEnd('.')
         val sb = StringBuilder("^")
         var count = 0
-        for (c in raw) {
+        for (c in normalized) {
             when (c) {
                 '*' -> {
                     sb.append("(.*)")

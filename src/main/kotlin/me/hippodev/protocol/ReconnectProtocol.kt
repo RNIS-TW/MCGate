@@ -32,7 +32,13 @@ data class ReconnectPacketIds(
     val playChunkDataAndUpdateLight: Int,
     val playStartConfiguration: Int,
     val playAckConfiguration: Int,
-    val playDisconnect: Int
+    val playDisconnect: Int,
+    /** Play-state clientbound `transfer` - tells the client to close this connection and open a
+     *  brand-new one directly to a given host:port (see [encodeTransfer]'s doc for the ID and how
+     *  it was verified). Used by the console `transfer` command; unrelated to the auto-reconnect-
+     *  hold feature this table otherwise serves, same as [playDisconnect] (reused purely as
+     *  framing infrastructure for the `kick` command). */
+    val playTransfer: Int
 )
 
 // Protocol 774 (1.21.11), 775 (26.1/26.1.1/26.1.2), and 776 (26.2) share this exact packet-ID
@@ -59,7 +65,8 @@ private val CURRENT_BRACKET = ReconnectPacketIds(
     playChunkDataAndUpdateLight = 0x2D,
     playStartConfiguration = 0x76,
     playAckConfiguration = 0x10,
-    playDisconnect = 0x20
+    playDisconnect = 0x20,
+    playTransfer = 0x81
 )
 
 private val BRACKETS: Map<Int, ReconnectPacketIds> = mapOf(
@@ -146,6 +153,25 @@ fun encodePlayDisconnect(ids: ReconnectPacketIds, renderedReasonText: String, co
     writeVarInt(payload, ids.playDisconnect)
     payload.writeByte(Nbt.STRING)
     Nbt.writeString(payload, renderedReasonText)
+    return frame(payload, compressionThreshold)
+}
+
+/** Play state clientbound `transfer` (id 0x81 as of protocol 776/26.2 - introduced at 0x0B in
+ *  protocol 766/1.20.5, no Play-state packet ID change recorded in the Protocol History changelog
+ *  between 766 and 776, so the live 776 value is taken to hold for the whole 774-776 bracket too,
+ *  same reasoning as the rest of this file's table). Tells the client to close this connection
+ *  and open a brand-new one directly to [host]:[port], sending a Handshake with intent 3
+ *  (transfer) - MCGate is no longer in that new connection's path at all, unlike the same-
+ *  connection splice [beginTransfer][me.hippodev.handler.ReconnectHandler.beginTransfer] uses for
+ *  auto-reconnect. Only meaningful on a client that actually supports it (protocol >= 766); this
+ *  codebase only has a verified packet-ID table for [reconnectSupported] versions, so callers must
+ *  check that first same as every other encoder in this file. Port is an unsigned short, not a
+ *  VarInt, per the packet's wire format. */
+fun encodeTransfer(ids: ReconnectPacketIds, host: String, port: Int, compressionThreshold: Int): ByteBuf {
+    val payload = Unpooled.buffer()
+    writeVarInt(payload, ids.playTransfer)
+    writeString(payload, host)
+    payload.writeShort(port)
     return frame(payload, compressionThreshold)
 }
 

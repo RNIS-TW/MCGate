@@ -11,7 +11,10 @@ import io.netty.channel.socket.nio.NioServerSocketChannel
 import me.hippodev.api.ApiServer
 import me.hippodev.config.*
 import me.hippodev.handler.*
+import me.hippodev.protocol.effectiveRemoteAddress
 import me.hippodev.routing.*
+import me.hippodev.voice.VoiceRelay
+import me.hippodev.voice.VoiceRouting
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -54,6 +57,7 @@ fun main(args: Array<String>) {
     val startedAt = System.currentTimeMillis()
     println(BANNER)
     log.info("MCGate v{}", version)
+    logNetworkInterfaces()
 
     val configPath = args.firstOrNull() ?: "config.yml"
     val messagesPath = args.getOrNull(1) ?: "messages.yml"
@@ -126,9 +130,23 @@ fun main(args: Array<String>) {
             .channel(NioServerSocketChannel::class.java)
             .option(ChannelOption.SO_BACKLOG, 128)
             .childOption(ChannelOption.TCP_NODELAY, true)
+            // Some hosting providers put a NAT/firewall/load balancer in front of the box that
+            // tracks raw TCP activity rather than Minecraft-protocol keepalives, and silently
+            // drops a connection it decides looks idle (an AFK player shows up client-side as a
+            // generic "connection interrupted" kick, with nothing in MCGate's own log explaining
+            // why - the OS just reports the socket as reset/closed). SO_KEEPALIVE makes the OS
+            // send its own periodic TCP-level probes, which is exactly what such middleboxes look
+            // for to keep the mapping alive, independent of whatever the Minecraft protocol itself
+            // is or isn't sending at the time.
+            .childOption(ChannelOption.SO_KEEPALIVE, true)
+            .applyTunedKeepalive()
             .childHandler(object : ChannelInitializer<SocketChannel>() {
                 override fun initChannel(ch: SocketChannel) {
                     val pipeline = ch.pipeline()
+                    if (stateRef.get().config.proxyProtocol) {
+                        pipeline.addLast(io.netty.handler.codec.haproxy.HAProxyMessageDecoder())
+                        pipeline.addLast(ProxyProtocolAttributeHandler())
+                    }
                     pipeline.addLast(HandshakeSniffer { ctx, protocolVersion, host, port, nextState, rawFrame ->
                         dispatch(ctx, stateRef.get(), pingCache, protocolVersion, host, port, nextState, rawFrame)
                     })
@@ -137,6 +155,13 @@ fun main(args: Array<String>) {
 
         val channel = bootstrap.bind(initialConfig.bindAddress).sync().channel()
         log.info("Listening on {}", initialConfig.bindAddress)
+
+        // Shares the TCP listener's own worker group rather than spinning up a separate one -
+        // relaying UDP voice traffic is just as I/O-bound as relaying player TCP bytes, and it
+        // binds to the very same address/port (see VoiceRelay's doc for why that needs a NAT-like
+        // per-client socket rather than one shared backend-facing channel).
+        val voiceRelay = VoiceRelay(workerGroup)
+        voiceRelay.start(initialConfig.bindAddress)
 
         val startupSeconds = (System.currentTimeMillis() - startedAt) / 1000.0
         log.info("Done (%.3fs)! For help, type \"help\"".format(startupSeconds))
@@ -153,6 +178,7 @@ fun main(args: Array<String>) {
             if (stopped.compareAndSet(false, true)) {
                 log.info("Shutdown signal received, stopping...")
                 channel.close().sync()
+                voiceRelay.stop()
                 bossGroup.shutdownGracefully().sync()
                 workerGroup.shutdownGracefully().sync()
                 log.info("Stopped.")
@@ -255,6 +281,35 @@ private fun startConsole(
                             }
                         }
                     }
+                    "transfer" -> {
+                        val rest = line.trim().substringAfter(' ', "").trim()
+                        val name = rest.substringBefore(' ')
+                        val target = rest.substringAfter(' ', "").trim()
+                        when {
+                            name.isEmpty() || target.isEmpty() -> log.info("Usage: transfer <player> <host:port>")
+                            else -> {
+                                val addr = try {
+                                    parseHostPort(target)
+                                } catch (e: Exception) {
+                                    log.info("Invalid host:port '{}'", target)
+                                    null
+                                }
+                                if (addr != null) {
+                                    val session = PlayerSessions.findByName(name)
+                                    if (session == null) {
+                                        log.info("No player named '{}' is connected.", name)
+                                    } else {
+                                        val error = PlayerSessions.transfer(session.uuid, addr.hostString, addr.port)
+                                        if (error == null) {
+                                            log.info("Transferring '{}' to {}.", session.name, target)
+                                        } else {
+                                            log.info("Can't transfer '{}': {}", session.name, error)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     "whois" -> {
                         val name = line.trim().substringAfter(' ', "").trim()
                         when {
@@ -282,6 +337,7 @@ private fun printHelp() {
     log.info("  players, list, playerlist - list connected players")
     log.info("  whois <player>           - show full session detail for one player")
     log.info("  kick <player> [message]  - disconnect a player, optionally with a message")
+    log.info("  transfer <player> <host:port> - send a player directly to another Minecraft server")
     log.info("  routes                   - list configured routes and backend status")
     log.info("  reload                   - re-read config.yml and messages.yml now")
     log.info("  uptime                   - show how long MCGate has been running")
@@ -296,6 +352,29 @@ private fun backendLatency(state: GateState, host: String, addr: java.net.InetSo
     if (addr == null) return null
     val route = state.config.routes.firstOrNull { it.match(host) != null } ?: return null
     return state.routeRuntimes[route]?.latencyOf(addr)
+}
+
+/** Logs every up network interface and its addresses at startup - mainly useful on multi-homed
+ *  hosts (multiple NICs/public IPs, e.g. separate TCP and UDP egress paths) to see at a glance
+ *  which local address an outbound connection would actually use, since that's otherwise picked
+ *  silently by the OS's routing table and isn't visible anywhere else in MCGate's own logging. */
+private fun logNetworkInterfaces() {
+    try {
+        val interfaces = java.net.NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList()
+        for (iface in interfaces) {
+            if (!iface.isUp) continue
+            val addrs = iface.inetAddresses.toList().map { it.hostAddress }
+            if (addrs.isEmpty()) continue
+            val flags = buildList {
+                if (iface.isLoopback) add("loopback")
+                if (iface.isVirtual) add("virtual")
+                if (iface.isPointToPoint) add("point-to-point")
+            }.joinToString(", ")
+            log.info("Network interface '{}'{}: {}", iface.displayName, if (flags.isEmpty()) "" else " ($flags)", addrs.joinToString(", "))
+        }
+    } catch (e: Exception) {
+        log.warn("Failed to enumerate network interfaces: {}", e.toString())
+    }
 }
 
 private fun formatDuration(millis: Long): String {
@@ -379,7 +458,7 @@ private fun dispatch(
 ) {
     if (state.config.logConnections) {
         val kind = if (nextState == 1) "status" else "login"
-        log.info("Connection: host='{}' from {} ({}, protocol {})", host, ctx.channel().remoteAddress(), kind, protocolVersion)
+        log.info("Connection: host='{}' from {} ({}, protocol {})", host, ctx.channel().effectiveRemoteAddress(), kind, protocolVersion)
     }
 
     var route: Route? = null
@@ -396,7 +475,7 @@ private fun dispatch(
         }
 
         if (route == null) {
-            log.info("No route for host '{}', closing connection from {}", host, ctx.channel().remoteAddress())
+            log.info("No route for host '{}', closing connection from {}", host, ctx.channel().effectiveRemoteAddress())
             rawFrame.release()
             ctx.close()
             return
@@ -407,7 +486,7 @@ private fun dispatch(
         // Route matching/backend resolution is config-driven (regex, DNS, param substitution) -
         // a bug or bad edge case here must only drop this one connection, never take the rest of
         // the server down with it.
-        log.warn("Failed to route connection for host '{}' from {}: {}", host, ctx.channel().remoteAddress(), e.toString())
+        log.warn("Failed to route connection for host '{}' from {}: {}", host, ctx.channel().effectiveRemoteAddress(), e.toString())
         rawFrame.release()
         ctx.close()
         return
@@ -426,9 +505,26 @@ private fun dispatch(
             )
         }
         else -> {
+            registerVoicechatRoute(ctx, resolvedRoute, captures, host)
             val relay = LoginRelayHandler(resolvedRoute, runtime, backends, protocolVersion, host, port, rawFrame)
             ctx.pipeline().addAfter(handlerName, "relay", relay)
             relay.start(ctx)
         }
+    }
+}
+
+/** Records this connecting client's IP -> voicechat backend mapping (see [VoiceRouting]) if
+ *  [route] has a `voicechat:` backend configured, so [VoiceRelay] can relay this player's UDP
+ *  voice traffic once it starts arriving. UDP carries no hostname to route by, so this is the
+ *  only point where that association can be made - resolution/param-substitution failures here
+ *  must only skip voice routing for this connection, never break the player's actual TCP login. */
+private fun registerVoicechatRoute(ctx: ChannelHandlerContext, route: Route, captures: List<String>, host: String) {
+    if (route.voicechatTemplates.isEmpty()) return
+    try {
+        val voiceBackend = route.resolveVoicechat(captures) ?: return
+        val clientAddr = ctx.channel().effectiveRemoteAddress() as? java.net.InetSocketAddress ?: return
+        VoiceRouting.register(clientAddr.address.hostAddress, voiceBackend)
+    } catch (e: Exception) {
+        log.warn("Failed to resolve voicechat backend for host '{}': {}", host, e.toString())
     }
 }
