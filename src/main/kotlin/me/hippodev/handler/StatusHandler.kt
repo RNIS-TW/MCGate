@@ -129,6 +129,10 @@ class StatusHandler(
             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
             .handler(object : ChannelInitializer<SocketChannel>() {
                 override fun initChannel(ch: SocketChannel) {
+                    // A backend that accepts the TCP connection but never sends a status response
+                    // (and never errors) would otherwise leave this probe channel open
+                    // indefinitely. Fail it like any other unreachable backend after 5s of silence.
+                    ch.pipeline().addLast(io.netty.handler.timeout.ReadTimeoutHandler(5))
                     ch.pipeline().addLast(BackendStatusFetcher { json ->
                         runtime.recordLatency(addr, System.currentTimeMillis() - startTime)
                         // MCGate otherwise relays this straight to the connecting client with zero

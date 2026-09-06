@@ -40,7 +40,7 @@ data class FallbackStatus(
  * connected to MCGate itself (no separate holding server needed) and transfers them onto the real
  * backend once it's reachable again. Only supported for clients on protocol versions covered by
  * [me.hippodev.protocol.ReconnectProtocol] (currently just the latest bracket - see that file);
- * other clients always get the plain [kickMessage] disconnect.
+ * other clients always get the plain [Route.kickMessage] disconnect.
  */
 data class ReconnectConfig(
     val enabled: Boolean = false,
@@ -53,8 +53,7 @@ data class ReconnectConfig(
     val subtitle: String = "&7Waiting to reconnect...",
     val attemptSuffix: String = " (attempt {attempt})",
     val actionBarFrames: List<String> = listOf("&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."),
-    val animationIntervalMillis: Long = 500,
-    val kickMessage: String = "&cServer is offline. Please reconnect shortly."
+    val animationIntervalMillis: Long = 500
 )
 
 data class Route(
@@ -67,6 +66,12 @@ data class Route(
     val proxyProtocol: Boolean,
     val priority: Int,
     val reconnect: ReconnectConfig,
+    /** Message shown when this route's backends are all unreachable and the player is kicked
+     *  outright (no reconnect-holding, or reconnect not supported for their client). Its own
+     *  top-level setting - not part of `reconnect:` - since it's sent regardless of whether
+     *  reconnect-holding is enabled for this route. Defaults to messages.yml's `kickMessage`,
+     *  overridable per-route via config.yml's top-level `kickMessage`. */
+    val kickMessage: String,
     /** Optional UDP backend (Simple Voice Chat or similar mods) for this route, relayed by
      *  [me.hippodev.voice.VoiceRelay] on the same port as the Minecraft TCP listener - no
      *  separate port to open. Empty when the route has no `voicechat:` entry. Only the first
@@ -92,6 +97,17 @@ data class Route(
         voicechatTemplates.firstOrNull()?.let { resolveBackendAddress(substituteParams(it, captures)) }
 }
 
+/**
+ * A standalone static UDP forward: every datagram received on [bind] is relayed to [backend],
+ * keyed by source `ip:port`. Independent of [Route]'s `voicechat:` backend - no Minecraft login
+ * is required to open a session, so this has its own bind address/port rather than sharing the
+ * main TCP listener's. See [me.hippodev.udp.UdpProxy].
+ */
+data class UdpProxyConfig(val bind: String, val backend: String) {
+    val bindAddress: InetSocketAddress by lazy { parseHostPort(bind) }
+    val backendAddress: InetSocketAddress by lazy { parseHostPort(backend) }
+}
+
 data class ApiConfig(
     val enabled: Boolean = false,
     val bind: String = "localhost:8080"
@@ -99,10 +115,65 @@ data class ApiConfig(
     val bindAddress: InetSocketAddress by lazy { parseHostPort(bind, defaultPort = 8080) }
 }
 
+/**
+ * Optional persistence of per-session player connection details (IP, UUID, login attempts,
+ * packets/bytes transferred, compression/encryption state, host) to a local SQLite database -
+ * a single compact binary file rather than an ever-growing plain-text log. Off by default: it's
+ * an extra moving part (disk I/O, a background writer thread, a growing-then-pruned .db file)
+ * that most deployments don't need. See [me.hippodev.tracking.ConnectionTracker] for how it stays
+ * bounded (queue capacity, batched writes, retention/row-cap pruning) under many concurrent
+ * players.
+ */
+data class ConnectionTrackingConfig(
+    val enabled: Boolean = false,
+    val dbPath: String = "data/connections.db",
+    /** Rows older than this many days are deleted by the periodic janitor. */
+    val retentionDays: Int = 30,
+    /** Hard cap on total stored rows - whichever of this or [retentionDays] is more restrictive
+     *  wins, so the file's contents can't grow without bound even under sustained high traffic
+     *  that would otherwise outrun the retention window. */
+    val maxRecords: Int = 200_000,
+    /** In-memory queue capacity between event-loop threads (producers) and the single DB writer
+     *  thread (consumer). A full queue drops the oldest-pending record rather than blocking a
+     *  Netty thread or growing without bound - see [me.hippodev.tracking.ConnectionTracker.record]. */
+    val queueCapacity: Int = 5000,
+    /** Max rows written per transaction/commit. */
+    val batchSize: Int = 200,
+    /** How long the writer thread waits for more queued records before committing whatever
+     *  batch it already has, so records aren't held indefinitely under light load. */
+    val flushIntervalMillis: Long = 2000,
+    /** How often the janitor (retention delete + row cap + incremental vacuum) runs. */
+    val pruneIntervalMillis: Long = 3_600_000
+)
+
+/**
+ * Optional local time-series logging of MCGate's live stats (players online, per-host player
+ * counts, per-backend active connections/latency, connection-tracking queue/drop counters) to a
+ * local SQLite database - a periodic snapshot with a timestamp, distinct from
+ * [ConnectionTrackingConfig]'s per-session history. Lets you see traffic trends over time (e.g.
+ * "players online per host, sampled every minute") without needing to run a separate Prometheus
+ * server against the `/metrics` API endpoint. Off by default. See
+ * [me.hippodev.tracking.StatsLogger].
+ */
+data class StatsLoggingConfig(
+    val enabled: Boolean = false,
+    val dbPath: String = "data/stats.db",
+    /** How often a snapshot is captured and written. */
+    val intervalMillis: Long = 60_000,
+    /** Snapshots older than this many days are deleted by the periodic janitor. */
+    val retentionDays: Int = 14,
+    /** Hard cap on total stored snapshots - whichever of this or [retentionDays] is more
+     *  restrictive wins, same reasoning as [ConnectionTrackingConfig.maxRecords]. */
+    val maxRecords: Int = 50_000
+)
+
 data class GateConfig(
     val bind: String = "0.0.0.0:25565",
     val routes: List<Route> = emptyList(),
+    val udpProxies: List<UdpProxyConfig> = emptyList(),
     val api: ApiConfig = ApiConfig(),
+    val connectionTracking: ConnectionTrackingConfig = ConnectionTrackingConfig(),
+    val statsLogging: StatsLoggingConfig = StatsLoggingConfig(),
     /** Netty worker event-loop thread count. 0 = auto (max(4, 2x CPU cores)).
      *
      * Every client channel is pinned to exactly one of these threads for its whole connection -
@@ -149,15 +220,28 @@ data class GateConfig(
             val routes = rawRoutes.mapIndexed { index, r -> parseRoute(r, index, messages) }
                 .sortedWith(compareByDescending<Route> { it.priority })
             warmStaticBackends(routes)
+            val udpProxies = parseUdpProxies(configSection["udpProxy"] as? List<Map<String, Any>>)
             val api = parseApi(configSection["api"] as? Map<String, Any>)
+            val connectionTracking = parseConnectionTracking(configSection["connectionTracking"] as? Map<String, Any>)
+            val statsLogging = parseStatsLogging(configSection["statsLogging"] as? Map<String, Any>)
             val workerThreads = configSection["workerThreads"] as? Int ?: 0
             val logConnections = configSection["logConnections"] as? Boolean ?: false
             val proxyProtocol = configSection["proxyProtocol"] as? Boolean ?: false
 
             return GateConfig(
-                bind = bind, routes = routes, api = api,
+                bind = bind, routes = routes, udpProxies = udpProxies, api = api, connectionTracking = connectionTracking,
+                statsLogging = statsLogging,
                 workerThreads = workerThreads, logConnections = logConnections, proxyProtocol = proxyProtocol
             )
+        }
+
+        private fun parseUdpProxies(raw: List<Map<String, Any>>?): List<UdpProxyConfig> {
+            if (raw == null) return emptyList()
+            return raw.mapIndexed { index, entry ->
+                val bind = entry["bind"] as? String ?: error("udpProxy #$index missing 'bind'")
+                val backend = entry["backend"] as? String ?: error("udpProxy #$index missing 'backend'")
+                UdpProxyConfig(bind = bind, backend = backend)
+            }
         }
 
         private fun parseApi(a: Map<String, Any>?): ApiConfig {
@@ -165,6 +249,33 @@ data class GateConfig(
             return ApiConfig(
                 enabled = a["enabled"] as? Boolean ?: false,
                 bind = a["bind"] as? String ?: "localhost:8080"
+            )
+        }
+
+        private fun parseConnectionTracking(c: Map<String, Any>?): ConnectionTrackingConfig {
+            val defaults = ConnectionTrackingConfig()
+            if (c == null) return defaults
+            return ConnectionTrackingConfig(
+                enabled = c["enabled"] as? Boolean ?: defaults.enabled,
+                dbPath = c["dbPath"] as? String ?: defaults.dbPath,
+                retentionDays = c["retentionDays"] as? Int ?: defaults.retentionDays,
+                maxRecords = c["maxRecords"] as? Int ?: defaults.maxRecords,
+                queueCapacity = c["queueCapacity"] as? Int ?: defaults.queueCapacity,
+                batchSize = c["batchSize"] as? Int ?: defaults.batchSize,
+                flushIntervalMillis = (c["flushInterval"] as? String)?.let { parseDuration(it) } ?: defaults.flushIntervalMillis,
+                pruneIntervalMillis = (c["pruneInterval"] as? String)?.let { parseDuration(it) } ?: defaults.pruneIntervalMillis
+            )
+        }
+
+        private fun parseStatsLogging(c: Map<String, Any>?): StatsLoggingConfig {
+            val defaults = StatsLoggingConfig()
+            if (c == null) return defaults
+            return StatsLoggingConfig(
+                enabled = c["enabled"] as? Boolean ?: defaults.enabled,
+                dbPath = c["dbPath"] as? String ?: defaults.dbPath,
+                intervalMillis = (c["interval"] as? String)?.let { parseDuration(it) } ?: defaults.intervalMillis,
+                retentionDays = c["retentionDays"] as? Int ?: defaults.retentionDays,
+                maxRecords = c["maxRecords"] as? Int ?: defaults.maxRecords
             )
         }
 
@@ -201,6 +312,7 @@ data class GateConfig(
             val proxyProtocol = r["proxyProtocol"] as? Boolean ?: false
             val priority = r["priority"] as? Int ?: 0
             val reconnect = renderReconnectText(parseReconnect(r["reconnect"] as? Map<String, Any>, messages.reconnect))
+            val kickMessage = r["kickMessage"] as? String ?: messages.kickMessage
 
             return Route(
                 hostPatterns = hostPatterns,
@@ -212,6 +324,7 @@ data class GateConfig(
                 proxyProtocol = proxyProtocol,
                 priority = priority,
                 reconnect = reconnect,
+                kickMessage = kickMessage,
                 voicechatTemplates = voicechatBackends
             )
         }
@@ -224,8 +337,7 @@ data class GateConfig(
                 title = messageDefaults.title,
                 subtitle = messageDefaults.subtitle,
                 attemptSuffix = messageDefaults.attemptSuffix,
-                actionBarFrames = messageDefaults.actionBarFrames,
-                kickMessage = messageDefaults.kickMessage
+                actionBarFrames = messageDefaults.actionBarFrames
             )
             if (r == null) return defaults
             val enabled = r["enabled"] as? Boolean ?: defaults.enabled
@@ -241,8 +353,7 @@ data class GateConfig(
                 subtitle = r["subtitle"] as? String ?: defaults.subtitle,
                 attemptSuffix = r["attemptSuffix"] as? String ?: defaults.attemptSuffix,
                 actionBarFrames = frames ?: defaults.actionBarFrames,
-                animationIntervalMillis = (r["animationInterval"] as? String)?.let { parseDuration(it) } ?: defaults.animationIntervalMillis,
-                kickMessage = r["kickMessage"] as? String ?: defaults.kickMessage
+                animationIntervalMillis = (r["animationInterval"] as? String)?.let { parseDuration(it) } ?: defaults.animationIntervalMillis
             )
         }
 
@@ -252,10 +363,7 @@ data class GateConfig(
          *  reconnect-wait session, but `actionBarFrames` is on the animation timer's hot path
          *  (every `animationInterval`, 500ms by default, for every player currently waiting to
          *  reconnect) - re-parsing MiniMessage there on every tick was real, needless CPU work on
-         *  the event-loop thread. `kickMessage` is deliberately left raw here: it's used via two
-         *  different renderers (JSON for the Login-state kick, legacy for the Play-state one) and
-         *  is only ever sent once per connection at most, so rendering it at each of those two
-         *  call sites instead is simpler and not a hot path either way. */
+         *  the event-loop thread. */
         private fun renderReconnectText(reconnect: ReconnectConfig): ReconnectConfig = reconnect.copy(
             title = toLegacyText(reconnect.title),
             subtitle = toLegacyText(reconnect.subtitle),

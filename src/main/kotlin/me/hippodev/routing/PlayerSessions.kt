@@ -12,6 +12,8 @@ import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 data class PlayerSession(
     val name: String,
@@ -38,7 +40,25 @@ data class PlayerSession(
      *  desyncing the client's stream cipher (see the LOGIN_ENCRYPTION_REQUEST handling in
      *  LoginRelayHandler). A kick message must not be attempted on an encrypted session; only a
      *  bare close is safe. */
-    val encrypted: Boolean
+    val encrypted: Boolean,
+    /** Backend dial attempts made to establish (or re-establish) this session - one per failover
+     *  hop across a route's backend list. Shared (not recreated) across every [PlayerSessions.put]
+     *  call for the same physical connection - see [me.hippodev.handler.LoginRelayHandler] and
+     *  [me.hippodev.handler.ReconnectHandler], the only writers - so it keeps accumulating rather
+     *  than resetting each time the session record is refreshed (e.g. on compression negotiated,
+     *  on a mid-session reconnect). */
+    val loginAttempts: AtomicInteger = AtomicInteger(1),
+    /** Live packet/byte counters for this connection, split by direction (client->backend is
+     *  "sent" from the player's perspective, backend->client is "received"). Frame-counted, not
+     *  strictly Minecraft-packet-counted, past login - see the LoginRelayHandler doc for why (the
+     *  relay is byte-blind past that point, one channelRead is treated as one packet). Same sharing
+     *  rule as [loginAttempts]: the same atomics follow the session across every `put`, so reading
+     *  them via [PlayerSessions.all] always reflects live, cumulative totals - not just whatever
+     *  was true at the last `put` call - without needing to re-put on every single packet. */
+    val packetsSent: AtomicLong = AtomicLong(0),
+    val packetsReceived: AtomicLong = AtomicLong(0),
+    val bytesSent: AtomicLong = AtomicLong(0),
+    val bytesReceived: AtomicLong = AtomicLong(0)
 )
 
 /** Process-wide registry of currently connected players, for the console `players` command -
@@ -59,6 +79,14 @@ object PlayerSessions {
     }
 
     fun all(): List<PlayerSession> = sessions.values.sortedBy { it.name.lowercase() }
+
+    /** Currently connected players grouped by the literal virtual host they connected with (not
+     *  the route's host *pattern* - for a wildcard route that's the actual subdomain a player
+     *  used, e.g. "abc.wildcard.example.com", not "*.wildcard.example.com"). Distinct from
+     *  per-backend active-connection counts (see RouteRuntime): several hosts can share one
+     *  route/backend, so a backend-level counter can't tell them apart on its own, but every
+     *  session already carries its own literal host, so grouping live sessions this way can. */
+    fun onlineByHost(): Map<String, Int> = sessions.values.groupingBy { it.host }.eachCount()
 
     fun findByName(name: String): PlayerSession? = sessions.values.firstOrNull { it.name.equals(name, ignoreCase = true) }
 

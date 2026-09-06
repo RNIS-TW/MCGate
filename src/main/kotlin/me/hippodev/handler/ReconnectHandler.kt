@@ -24,6 +24,7 @@ import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 private const val KEEP_ALIVE_INTERVAL_MILLIS = 15_000L
 
@@ -165,7 +166,7 @@ class ReconnectHandler(
             val suffix = route.reconnect.attemptSuffix.replace("{attempt}", attemptCount.toString())
             ctx.writeAndFlush(encodeSetSubtitleText(ids, route.reconnect.subtitle + suffix, compressionThreshold))
             if (route.reconnect.maxWaitMillis > 0 && System.currentTimeMillis() - enteredAt > route.reconnect.maxWaitMillis) {
-                kickWithMessage(ctx, toLegacyText(route.reconnect.kickMessage))
+                kickWithMessage(ctx, toLegacyText(route.kickMessage))
                 return
             }
             scheduleRetry(ctx)
@@ -232,6 +233,12 @@ class ReconnectHandler(
             .channel(clientChannel.javaClass)
             .option(ChannelOption.TCP_NODELAY, true)
             .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
+            // Bound the post-transfer raw relay's queued bytes the same way the initial login
+            // relay does (see LoginRelayHandler / FlowControl.kt).
+            .option(
+                ChannelOption.WRITE_BUFFER_WATER_MARK,
+                io.netty.channel.WriteBufferWaterMark(32 * 1024, 64 * 1024)
+            )
             .handler(object : ChannelInitializer<SocketChannel>() {
                 override fun initChannel(ch: SocketChannel) {
                     ch.pipeline().addLast(BackendLoginRelay(clientChannel, addr))
@@ -259,6 +266,12 @@ class ReconnectHandler(
             backendChannel.writeAndFlush(encodeHandshake(protocolVersion, addr.hostString, port, 2))
             backendChannel.writeAndFlush(encodeLoginStart(playerName, playerUuid))
             val existing = PlayerSessions.get(playerUuid)
+            // Carries forward the same live counters (not fresh zeroed ones) so a player's
+            // packet/byte/login-attempt totals stay continuous across this reconnect hand-off
+            // instead of resetting - see PlayerSession.packetsSent for why these are shared,
+            // mutable atomics rather than plain fields. This transfer is itself another dial
+            // attempt, so bump the shared counter for it too.
+            val loginAttempts = existing?.loginAttempts?.also { it.incrementAndGet() } ?: AtomicInteger(1)
             PlayerSessions.put(
                 PlayerSession(
                     playerName, playerUuid, host, existing?.remoteAddress ?: "?", addr,
@@ -266,7 +279,12 @@ class ReconnectHandler(
                     // A backend requiring encryption aborts this transfer entirely (see
                     // BackendLoginRelay below) rather than completing it, so reaching this point
                     // always means the new backend didn't require it.
-                    encrypted = false
+                    encrypted = false,
+                    loginAttempts = loginAttempts,
+                    packetsSent = existing?.packetsSent ?: java.util.concurrent.atomic.AtomicLong(0),
+                    packetsReceived = existing?.packetsReceived ?: java.util.concurrent.atomic.AtomicLong(0),
+                    bytesSent = existing?.bytesSent ?: java.util.concurrent.atomic.AtomicLong(0),
+                    bytesReceived = existing?.bytesReceived ?: java.util.concurrent.atomic.AtomicLong(0)
                 )
             )
             runtime.recordConnectOpened(addr)
@@ -402,9 +420,20 @@ class ReconnectHandler(
 
 /** Plain raw byte pipe from whichever channel it's installed on to [target] - the same splice
  *  pattern LoginRelayHandler uses once a backend is connected. */
-private class RawRelayHandler(private val target: Channel) : SimpleChannelInboundHandler<ByteBuf>() {
+internal class RawRelayHandler(private val target: Channel) : SimpleChannelInboundHandler<ByteBuf>() {
+    override fun handlerAdded(ctx: ChannelHandlerContext) {
+        // Installed via pipeline replace on an already-active channel (channelActive won't fire) -
+        // sync flow control state immediately. See FlowControl.kt / pauseOrResumeReads.
+        target.pauseOrResumeReads(ctx.channel())
+    }
+
     override fun channelRead0(ctx: ChannelHandlerContext, msg: ByteBuf) {
         if (target.isActive) target.writeAndFlush(msg.retain())
+    }
+
+    override fun channelWritabilityChanged(ctx: ChannelHandlerContext) {
+        ctx.channel().pauseOrResumeReads(target)
+        ctx.fireChannelWritabilityChanged()
     }
 
     override fun channelInactive(ctx: ChannelHandlerContext) {

@@ -7,13 +7,16 @@ data class ReconnectMessages(
     val title: String = "&eServer is currently offline.",
     val subtitle: String = "&7Waiting to reconnect...",
     val attemptSuffix: String = " (attempt {attempt})",
-    val actionBarFrames: List<String> = listOf("&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."),
-    val kickMessage: String = "&cServer is offline. Please reconnect shortly."
+    val actionBarFrames: List<String> = listOf("&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting...")
 )
 
 /** Default text for all player-facing messages, loaded from messages.yml. Routes may still
- *  override any of these per-route via config.yml's `reconnect:` block - see [ReconnectConfig]. */
+ *  override any of these per-route via config.yml's `reconnect:` block - see [ReconnectConfig].
+ *  `kickMessage` is its own top-level setting (not part of `reconnect:`) since it's sent for any
+ *  offline-backend kick, whether or not reconnect-holding is enabled for that route - see
+ *  [me.hippodev.config.Route.kickMessage]. */
 data class GateMessages(
+    val kickMessage: String = "&cServer is offline. Please reconnect shortly.",
     val reconnect: ReconnectMessages = ReconnectMessages()
 ) {
     companion object {
@@ -27,7 +30,11 @@ data class GateMessages(
             val root = file.inputStream().use { yaml.load<Map<String, Any>>(it) } ?: emptyMap()
             val messagesSection = (root["messages"] as? Map<String, Any>) ?: root
 
-            return GateMessages(reconnect = parseReconnect(messagesSection["reconnect"] as? Map<String, Any>))
+            val defaults = GateMessages()
+            return GateMessages(
+                kickMessage = messagesSection["kickMessage"] as? String ?: defaults.kickMessage,
+                reconnect = parseReconnect(messagesSection["reconnect"] as? Map<String, Any>)
+            )
         }
 
         private fun parseReconnect(r: Map<String, Any>?): ReconnectMessages {
@@ -38,8 +45,7 @@ data class GateMessages(
                 title = r["title"] as? String ?: defaults.title,
                 subtitle = r["subtitle"] as? String ?: defaults.subtitle,
                 attemptSuffix = r["attemptSuffix"] as? String ?: defaults.attemptSuffix,
-                actionBarFrames = frames ?: defaults.actionBarFrames,
-                kickMessage = r["kickMessage"] as? String ?: defaults.kickMessage
+                actionBarFrames = frames ?: defaults.actionBarFrames
             )
         }
     }

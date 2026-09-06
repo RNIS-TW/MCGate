@@ -14,11 +14,76 @@ config:
   # scanners can be frequent enough to be noisy. Hot-reloadable, no restart needed.
   logConnections: false
 
-  # Read-only JSON/HTTP status API (routes, backends, live connection/latency stats).
-  # Disabled by default - only bind it to a trusted interface.
+  # Read-only JSON/HTTP status API (routes, backends, live connection/latency stats). Also
+  # exposes GET /v1/players (every connected player: IP, UUID, host, login attempts, packets/
+  # bytes sent+received, compression/encryption state) and GET /metrics in Prometheus text format
+  # (players online, per-host player counts, uptime, per-backend active connections/latency,
+  # connection-tracking queue/drop counters - add ?type=json for the same data plus the full
+  # player list as JSON). Point a Prometheus scrape_configs target at this host:port + /metrics
+  # to graph MCGate in Grafana; no MCGate-specific plugin needed. Disabled by default - only bind
+  # it to a trusted interface.
   api:
     enabled: false
-    bind: localhost:8080
+    bind: 0.0.0.0:8080
+
+  # Standalone static UDP forwards - each entry relays every datagram received on `bind` to
+  # `backend`, keyed by source ip:port. Independent of a route's `voicechat:` backend: there's no
+  # Minecraft login required to open a session, so each entry needs its own bind address/port
+  # rather than sharing the main TCP listener's. Useful for forwarding any other UDP service
+  # (e.g. a WireGuard endpoint) through the same box/anti-DDoS setup. Bind addresses only take
+  # effect on (re)start, not a live config reload.
+  udpProxy: []
+  #  - bind: 0.0.0.0:51820
+  #    backend: 127.0.0.1:51820
+
+  # Persists per-session player connection details (IP, UUID, login attempts, packets/bytes
+  # transferred, compression/encryption state, host) to a local SQLite database - a single
+  # compact binary .db file, not a growing plain-text log. Disabled by default. One row is
+  # written per completed session (at disconnect), via a bounded queue + a single background
+  # writer thread, so it never blocks a player's connection and never grows memory without
+  # bound; a periodic janitor also prunes old/excess rows so the .db file itself stays bounded.
+  # Hot-reloadable - toggling `enabled` (or any other field below) here takes effect without a
+  # restart.
+  connectionTracking:
+    enabled: false
+    # Path to the SQLite database file (created, along with any parent directories, on first use).
+    dbPath: data/connections.db
+    # Rows older than this many days are deleted by the periodic janitor.
+    retentionDays: 30
+    # Hard cap on total stored rows, independent of age - whichever of this or retentionDays is
+    # more restrictive wins, so sustained high traffic can't grow the file without bound even if
+    # it would otherwise outrun the retention window.
+    maxRecords: 200000
+    # In-memory queue capacity between connecting players (producers) and the single DB writer
+    # thread (consumer). A full queue drops the oldest-pending record (logged) instead of
+    # blocking a player's connection or growing without bound - matters most under a burst of
+    # many simultaneous disconnects (500+ players at once).
+    queueCapacity: 5000
+    # Max rows written per transaction/commit.
+    batchSize: 200
+    # How long the writer thread waits for more queued records before committing whatever batch
+    # it already has.
+    flushInterval: 2s
+    # How often the janitor (retention delete + row cap + incremental vacuum) runs.
+    pruneInterval: 1h
+
+  # Periodically logs a timestamped snapshot of MCGate's live stats (players online, per-host
+  # player counts, per-backend active connections/latency, connection-tracking queue/drop
+  # counters) to a local SQLite database - a lightweight local alternative to scraping /metrics
+  # with Prometheus if you just want to see traffic trends over time. Distinct from
+  # connectionTracking above: this is periodic system-wide snapshots, not per-player session
+  # history. Disabled by default. Hot-reloadable.
+  statsLogging:
+    enabled: false
+    # Path to the SQLite database file (created, along with any parent directories, on first use).
+    dbPath: data/stats.db
+    # How often a snapshot is captured and written.
+    interval: 60s
+    # Snapshots older than this many days are deleted by the periodic janitor.
+    retentionDays: 14
+    # Hard cap on total stored snapshots, independent of age - same reasoning as
+    # connectionTracking.maxRecords above.
+    maxRecords: 50000
 
   # Accept a PROXY protocol (v1/v2) header at the start of every incoming connection, before the
   # Minecraft handshake - for when MCGate itself sits behind another load balancer/proxy that
@@ -76,14 +141,24 @@ config:
         # or an already-encoded "data:image/png;base64,..." string. Ideally a 64x64 PNG.
         favicon: icon.png
 
+    # Custom kick message when this route's backend is offline. `kickMessage` is a plain
+    # top-level route setting - not part of `reconnect:` - so it works with or without
+    # reconnect-holding enabled. Defaults to messages.yml's top-level `kickMessage` when unset.
+    - host: kickmsg.example.com
+      backend: 127.0.0.1:25573
+      kickMessage: "&cKickmsg's server is offline, try again later!"
+
     # Auto-reconnect shown to 1.20.2+ clients while all backends are offline, instead of a
     # fallback status/kick (VelocityReconnect-style, no separate holding server needed): the
     # player is kept connected to MCGate itself in a minimal waiting world (it reuses the
     # client's own built-in minecraft:overworld dimension, nothing custom to register) and is
     # transparently moved onto the real backend once it's reachable again - no manual reconnect
-    # needed. Older clients still just get a kick with `kickMessage`. Disabled by default.
+    # needed. Older clients (or once reconnect.maxWait is exceeded) still just get a kick with
+    # this route's `kickMessage` (see above). Disabled by default.
     - host: reconnect.example.com
       backend: 127.0.0.1:25574
+      # Custom kick message for this route too - independent of the `reconnect:` block below.
+      kickMessage: "&cServer is offline. Please reconnect shortly."
       reconnect:
         enabled: true
         # Also hold players for reconnect if this backend drops mid-session, not just on initial
@@ -101,7 +176,6 @@ config:
         # subtitle: "&7Waiting to reconnect..."
         # attemptSuffix: " (attempt {attempt})"
         # actionBarFrames: ["&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."]
-        # kickMessage: "&cServer is offline. Please reconnect shortly."
         animationInterval: 500ms
 
     # Rewrites the handshake's virtual host to match the backend address,

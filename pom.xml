@@ -17,6 +17,9 @@
         <adventure.version>4.17.0</adventure.version>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
+        <!-- Tests don't run as part of `mvn package`/`install` by default - run them explicitly
+             with `mvn test` or `mvn package -DskipTests=false`. -->
+        <skipTests>true</skipTests>
     </properties>
 
     <repositories>
@@ -54,6 +57,8 @@
             <plugin>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>2.22.2</version>
+                <!-- skipTests is bound to the "skipTests" property (default true - see
+                     <properties> above), so `-DskipTests=false` overrides it. -->
             </plugin>
             <plugin>
                 <artifactId>maven-failsafe-plugin</artifactId>
@@ -83,6 +88,13 @@
                                     <mainClass>me.hippodev.MainKt</mainClass>
                                     <manifestEntries>
                                         <Implementation-Version>${project.version}</Implementation-Version>
+                                        <!-- sqlite-jdbc (used by the optional connection-tracking feature) loads a
+                                             native library via System::load, which JDK 22+ otherwise warns about as
+                                             a "restricted method" call from this jar's unnamed module. This manifest
+                                             attribute is the jar-based equivalent of the "enable native access" JVM
+                                             flag: the launcher honors it for the jar named on `java -jar`, so the
+                                             warning is gone without needing to change how the jar is started. -->
+                                        <Enable-Native-Access>ALL-UNNAMED</Enable-Native-Access>
                                     </manifestEntries>
                                 </transformer>
                             </transformers>
@@ -152,6 +164,13 @@
             <groupId>org.yaml</groupId>
             <artifactId>snakeyaml</artifactId>
             <version>2.2</version>
+        </dependency>
+        <dependency>
+            <!-- Embedded, single-file, binary (not plain-text) database for the optional
+                 connection-tracking feature - no separate DB server, whole engine is one jar. -->
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>3.46.1.3</version>
         </dependency>
         <dependency>
             <!-- Console input with line-editing (history via up/down arrows, etc.) - a plain

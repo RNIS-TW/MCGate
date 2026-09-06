@@ -1,12 +1,19 @@
 messages:
-  # Player-facing text for the auto-reconnect waiting screen (route `reconnect:` config).
-  # Routes can still override any of these per-route in config.yml; these are just the defaults
-  # used when a route doesn't set its own.
+  # Player-facing text for offline-backend situations. Routes can still override any of these
+  # per-route in config.yml; these are just the defaults used when a route doesn't set its own.
   #
   # Every message below supports both legacy `&`-codes (e.g. `&e`, `&l`) and MiniMessage tags -
   # `<red>`, `<gradient:red:blue>text</gradient>`, `<bold>`, `<#ff0000>`, `<rainbow>`, etc. See
   # https://docs.advntr.dev/minimessage/format.html for the full tag reference. Mix both freely,
   # e.g. "&e<bold>Offline</bold>".
+
+  # Kick/disconnect message shown when a route's backends are all unreachable and the player is
+  # kicked outright - whether or not `reconnect:` is enabled for that route (e.g. reconnect
+  # disabled, client too old to support it, or reconnect.maxWait exceeded). Override per-route
+  # via config.yml's top-level `kickMessage` (not nested under `reconnect:`).
+  kickMessage: "&cServer is offline. Please reconnect shortly."
+
+  # Text for the auto-reconnect waiting screen (route `reconnect:` config).
   reconnect:
     # Title/subtitle shown while a player is held waiting to reconnect.
     title: "&eServer is currently offline."
@@ -16,6 +23,3 @@ messages:
     attemptSuffix: " (attempt {attempt})"
     # Small animated action-bar message cycling through these frames.
     actionBarFrames: ["&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."]
-    # Kick/disconnect message shown when reconnect isn't available/enabled, or when
-    # reconnect.maxWait is exceeded.
-    kickMessage: "&cServer is offline. Please reconnect shortly."

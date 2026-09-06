@@ -13,6 +13,9 @@ import me.hippodev.config.*
 import me.hippodev.handler.*
 import me.hippodev.protocol.effectiveRemoteAddress
 import me.hippodev.routing.*
+import me.hippodev.tracking.ConnectionTracker
+import me.hippodev.tracking.StatsLogger
+import me.hippodev.udp.UdpProxy
 import me.hippodev.voice.VoiceRelay
 import me.hippodev.voice.VoiceRouting
 import org.slf4j.LoggerFactory
@@ -67,9 +70,16 @@ fun main(args: Array<String>) {
 
     val initialConfig = ConfigLoader.loadOrCreateDefault(configPath, messagesRef.get())
     log.info("Loaded {} route(s) from {}", initialConfig.routes.size, configPath)
+    ConnectionTracker.applyConfig(initialConfig.connectionTracking)
 
     val stateRef = AtomicReference(GateState(initialConfig))
     val pingCache = PingCache()
+
+    // Captured by reference (reads stateRef fresh on every StatsLogger tick), not the config
+    // value itself - so a snapshot always reflects whichever routes/runtimes are current at that
+    // moment, even across a config reload that swaps stateRef out from under it.
+    fun currentSnapshot() = collectMetrics(stateRef.get().config.routes) { route -> stateRef.get().routeRuntimes[route] }
+    StatsLogger.applyConfig(initialConfig.statsLogging, ::currentSnapshot)
 
     // Shared by the file watchers below and the console `reload` command, so a manual reload
     // behaves identically to a file save - re-reads both files fresh from disk regardless of
@@ -80,6 +90,8 @@ fun main(args: Array<String>) {
             messagesRef.set(newMessages)
             val newConfig = GateConfig.load(configPath, newMessages)
             stateRef.set(GateState(newConfig))
+            ConnectionTracker.applyConfig(newConfig.connectionTracking)
+            StatsLogger.applyConfig(newConfig.statsLogging, ::currentSnapshot)
             log.info("{}: reloaded {} route(s) from {} and messages from {}", reason, newConfig.routes.size, configPath, messagesPath)
         } catch (e: Exception) {
             log.error("{}: reload failed, keeping previous config/messages", reason, e)
@@ -89,6 +101,8 @@ fun main(args: Array<String>) {
     ConfigLoader.watch(configPath, { messagesRef.get() }) { newConfig ->
         log.info("Config changed, loaded {} route(s)", newConfig.routes.size)
         stateRef.set(GateState(newConfig))
+        ConnectionTracker.applyConfig(newConfig.connectionTracking)
+        StatsLogger.applyConfig(newConfig.statsLogging, ::currentSnapshot)
     }
 
     // Reload config.yml too so routes that don't override a message pick up the new default
@@ -98,6 +112,8 @@ fun main(args: Array<String>) {
         log.info("Messages changed, reloading {} with new defaults", configPath)
         val newConfig = GateConfig.load(configPath, newMessages)
         stateRef.set(GateState(newConfig))
+        ConnectionTracker.applyConfig(newConfig.connectionTracking)
+        StatsLogger.applyConfig(newConfig.statsLogging, ::currentSnapshot)
     }
 
     if (initialConfig.api.enabled) {
@@ -130,6 +146,16 @@ fun main(args: Array<String>) {
             .channel(NioServerSocketChannel::class.java)
             .option(ChannelOption.SO_BACKLOG, 128)
             .childOption(ChannelOption.TCP_NODELAY, true)
+            // Explicit (not relying on Netty's version-dependent default) write water marks, the
+            // trip points the relay's flow control keys off (see FlowControl.kt): once a client's
+            // unsent-and-queued bytes pass 64 KiB, isWritable flips false and reads on its backend
+            // pause until it drains back under 32 KiB. This is what bounds per-connection memory -
+            // without a listener honoring it (which the relay handlers now are) a slow peer's
+            // queue, and with it Netty's pooled-direct arenas, grow without limit.
+            .childOption(
+                ChannelOption.WRITE_BUFFER_WATER_MARK,
+                io.netty.channel.WriteBufferWaterMark(32 * 1024, 64 * 1024)
+            )
             // Some hosting providers put a NAT/firewall/load balancer in front of the box that
             // tracks raw TCP activity rather than Minecraft-protocol keepalives, and silently
             // drops a connection it decides looks idle (an AFK player shows up client-side as a
@@ -159,9 +185,25 @@ fun main(args: Array<String>) {
         // Shares the TCP listener's own worker group rather than spinning up a separate one -
         // relaying UDP voice traffic is just as I/O-bound as relaying player TCP bytes, and it
         // binds to the very same address/port (see VoiceRelay's doc for why that needs a NAT-like
-        // per-client socket rather than one shared backend-facing channel).
+        // per-client socket rather than one shared backend-facing channel). Only bound at all if
+        // some route actually configures a `voicechat:` backend - otherwise it'd permanently claim
+        // that UDP port for a feature nobody's using, which conflicts with e.g. a same-port entry
+        // in `udpProxy:` below. Like the rest of this section, this is decided once at startup from
+        // initialConfig, not re-evaluated on a hot config reload.
         val voiceRelay = VoiceRelay(workerGroup)
-        voiceRelay.start(initialConfig.bindAddress)
+        val hasVoicechatRoutes = initialConfig.routes.any { it.voicechatTemplates.isNotEmpty() }
+        if (hasVoicechatRoutes) {
+            voiceRelay.start(initialConfig.bindAddress)
+        } else {
+            log.info("No routes configure a voicechat backend, skipping voicechat UDP relay")
+        }
+
+        // Standalone static UDP forwards (config.yml's top-level `udpProxy:` list) - unrelated
+        // to voice chat's login-gated routing, each with its own bind address/port. Not
+        // reconfigured on a hot config reload (same as the main TCP bind/voice relay): changing
+        // bind addresses needs a restart, only route/messages content is hot-reloadable.
+        val udpProxies = initialConfig.udpProxies.map { UdpProxy(workerGroup, it) }
+        udpProxies.forEach { it.start() }
 
         val startupSeconds = (System.currentTimeMillis() - startedAt) / 1000.0
         log.info("Done (%.3fs)! For help, type \"help\"".format(startupSeconds))
@@ -179,9 +221,24 @@ fun main(args: Array<String>) {
                 log.info("Shutdown signal received, stopping...")
                 channel.close().sync()
                 voiceRelay.stop()
+                udpProxies.forEach { it.stop() }
                 bossGroup.shutdownGracefully().sync()
                 workerGroup.shutdownGracefully().sync()
+                ConnectionTracker.shutdown()
+                StatsLogger.shutdown()
                 log.info("Stopped.")
+                // Everything above is our own graceful cleanup and has already completed by this
+                // point - this is only to force the process to actually exit afterward. The JVM
+                // only exits on its own once every non-daemon thread has finished, and JLine's
+                // system terminal (see startConsole) can leave behind a background input-reader
+                // thread that isn't always daemon and is never explicitly closed - without this,
+                // that stray thread silently keeps the process alive forever after "Stopped." is
+                // logged (visible as a process manager never seeing the JVM actually exit, even
+                // though shutdown clearly finished). halt() (not exit()) is deliberate: it skips
+                // running shutdown hooks/finalizers again, which matters here since this can
+                // itself be running from inside the shutdown hook below - calling exit() there
+                // would just be a no-op instead of actually terminating the process.
+                Runtime.getRuntime().halt(0)
             }
         }
         Runtime.getRuntime().addShutdownHook(Thread(shutdown, "shutdown"))

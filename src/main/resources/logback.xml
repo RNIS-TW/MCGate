@@ -2,6 +2,14 @@
 <!-- Console pattern intentionally mirrors the old slf4j-simple output ("HH:mm:ss [LEVEL] msg")
      since ConsoleColors.kt regex-matches that exact shape to colorize/re-route it through JLine. -->
 <configuration>
+    <!-- Suppresses logback's own internal status messages (the "|-INFO in ch.qos.logback...."
+         lines about appenders/policies being instantiated). Logback auto-dumps its full status
+         history to the console whenever a WARN/ERROR occurs during setup (e.g. our
+         FixedWindowRollingPolicy maxIndex getting clamped) - NopStatusListener disables that
+         entirely, regardless of whether such warnings happen. This only affects logback's own
+         diagnostic noise, not MCGate's application logging (root level below). -->
+    <statusListener class="ch.qos.logback.core.status.NopStatusListener" />
+
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
         <target>System.err</target>
         <encoder>
