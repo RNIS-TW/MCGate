@@ -386,7 +386,11 @@ class LoginRelayHandler(
         }
 
         override fun channelInactive(ctx: ChannelHandlerContext) {
-            handleBackendDrop(clientChannel)
+            try {
+                handleBackendDrop(clientChannel)
+            } finally {
+                super.channelInactive(ctx)
+            }
         }
 
         override fun channelWritabilityChanged(ctx: ChannelHandlerContext) {
