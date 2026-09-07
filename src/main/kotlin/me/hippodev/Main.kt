@@ -46,7 +46,46 @@ private class GateState(val config: GateConfig) {
 private val version: String =
     object {}.javaClass.`package`.implementationVersion ?: "dev"
 
+/** Netty sizes its pooled allocator (arena count, and a per-event-loop-thread buffer cache) off
+ *  `Runtime.availableProcessors()`. Inside a container that isn't cgroup-aware - or on a shared
+ *  hosting node where the JVM sees every physical core of the box, not the slice we're sold - that
+ *  number is huge, so Netty reserves dozens of 4 MiB direct-memory arenas plus a fat thread-local
+ *  cache per worker before a single player connects. That, not per-connection buffering (the write
+ *  water marks in the bootstrap below bound that to ~64 KiB/connection), is what makes RSS sit near
+ *  the container limit with only a few dozen players online.
+ *
+ *  These properties shrink that fixed overhead to what a byte-relay proxy actually needs. Every one
+ *  is a no-op if already set (via `-D...` on the command line), so an operator can still override.
+ *  MUST run before the first Netty class initializes - Netty reads them once, in a static
+ *  initializer. */
+private fun tuneNettyMemoryFootprint() {
+    fun default(key: String, value: String) {
+        if (System.getProperty(key) == null) System.setProperty(key, value)
+    }
+    // A relay is I/O-bound and never holds many buffers at once - a handful of arenas is plenty,
+    // vs. Netty's cores*2 default (64+ on a 32-core host node).
+    default("io.netty.allocator.numHeapArenas", "2")
+    default("io.netty.allocator.numDirectArenas", "2")
+    // pageSize(8 KiB) << maxOrder = chunk size. 6 -> 512 KiB chunks instead of the 4 MiB default,
+    // so an arena that's barely used still only pins 512 KiB.
+    default("io.netty.allocator.maxOrder", "6")
+    // Only give the (few) event-loop threads a buffer cache, and keep it small; don't grow one on
+    // every incidental thread that ever touches a ByteBuf.
+    default("io.netty.allocator.useCacheForAllThreads", "false")
+    default("io.netty.allocator.smallCacheSize", "128")
+    default("io.netty.allocator.normalCacheSize", "64")
+    default("io.netty.allocator.cacheTrimIntervalMillis", "60000")
+    // Bound the object-recycler pools (per thread) too - the relay churns few pooled objects.
+    default("io.netty.recycler.maxCapacityPerThread", "256")
+    // Hard ceiling on total direct memory Netty will hand out, independent of -XX:MaxDirectMemorySize.
+    // 96 MiB is far above what 46 players * ~64 KiB/connection water-marked queues can reach; a
+    // genuine overshoot fails that one write instead of letting the process get OOM-killed.
+    default("io.netty.maxDirectMemory", (96L * 1024 * 1024).toString())
+}
+
 fun main(args: Array<String>) {
+    tuneNettyMemoryFootprint()
+
     // Netty already isolates most per-connection exceptions to that one channel (see the
     // exceptionCaught overrides in the handler package), but this is the last-resort net for
     // anything that still slips through uncaught on any thread - console, watcher, scheduled
@@ -134,7 +173,12 @@ fun main(args: Array<String>) {
     val workerThreadCount = if (initialConfig.workerThreads > 0) {
         initialConfig.workerThreads
     } else {
-        maxOf(4, Runtime.getRuntime().availableProcessors() * 2)
+        // cores*2 for spread, but capped: on a shared hosting node availableProcessors() reports
+        // the whole box (32+), and every extra NioEventLoop thread is another stack + its own
+        // Netty buffer cache + arena affinity - pure memory overhead well past the point where a
+        // byte-relay handling a few hundred players needs more parallelism. 12 is plenty; an
+        // operator who genuinely wants more sets `workerThreads` explicitly in config.yml.
+        maxOf(4, Runtime.getRuntime().availableProcessors() * 2).coerceAtMost(12)
     }
     val bossGroup = NioEventLoopGroup(1)
     val workerGroup = NioEventLoopGroup(workerThreadCount)

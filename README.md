@@ -32,6 +32,22 @@ java -jar target/MCGate-1.0-SNAPSHOT.jar [path/to/config.yml]
 
 If the config path doesn't exist yet, it's created from a bundled example covering every feature. Defaults to `config.yml` in the working directory.
 
+### Memory / JVM flags
+
+MCGate is a byte-relay: its own working set is tiny (a few hundred KiB per connected player). Almost all of the RSS you see is the JVM heap reservation and Netty's pooled buffer arenas, both of which size themselves off the CPU/RAM the JVM *thinks* it has. On a shared hosting node (Pterodactyl and similar) the JVM often sees the whole physical box, not your slice, and over-reserves badly - e.g. ~900 MiB resident with only ~50 players.
+
+The build already shrinks Netty's side of this (small fixed arena count, capped worker threads, a 96 MiB direct-memory ceiling - see `tuneNettyMemoryFootprint` in `Main.kt`). For the heap, pass explicit flags - for a 1 GiB container:
+
+```
+java -Xms128m -Xmx512m \
+     -XX:+UseSerialGC \
+     -XX:MaxDirectMemorySize=128m \
+     -XX:+ExitOnOutOfMemoryError \
+     -jar MCGate-1.0-SNAPSHOT.jar
+```
+
+`-Xmx512m` leaves headroom for direct buffers, thread stacks, and metaspace under the 1 GiB cap. `-XX:+UseSerialGC` has the smallest footprint and actually returns freed memory to the OS, which G1 (the default) largely won't at this heap size. Scale `-Xmx` with the container: roughly `limit - 256m - (players / 500)m`.
+
 ## Configuration
 
 ```yaml
