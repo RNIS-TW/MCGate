@@ -61,14 +61,9 @@ class LoginRelayHandler(
     private var encrypted = false
     private var clientRemoteAddress: String = "?"
     private lateinit var frontendChannel: Channel
-    /** Guards [handshakeFrame]/[pending] against a double-release: they're normally released once
-     *  the backend dial resolves (success or all-attempts-exhausted, in [connect]), but if the
-     *  client disconnects *while a dial is still in flight*, [channelInactive] releases them right
-     *  away instead of leaving them held for however long the in-flight dial takes to time out -
-     *  see [releasePendingBuffers]. Only ever touched on this channel's event-loop thread (every
-     *  caller - channelRead, channelInactive, and the connect()/bootstrap listeners below, since
-     *  the backend Bootstrap is built with `.group(clientChannel.eventLoop())` - runs on it), so
-     *  a plain Boolean is enough. */
+    /** True once dialing ends or this handler is closed/removed. Guards [handshakeFrame] against
+     *  double release and prevents further buffering when no future dial can drain [pending].
+     *  All access runs on the client's event loop, including backend connect listeners. */
     private var pendingReleased = false
     /** Wall-clock start of this login attempt, captured before any backend dial - used as the
      *  connection-tracking record's start time even in the (rare) case every backend dial fails
@@ -116,12 +111,16 @@ class LoginRelayHandler(
         bytesToBackend.addAndGet(buf.readableBytes().toLong())
         if (backend != null && backend.isActive) {
             backend.writeAndFlush(buf)
+        } else if (pendingReleased) {
+            // Dialing has ended; no future connection will drain this buffer.
+            buf.release()
         } else {
             pending.addLast(buf)
         }
     }
 
     private fun connect(ctx: ChannelHandlerContext, ordered: List<InetSocketAddress>, attempt: Int) {
+        if (pendingReleased || !ctx.channel().isActive || ctx.isRemoved) return
         if (attempt >= ordered.size) {
             // Login Start sniffing (channelRead) races with backend dialing; a fast "connection
             // refused" can resolve before the client's Login Start bytes have been read and
@@ -237,14 +236,18 @@ class LoginRelayHandler(
         })
     }
 
-    /** Releases [handshakeFrame]/[pending] exactly once, however the dial ends up resolving - see
-     *  [pendingReleased]. */
+    /** Releases the handshake if still owned, and always drains any remaining queued buffers. */
     private fun releasePendingBuffers() {
-        if (pendingReleased) return
-        pendingReleased = true
-        handshakeFrame.release()
+        if (!pendingReleased) {
+            pendingReleased = true
+            handshakeFrame.release()
+        }
         pending.forEach { it.release() }
         pending.clear()
+    }
+
+    override fun handlerRemoved(ctx: ChannelHandlerContext) {
+        releasePendingBuffers()
     }
 
     override fun channelInactive(ctx: ChannelHandlerContext) {
@@ -253,15 +256,7 @@ class LoginRelayHandler(
         playerUuid?.let { PlayerSessions.remove(it) }
         VoiceRouting.unregisterChannel(ctx.channel())
         closeOnFlush(backendChannel)
-        // If a backend dial is still in flight when the client disconnects, this is what actually
-        // frees handshakeFrame/pending - previously they just sat there, still referenced, until
-        // whatever backend dial was in progress happened to resolve on its own (up to
-        // CONNECT_TIMEOUT_MILLIS per remaining backend in the route) - a real, if bounded, delay
-        // in freeing memory that shows up under Netty's leak detector as a ByteBuf whose access
-        // trail is empty (this handler is a raw ChannelInboundHandlerAdapter, not a
-        // ByteToMessageDecoder, so it never calls touch()) once GC finally collects it. The
-        // connect()/bootstrap-listener continuation now checks [pendingReleased] and backs off
-        // instead of touching either buffer again.
+        // Release owned buffers immediately, including during an in-flight backend dial.
         releasePendingBuffers()
     }
 
@@ -386,7 +381,11 @@ class LoginRelayHandler(
         }
 
         override fun channelInactive(ctx: ChannelHandlerContext) {
-            handleBackendDrop(clientChannel)
+            try {
+                super.channelInactive(ctx)
+            } finally {
+                handleBackendDrop(clientChannel)
+            }
         }
 
         override fun channelWritabilityChanged(ctx: ChannelHandlerContext) {
