@@ -11,14 +11,16 @@ pipeline {
     }
 
     triggers {
-        // Fallback if a webhook is missed. Multibranch + "GitHub Branch Source"
-        // is what actually discovers and builds pull requests automatically.
+        // Fallback if a webhook is missed. A Multibranch Pipeline job with the
+        // "GitHub Branch Source" plugin is what discovers/builds PRs automatically.
         pollSCM('H/5 * * * *')
     }
 
     environment {
-        GITHUB_REPO = 'RNIS-TW/MCGate'
-        // Jenkins credentials id for a GitHub token with repo:status + PR comment scope.
+        GITHUB_ACCOUNT = 'RNIS-TW'
+        GITHUB_REPO = 'MCGate'
+        // A GLOBAL-scoped credential (Secret text = PAT, or Username/password).
+        // Must exist at Manage Jenkins > Credentials > System > Global credentials.
         GITHUB_CRED = 'github-rnis'
     }
 
@@ -29,13 +31,7 @@ pipeline {
                 script {
                     env.GIT_SHA = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
                 }
-                // "loader icon" on the commit / PR in GitHub -> pending status check
-                githubNotify context: 'ci/jenkins',
-                             status: 'PENDING',
-                             description: 'Build started',
-                             repo: env.GITHUB_REPO,
-                             sha: env.GIT_SHA,
-                             credentialsId: env.GITHUB_CRED
+                notifyGitHub('PENDING', 'Build started')
             }
         }
 
@@ -72,23 +68,44 @@ pipeline {
 
     post {
         success {
-            githubNotify context: 'ci/jenkins', status: 'SUCCESS', description: 'Build passed',
-                         repo: env.GITHUB_REPO, sha: env.GIT_SHA, credentialsId: env.GITHUB_CRED
-            commentOnPr('✅')
+            script {
+                notifyGitHub('SUCCESS', 'Build passed')
+                commentOnPr('✅')
+            }
         }
         failure {
-            githubNotify context: 'ci/jenkins', status: 'FAILURE', description: 'Build failed',
-                         repo: env.GITHUB_REPO, sha: env.GIT_SHA, credentialsId: env.GITHUB_CRED
-            commentOnPr('❌')
+            script {
+                notifyGitHub('FAILURE', 'Build failed')
+                commentOnPr('❌')
+            }
         }
     }
 }
 
+// GitHub commit status = the pending/success/failure "loader icon" on the commit.
+// Non-fatal: a missing plugin or credential just logs a warning.
+def notifyGitHub(String status, String description) {
+    try {
+        githubNotify context: 'ci/jenkins',
+                     status: status,
+                     description: description,
+                     repo: env.GITHUB_REPO,
+                     account: env.GITHUB_ACCOUNT,
+                     sha: env.GIT_SHA,
+                     credentialsId: env.GITHUB_CRED
+    } catch (e) {
+        echo "githubNotify skipped: ${e.message}"
+    }
+}
+
 // Posts a build summary on the PR with a link to the archived test-reports.zip.
-// GitHub's comment API can't hold binary attachments, so we attach it to the
-// build and link it from the comment.
+// Requires the "Pipeline: GitHub" plugin (provides the `pullRequest` global) and
+// a Multibranch Pipeline job (so env.CHANGE_ID is set on PR builds).
+// GitHub's comment API can't hold binary attachments, so we archive the report
+// on the build and link it.
 def commentOnPr(String icon) {
     if (!env.CHANGE_ID) {
+        echo 'Not a PR build (no CHANGE_ID) - skipping PR comment.'
         return
     }
     def tests = junitResultSummary()
@@ -102,7 +119,11 @@ ${icon} **Jenkins build [#${env.BUILD_NUMBER}](${env.BUILD_URL})** — `${env.GI
 
 📎 [Download test report (test-reports.zip)](${reportUrl})
 """
-    pullRequest.comment(body)
+    try {
+        pullRequest.comment(body)
+    } catch (NoSuchMethodError | MissingPropertyException e) {
+        echo "Could not post PR comment (install the 'Pipeline: GitHub' plugin): ${e.message}"
+    }
 }
 
 def junitResultSummary() {
