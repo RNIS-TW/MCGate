@@ -48,6 +48,26 @@ java -Xms128m -Xmx512m \
 
 `-Xmx512m` leaves headroom for direct buffers, thread stacks, and metaspace under the 1 GiB cap. `-XX:+UseSerialGC` has the smallest footprint and actually returns freed memory to the OS, which G1 (the default) largely won't at this heap size. Scale `-Xmx` with the container: roughly `limit - 256m - (players / 500)m`.
 
+## Continuous integration
+
+`Jenkinsfile` defines a declarative pipeline:
+
+| Stage | What it does |
+| --- | --- |
+| Checkout | `checkout scm` and records the commit SHA; posts a `PENDING` GitHub commit status (`ci/jenkins`) |
+| Build | `mvn -B clean compile` |
+| Test | `mvn -B test`, publishes JUnit results, zips `surefire-reports` and archives `test-reports.zip` |
+| Package | `mvn -B package -DskipTests`, archives `target/MCGate-*.jar` |
+
+On completion it sets the GitHub commit status to `SUCCESS` / `FAILURE` (the check shown on commits and PRs). On pull-request builds (a Multibranch Pipeline job) it also comments on the PR with a pass/fail/skipped table and a link to the archived test report.
+
+**Jenkins setup:**
+
+- Tools named `JDK 21` and `Maven 3` configured under *Manage Jenkins → Tools*.
+- Plugins: *GitHub API for Pipeline* (`githubNotify`), *JUnit*; for PR builds/comments also *GitHub Branch Source* and *Pipeline: GitHub*.
+- A global **Username with password** credential `github-rnis` (username = a GitHub user with write access to `RNIS-TW/MCGate`, password = a token with *Commit statuses* and *Pull requests* read/write). Update `GITHUB_ACCOUNT` / `GITHUB_REPO` / `GITHUB_CRED` in `Jenkinsfile` if these differ.
+- For automatic PR builds, use a *Multibranch Pipeline* job with "Discover pull requests" and a GitHub webhook to `/github-webhook/`.
+
 ## Configuration
 
 ```yaml
@@ -122,3 +142,11 @@ src/main/kotlin/me/hippodev/
 src/main/resources/
   default-config.yml      - bundled example config, copied on first run
 ```
+
+```
+Jenkinsfile               - CI pipeline: checkout, build, test, package, GitHub status + PR comment
+```
+
+## License
+
+MIT - see [LICENSE](LICENSE).

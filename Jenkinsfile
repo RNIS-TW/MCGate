@@ -19,8 +19,9 @@ pipeline {
     environment {
         GITHUB_ACCOUNT = 'RNIS-TW'
         GITHUB_REPO = 'MCGate'
-        // A GLOBAL-scoped credential (Secret text = PAT, or Username/password).
-        // Must exist at Manage Jenkins > Credentials > System > Global credentials.
+        // Must be a GLOBAL-scoped "Username with password" credential
+        // (username = GitHub user, password = PAT with commit-status scope).
+        // The githubNotify step does NOT recognise "Secret text" credentials.
         GITHUB_CRED = 'github-rnis'
     }
 
