@@ -361,7 +361,11 @@ class ReconnectHandler(
         }
 
         override fun channelInactive(ctx: ChannelHandlerContext) {
-            if (!aborted) closeOnFlush(clientChannel)
+            try {
+                super.channelInactive(ctx)
+            } finally {
+                if (!aborted) closeOnFlush(clientChannel)
+            }
         }
 
         override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
