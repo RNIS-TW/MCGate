@@ -41,3 +41,6 @@ build/
 
 ### RUN ###
 run/
+### Logs ###
+log/
+*.log
