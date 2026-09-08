@@ -94,6 +94,24 @@ config:
   # every real client gets dropped as a malformed handshake. Off by default.
   proxyProtocol: false
 
+  # Anti-abuse limits for the pre-login phase of a connection - the window a connection-flood /
+  # slow-loris DDoS lives in. Only take effect on (re)start.
+  #
+  # How long a connection has to complete its handshake AND send its Login Start packet before
+  # MCGate closes it. A flood that opens sockets (and often completes the handshake) but never
+  # sends login otherwise pins a channel + an fd each - and used to make MCGate dial a backend
+  # per bot, which the backend logged as "[initial connection] ... read timed out". A real client
+  # sends Login Start within milliseconds of the handshake, so 30s is very generous. Use 0 to
+  # disable. The backend dial itself is now deferred until Login Start arrives, so bots that never
+  # send it never reach the backend at all.
+  loginTimeout: 30s
+  # Max simultaneous PRE-LOGIN connections from one source IP. A connection stops counting the
+  # moment it completes login (or is held for reconnect), so a real player opening a few
+  # connections in a row is unaffected while a single-source socket flood is capped. 0 =
+  # unlimited. Ignored when proxyProtocol is on (every connection would look like it came from the
+  # upstream load balancer).
+  maxConnectionsPerIp: 0
+
   routes:
     # Simple 1:1 host -> backend mapping.
     - host: survival.example.com

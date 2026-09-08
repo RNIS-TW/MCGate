@@ -11,6 +11,7 @@ A Java/Kotlin thin, host-based reverse proxy for Minecraft servers. It routes cl
 - **Fallback status response** (motd/version/players/favicon) when all of a route's backends are down
 - **`modifyVirtualHost`** - rewrites the handshake hostname before forwarding to the backend
 - **Per-route `proxyProtocol`** - sends a PROXY protocol v1 header so the backend sees the real client IP
+- **DDoS / flood hardening** - `loginTimeout` closes half-open connections (slow-loris); the backend dial *and* backend DNS resolution are both deferred until the client's Login Start arrives, so a connection flood (e.g. to random subdomains on a wildcard route) never reaches the backend or the resolver; oversized handshake frames are rejected on sight; the ping and DNS caches are size-capped; optional `maxConnectionsPerIp` caps concurrent pre-login connections per source IP
 - **Hot config reload** - edits to the config file are picked up live, no restart needed (except for the `bind` address)
 - **Bootstraps a default config** on first run if none exists
 

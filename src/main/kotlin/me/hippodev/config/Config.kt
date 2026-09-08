@@ -196,7 +196,18 @@ data class GateConfig(
      *  connecting straight to MCGate does not send this header, so turning it on when nothing
      *  upstream actually sends one just makes every real connection look like garbage and get
      *  dropped. */
-    val proxyProtocol: Boolean = false
+    val proxyProtocol: Boolean = false,
+    /** Anti-abuse: how long a connection has to complete its handshake *and* send its Login Start
+     *  packet before MCGate closes it. A connection-flood / slow-loris opens sockets (and often
+     *  completes the handshake) but never sends login - each one otherwise pins a channel + an fd
+     *  for as long as it likes. `0` disables the timeout. See [me.hippodev.handler.ConnectionGuardHandler]. */
+    val loginTimeoutMillis: Long = 30_000,
+    /** Anti-abuse: max simultaneous *pre-login* connections from one source IP. A connection stops
+     *  counting the moment it completes login (or is held for reconnect), so a real player opening
+     *  a few connections is unaffected while a single-source socket flood is capped. `0` = unlimited.
+     *  Ignored when [proxyProtocol] is on (every connection would look like it came from the
+     *  upstream load balancer). See [me.hippodev.handler.ConnectionGuardHandler]. */
+    val maxConnectionsPerIp: Int = 0
 ) {
     val bindAddress: InetSocketAddress by lazy { parseHostPort(bind) }
 
@@ -227,11 +238,14 @@ data class GateConfig(
             val workerThreads = configSection["workerThreads"] as? Int ?: 0
             val logConnections = configSection["logConnections"] as? Boolean ?: false
             val proxyProtocol = configSection["proxyProtocol"] as? Boolean ?: false
+            val loginTimeoutMillis = (configSection["loginTimeout"] as? String)?.let { parseDuration(it) } ?: 30_000L
+            val maxConnectionsPerIp = configSection["maxConnectionsPerIp"] as? Int ?: 0
 
             return GateConfig(
                 bind = bind, routes = routes, udpProxies = udpProxies, api = api, connectionTracking = connectionTracking,
                 statsLogging = statsLogging,
-                workerThreads = workerThreads, logConnections = logConnections, proxyProtocol = proxyProtocol
+                workerThreads = workerThreads, logConnections = logConnections, proxyProtocol = proxyProtocol,
+                loginTimeoutMillis = loginTimeoutMillis, maxConnectionsPerIp = maxConnectionsPerIp
             )
         }
 

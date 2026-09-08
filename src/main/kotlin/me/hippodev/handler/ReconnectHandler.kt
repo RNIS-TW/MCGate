@@ -73,6 +73,10 @@ class ReconnectHandler(
      *  connection. */
     fun enter(ctx: ChannelHandlerContext) {
         ctx.channel().config().isAutoRead = true
+        // The player sent a valid Login Start (that's how we have their name/uuid) - they're a real
+        // connection being held because every backend is down, not a flood. Release the pre-login
+        // guard so its deadline doesn't close this held connection out from under us.
+        ctx.pipeline().fireUserEventTriggered(ConnectionGuardHandler.PRELOGIN_DONE)
         ctx.writeAndFlush(encodeLoginSuccess(ids, playerUuid, playerName, compressionThreshold))
         sendWaitingWorld(ctx)
         startKeepAlive(ctx)

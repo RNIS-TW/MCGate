@@ -58,7 +58,13 @@ class ApiServer(
 
     fun start(bindAddress: InetSocketAddress) {
         val boss = NioEventLoopGroup(1)
-        val worker = NioEventLoopGroup()
+        // Fixed small worker pool. NioEventLoopGroup() with no count defaults to cores*2 - 64+
+        // threads on a shared hosting node where availableProcessors() sees the whole box - each
+        // one another stack plus its own Netty buffer cache and arena affinity. This is a
+        // low-traffic read-only admin API; two threads is plenty, and it keeps the same fixed
+        // per-thread memory overhead the main listener already caps (see tuneNettyMemoryFootprint
+        // and workerThreadCount in Main.kt).
+        val worker = NioEventLoopGroup(2)
         bossGroup = boss
         workerGroup = worker
 

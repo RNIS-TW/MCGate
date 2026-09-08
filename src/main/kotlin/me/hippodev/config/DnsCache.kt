@@ -14,6 +14,15 @@ private const val CACHE_TTL_MILLIS = 60_000L
  *  unbounded growth over the process's lifetime. A host still being actively used gets refreshed
  *  well within this window (see [DnsCache.resolve]) and is never swept. */
 private const val ENTRY_IDLE_EVICT_MILLIS = 10 * 60_000L
+
+/** Hard ceiling on cached hostnames, independent of the idle sweep. A wildcard route
+ *  (`$1.servers.svc`) hit by a flood of connections to random subdomains resolves a new key per
+ *  distinct subdomain, faster than [ENTRY_IDLE_EVICT_MILLIS] clears them - without a cap the map
+ *  grows until OOM. A real deployment has at most a handful of distinct backend hosts; once past
+ *  this, new hostnames still resolve, they just aren't cached (the flood keys churn instead of
+ *  accumulating). */
+private const val MAX_CACHE_ENTRIES = 10_000
+
 private val ipLiteralPattern = Regex("""^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$""")
 
 /**
@@ -79,7 +88,11 @@ object DnsCache {
         // No cached value at all yet - nothing to return in the meantime, so this first lookup
         // has to be synchronous. Every subsequent call for this host is non-blocking.
         val addr = InetSocketAddress(host, port)
-        cache[key] = Entry(addr, System.currentTimeMillis() + CACHE_TTL_MILLIS)
+        // Don't let a flood of one-off hostnames (random subdomains on a wildcard route) grow the
+        // cache without bound - past the cap, resolve but don't store.
+        if (cache.size < MAX_CACHE_ENTRIES) {
+            cache[key] = Entry(addr, System.currentTimeMillis() + CACHE_TTL_MILLIS)
+        }
         return addr
     }
 

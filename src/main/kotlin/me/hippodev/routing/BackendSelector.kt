@@ -30,7 +30,13 @@ class RouteRuntime {
     }
 
     fun recordLatency(addr: InetSocketAddress, millis: Long) {
-        latency[addr] = millis to System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        latency[addr] = millis to now
+        // Opportunistic sweep: `latencyOf` only evicts entries it's actually asked for, so a
+        // wildcard route's one-off captured backends that never get read back would linger. A dial
+        // isn't a hot path and `latency` holds one entry per distinct backend, so scanning it here
+        // is cheap and keeps the map bounded without a dedicated reaper thread.
+        latency.entries.removeIf { now - it.value.second > LATENCY_TTL_MILLIS }
     }
 
     /** Same unbounded-growth concern as [recordConnectClosed] applies here - an expired reading

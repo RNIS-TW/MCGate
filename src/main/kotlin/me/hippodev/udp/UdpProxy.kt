@@ -18,6 +18,12 @@ import java.util.concurrent.TimeUnit
 
 private const val SESSION_IDLE_MILLIS = 5 * 60_000L
 
+/** Hard cap on datagrams buffered per session while its backend-facing socket is opening - see
+ *  [me.hippodev.voice.VoiceRelay]'s constant of the same name. Past this the oldest queued
+ *  datagram is dropped and released so a flood (or a hung backend connect) can't pin unbounded
+ *  direct memory. */
+private const val MAX_PENDING_PACKETS = 256
+
 /**
  * Plain static UDP forwarder: every datagram arriving on [UdpProxyConfig.bind] is relayed to
  * [UdpProxyConfig.backend], keyed by source `ip:port` (not just IP, unlike voice/[me.hippodev.voice.VoiceRelay]) -
@@ -35,6 +41,9 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
     private class Session(@Volatile var lastActive: Long) {
         var backendChannel: Channel? = null
         val pending = ArrayDeque<ByteBuf>()
+        /** Set once torn down - a datagram racing in after teardown is released, not re-queued
+         *  into a [pending] nothing will drain. */
+        var dead = false
     }
 
     private val sessions = ConcurrentHashMap<InetSocketAddress, Session>()
@@ -90,8 +99,19 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
 
     private fun forward(session: Session, content: ByteBuf) {
         synchronized(session) {
+            if (session.dead) {
+                content.release()
+                return
+            }
             val channel = session.backendChannel
-            if (channel != null) channel.writeAndFlush(content) else session.pending.addLast(content)
+            if (channel != null) {
+                channel.writeAndFlush(content)
+                return
+            }
+            if (session.pending.size >= MAX_PENDING_PACKETS) {
+                session.pending.removeFirst().release()
+            }
+            session.pending.addLast(content)
         }
     }
 
@@ -116,6 +136,7 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
                 log.warn("Failed to open UDP relay session for {} -> {}: {}", clientAddr, config.backendAddress, future.cause()?.toString())
                 sessions.remove(clientAddr, session)
                 synchronized(session) {
+                    session.dead = true
                     session.pending.forEach { it.release() }
                     session.pending.clear()
                 }
@@ -132,6 +153,7 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
 
     private fun closeSession(session: Session) {
         synchronized(session) {
+            session.dead = true
             session.backendChannel?.close()
             session.pending.forEach { it.release() }
             session.pending.clear()

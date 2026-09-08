@@ -213,7 +213,16 @@ fun main(args: Array<String>) {
             .childHandler(object : ChannelInitializer<SocketChannel>() {
                 override fun initChannel(ch: SocketChannel) {
                     val pipeline = ch.pipeline()
-                    if (stateRef.get().config.proxyProtocol) {
+                    val cfg = stateRef.get().config
+                    // Front of the pipeline: bound the pre-login phase (login deadline + per-IP
+                    // concurrent cap) so a connection-flood / slow-loris can't tie up channels/fds
+                    // or reach the backend. Per-IP capping is skipped under proxyProtocol - every
+                    // connection would otherwise look like it came from the upstream load balancer.
+                    val perIpLimit = if (cfg.proxyProtocol) 0 else cfg.maxConnectionsPerIp
+                    if (cfg.loginTimeoutMillis > 0 || perIpLimit > 0) {
+                        pipeline.addLast(ConnectionGuardHandler(cfg.loginTimeoutMillis, perIpLimit))
+                    }
+                    if (cfg.proxyProtocol) {
                         pipeline.addLast(io.netty.handler.codec.haproxy.HAProxyMessageDecoder())
                         pipeline.addLast(ProxyProtocolAttributeHandler())
                     }
@@ -564,42 +573,42 @@ private fun dispatch(
 
     var route: Route? = null
     var captures: List<String> = emptyList()
-    val backends: List<java.net.InetSocketAddress>
-    try {
-        for (r in state.config.routes) {
-            val m = r.match(host)
-            if (m != null) {
-                route = r
-                captures = m
-                break
-            }
+    for (r in state.config.routes) {
+        val m = r.match(host)
+        if (m != null) {
+            route = r
+            captures = m
+            break
         }
+    }
 
-        if (route == null) {
-            log.info("No route for host '{}', closing connection from {}", host, ctx.channel().effectiveRemoteAddress())
-            rawFrame.release()
-            ctx.close()
-            return
-        }
-
-        backends = route.resolveBackends(captures)
-    } catch (e: Exception) {
-        // Route matching/backend resolution is config-driven (regex, DNS, param substitution) -
-        // a bug or bad edge case here must only drop this one connection, never take the rest of
-        // the server down with it.
-        log.warn("Failed to route connection for host '{}' from {}: {}", host, ctx.channel().effectiveRemoteAddress(), e.toString())
+    if (route == null) {
+        log.info("No route for host '{}', closing connection from {}", host, ctx.channel().effectiveRemoteAddress())
         rawFrame.release()
         ctx.close()
         return
     }
 
-    val resolvedRoute = route!! // non-null: the try block above returns before here otherwise
+    val resolvedRoute = route
     val runtime = state.routeRuntimes.computeIfAbsent(resolvedRoute) { RouteRuntime() }
 
     val handlerName = ctx.name()
     when (nextState) {
         1 -> {
             rawFrame.release()
+            // Status needs its backend list now (to dial for the MOTD). A login connection's is
+            // resolved lazily inside LoginRelayHandler instead - only once the client sends Login
+            // Start - so a connection flood to random subdomains on a wildcard route can't force a
+            // blocking DNS lookup per bot on the event loop.
+            val backends = try {
+                resolvedRoute.resolveBackends(captures)
+            } catch (e: Exception) {
+                // Config-driven (regex, DNS, param substitution) - a bad edge case here must only
+                // drop this one connection, never take the rest of the server down.
+                log.warn("Failed to resolve backends for host '{}' from {}: {}", host, ctx.channel().effectiveRemoteAddress(), e.toString())
+                ctx.close()
+                return
+            }
             ctx.pipeline().addAfter(
                 handlerName, "status",
                 StatusHandler(resolvedRoute, runtime, backends, protocolVersion, host, port, pingCache)
@@ -607,7 +616,7 @@ private fun dispatch(
         }
         else -> {
             registerVoicechatRoute(ctx, resolvedRoute, captures, host)
-            val relay = LoginRelayHandler(resolvedRoute, runtime, backends, protocolVersion, host, port, rawFrame)
+            val relay = LoginRelayHandler(resolvedRoute, runtime, captures, protocolVersion, host, port, rawFrame)
             ctx.pipeline().addAfter(handlerName, "relay", relay)
             relay.start(ctx)
         }
