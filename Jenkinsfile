@@ -44,7 +44,9 @@ pipeline {
 
         stage('Test') {
             steps {
-                sh 'mvn -B test'
+                // pom.xml sets <skipTests>true</skipTests> so a plain `mvn package` build stays
+                // fast; CI must override it or this stage silently runs zero tests.
+                sh 'mvn -B test -DskipTests=false'
             }
             post {
                 always {

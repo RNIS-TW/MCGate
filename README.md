@@ -57,7 +57,7 @@ java -Xms128m -Xmx512m \
 | --- | --- |
 | Checkout | `checkout scm` and records the commit SHA; posts a `PENDING` GitHub commit status (`ci/jenkins`) |
 | Build | `mvn -B clean compile` |
-| Test | `mvn -B test`, publishes JUnit results, zips `surefire-reports` and archives `test-reports.zip` |
+| Test | `mvn -B test -DskipTests=false` (the pom skips tests by default), publishes JUnit results, zips `surefire-reports` and archives `test-reports.zip` |
 | Package | `mvn -B package -DskipTests`, archives `target/MCGate-*.jar` |
 
 On completion it sets the GitHub commit status to `SUCCESS` / `FAILURE` (the check shown on commits and PRs). On pull-request builds (a Multibranch Pipeline job) it also comments on the PR with a pass/fail/skipped table and a link to the archived test report.
@@ -68,6 +68,13 @@ On completion it sets the GitHub commit status to `SUCCESS` / `FAILURE` (the che
 - Plugins: *GitHub API for Pipeline* (`githubNotify`), *JUnit*; for PR builds/comments also *GitHub Branch Source* and *Pipeline: GitHub*.
 - A global **Username with password** credential `github-rnis` (username = a GitHub user with write access to `RNIS-TW/MCGate`, password = a token with *Commit statuses* and *Pull requests* read/write). Update `GITHUB_ACCOUNT` / `GITHUB_REPO` / `GITHUB_CRED` in `Jenkinsfile` if these differ.
 - For automatic PR builds, use a *Multibranch Pipeline* job with "Discover pull requests" and a GitHub webhook to `/github-webhook/`.
+
+**If a new branch / PR gets no build ("Checks 0"):** the job hasn't *discovered* it yet — the `pollSCM` trigger in `Jenkinsfile` only re-polls branches that already have a job, it does not discover new ones.
+- Immediate: open the Multibranch job → **Scan Repository Now**.
+- Permanent: set *Scan Repository Triggers → "Periodically if not otherwise run"* (e.g. 1 hour) as a fallback, and add a GitHub webhook (repo *Settings → Webhooks → `https://<jenkins>/github-webhook/`*, JSON, "push" + "pull request" events).
+- The Branch Source **Behaviours** must include *"Discover branches"* and *"Discover pull requests from origin"* (add *"…from forks"* if PRs come from forks).
+- If the job is a plain single-branch *Pipeline* (not *Multibranch*), it will never build PRs — recreate it as *Multibranch Pipeline*; this `Jenkinsfile` already assumes that (`env.CHANGE_ID`).
+- Note: with the PR "merge" discovery strategy, `git rev-parse HEAD` is the ephemeral merge commit, so the `ci/jenkins` status lands on a commit GitHub doesn't show on the PR. Use the *"The current pull request revision"* (head) strategy so the status attaches to the PR head.
 
 ## Configuration
 
