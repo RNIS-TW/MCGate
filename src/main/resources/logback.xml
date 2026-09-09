@@ -10,8 +10,11 @@
          diagnostic noise, not MCGate's application logging (root level below). -->
     <statusListener class="ch.qos.logback.core.status.NopStatusListener" />
 
-    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
-        <target>System.err</target>
+    <!-- me.hippodev.ColorConsoleAppender (not logback's stock ConsoleAppender): routes each line
+         through System.err.println so ConsoleColors.kt can colourise it, queue it off the Netty
+         event loop, and print it above the JLine prompt. The pattern must stay "HH:mm:ss [LEVEL]
+         msg" - ConsoleColors.kt's LINE_PATTERN regex-matches that exact shape. -->
+    <appender name="CONSOLE" class="me.hippodev.ColorConsoleAppender">
         <encoder>
             <pattern>%d{HH:mm:ss} [%level] %msg%n</pattern>
         </encoder>
