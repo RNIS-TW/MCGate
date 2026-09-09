@@ -17,12 +17,25 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 private const val SESSION_IDLE_MILLIS = 5 * 60_000L
+/** How often the reaper runs - short, so no-reply sessions from a spoofed-source flood are torn
+ *  down quickly rather than lingering for [SESSION_IDLE_MILLIS]. */
+private const val REAPER_INTERVAL_MILLIS = 15_000L
+/** A session whose backend never answers within this long is torn down - a UDP source address is
+ *  trivially spoofable, so a flood of one-off fake senders would otherwise each hold a Session
+ *  plus a backend-facing socket (an fd) for the full idle window. */
+private const val NO_REPLY_TEARDOWN_MILLIS = 20_000L
 
 /** Hard cap on datagrams buffered per session while its backend-facing socket is opening - see
  *  [me.hippodev.voice.VoiceRelay]'s constant of the same name. Past this the oldest queued
  *  datagram is dropped and released so a flood (or a hung backend connect) can't pin unbounded
  *  direct memory. */
 private const val MAX_PENDING_PACKETS = 256
+
+/** Process-wide cap on concurrent relay sessions (each = a Session object + a backend-facing UDP
+ *  socket). Past this, datagrams from not-yet-seen senders are dropped. */
+private const val MAX_SESSIONS = 8192
+/** Cap on concurrent sessions from a single source IP. */
+private const val MAX_SESSIONS_PER_IP = 64
 
 /**
  * Plain static UDP forwarder: every datagram arriving on [UdpProxyConfig.bind] is relayed to
@@ -38,8 +51,10 @@ private const val MAX_PENDING_PACKETS = 256
 class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyConfig) {
     private val log = LoggerFactory.getLogger(UdpProxy::class.java)
 
-    private class Session(@Volatile var lastActive: Long) {
+    private class Session(val clientIp: String, @Volatile var lastActive: Long) {
+        val createdAt = lastActive
         var backendChannel: Channel? = null
+        @Volatile var backendReplied = false
         val pending = ArrayDeque<ByteBuf>()
         /** Set once torn down - a datagram racing in after teardown is released, not re-queued
          *  into a [pending] nothing will drain. */
@@ -47,6 +62,7 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
     }
 
     private val sessions = ConcurrentHashMap<InetSocketAddress, Session>()
+    private val sessionsPerIp = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
     private var publicChannel: Channel? = null
     private val reaper = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "udp-proxy-reaper-${config.bindAddress.port}").apply { isDaemon = true }
@@ -69,13 +85,14 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
         publicChannel = bootstrap.bind(config.bindAddress).sync().channel()
         log.info("Relaying UDP {} -> {}", config.bindAddress, config.backendAddress)
 
-        reaper.scheduleAtFixedRate({ evictIdleSessions() }, SESSION_IDLE_MILLIS, SESSION_IDLE_MILLIS, TimeUnit.MILLISECONDS)
+        reaper.scheduleAtFixedRate({ evictStaleSessions() }, REAPER_INTERVAL_MILLIS, REAPER_INTERVAL_MILLIS, TimeUnit.MILLISECONDS)
     }
 
     fun stop() {
         reaper.shutdownNow()
         sessions.values.forEach { closeSession(it) }
         sessions.clear()
+        sessionsPerIp.clear()
         publicChannel?.close()
     }
 
@@ -90,11 +107,34 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
             return
         }
 
+        if (sessions.size >= MAX_SESSIONS) {
+            content.release()
+            return
+        }
+        val ip = sender.address.hostAddress
+        val ipCount = sessionsPerIp.computeIfAbsent(ip) { java.util.concurrent.atomic.AtomicInteger(0) }
+        if (ipCount.incrementAndGet() > MAX_SESSIONS_PER_IP) {
+            if (ipCount.decrementAndGet() == 0) sessionsPerIp.remove(ip, ipCount)
+            content.release()
+            return
+        }
+
         log.info("Opening UDP relay session: {} -> {}", sender, config.backendAddress)
-        val session = Session(System.currentTimeMillis())
-        sessions[sender] = session
+        val session = Session(ip, System.currentTimeMillis())
+        val prev = sessions.putIfAbsent(sender, session)
+        if (prev != null) {
+            // Raced with another datagram from the same sender - undo our per-IP reservation.
+            releaseIpSlot(ip)
+            prev.lastActive = System.currentTimeMillis()
+            forward(prev, content)
+            return
+        }
         forward(session, content)
         openBackendChannel(sender, session)
+    }
+
+    private fun releaseIpSlot(ip: String) {
+        sessionsPerIp.computeIfPresent(ip) { _, c -> if (c.decrementAndGet() <= 0) null else c }
     }
 
     private fun forward(session: Session, content: ByteBuf) {
@@ -123,6 +163,7 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
             .handler(object : SimpleChannelInboundHandler<DatagramPacket>() {
                 override fun channelRead0(ctx: ChannelHandlerContext, packet: DatagramPacket) {
                     session.lastActive = System.currentTimeMillis()
+                    session.backendReplied = true
                     public.writeAndFlush(DatagramPacket(packet.content().retain(), clientAddr))
                 }
 
@@ -135,11 +176,7 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
             if (!future.isSuccess) {
                 log.warn("Failed to open UDP relay session for {} -> {}: {}", clientAddr, config.backendAddress, future.cause()?.toString())
                 sessions.remove(clientAddr, session)
-                synchronized(session) {
-                    session.dead = true
-                    session.pending.forEach { it.release() }
-                    session.pending.clear()
-                }
+                closeSession(session)
                 return@ChannelFutureListener
             }
             synchronized(session) {
@@ -153,19 +190,23 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
 
     private fun closeSession(session: Session) {
         synchronized(session) {
+            if (session.dead) return
             session.dead = true
             session.backendChannel?.close()
             session.pending.forEach { it.release() }
             session.pending.clear()
         }
+        releaseIpSlot(session.clientIp)
     }
 
-    private fun evictIdleSessions() {
-        val cutoff = System.currentTimeMillis() - SESSION_IDLE_MILLIS
-        val idle = sessions.entries.filter { it.value.lastActive < cutoff }
-        for (entry in idle) {
-            sessions.remove(entry.key, entry.value)
-            closeSession(entry.value)
+    private fun evictStaleSessions() {
+        val now = System.currentTimeMillis()
+        val stale = sessions.entries.filter { (_, s) ->
+            now - s.lastActive > SESSION_IDLE_MILLIS ||
+                (!s.backendReplied && now - s.createdAt > NO_REPLY_TEARDOWN_MILLIS)
+        }
+        for (entry in stale) {
+            if (sessions.remove(entry.key, entry.value)) closeSession(entry.value)
         }
     }
 }

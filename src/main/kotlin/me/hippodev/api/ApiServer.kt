@@ -30,6 +30,7 @@ import me.hippodev.routing.pingBackendLive
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Semaphore
 
 /**
  * A small read-only JSON-over-HTTP admin/status API. Exposes the routing
@@ -99,21 +100,39 @@ private class ApiHandler(
 
     private val log = LoggerFactory.getLogger(ApiHandler::class.java)
 
+    private companion object {
+        /** Process-wide cap on concurrent live `/ping` backend dials across all API connections. */
+        val livePingLimiter = Semaphore(4)
+    }
+
     override fun channelRead0(ctx: ChannelHandlerContext, req: FullHttpRequest) {
         if (req.method() != HttpMethod.GET) {
             respond(ctx, req, HttpResponseStatus.METHOD_NOT_ALLOWED, "{\"error\":\"method not allowed\"}")
             return
         }
 
+        val api = configSupplier().api
+        val token = api.token
+        if (token != null) {
+            val auth = req.headers().get(HttpHeaderNames.AUTHORIZATION)
+            if (auth != "Bearer $token") {
+                respond(ctx, req, HttpResponseStatus.UNAUTHORIZED, "{\"error\":\"unauthorized\"}")
+                return
+            }
+        }
+
         val path = req.uri().substringBefore('?').trimEnd('/')
+        val query = req.uri().substringAfter('?', "").split('&')
+        fun queryInt(name: String): Int? =
+            query.firstOrNull { it.startsWith("$name=") }?.substringAfter('=')?.toIntOrNull()
         val routes = configSupplier().routes
         val segments = path.split('/').filter { it.isNotEmpty() }
 
         when {
             segments == listOf("metrics") -> {
                 val snapshot = collectMetrics(routes, runtimeSupplier)
-                if (req.uri().substringAfter('?', "").split('&').any { it == "type=json" }) {
-                    respond(ctx, req, HttpResponseStatus.OK, metricsJson(snapshot))
+                if (query.any { it == "type=json" }) {
+                    respond(ctx, req, HttpResponseStatus.OK, metricsJson(snapshot, api.playersPageLimit))
                 } else {
                     respond(ctx, req, HttpResponseStatus.OK, metricsText(snapshot), contentType = "text/plain; version=0.0.4; charset=utf-8")
                 }
@@ -123,7 +142,8 @@ private class ApiHandler(
                 respond(ctx, req, HttpResponseStatus.OK, routesJson(routes))
 
             segments == listOf("v1", "players") ->
-                respond(ctx, req, HttpResponseStatus.OK, playersJson())
+                respond(ctx, req, HttpResponseStatus.OK,
+                    playersJson(queryInt("limit") ?: api.playersPageLimit, queryInt("offset") ?: 0, api.playersPageLimit))
 
             segments.size == 3 && segments[0] == "v1" && segments[1] == "routes" && segments[2].toIntOrNull() != null -> {
                 val route = routes.getOrNull(segments[2].toInt())
@@ -215,9 +235,17 @@ private class ApiHandler(
      *  encryption flag governing how their traffic is framed. Reads a handful of AtomicLong/
      *  AtomicInteger values already being maintained live per-session (see PlayerSession) - no
      *  extra bookkeeping is done just to serve this endpoint, and nothing here blocks on I/O. */
-    private fun playersJson(): String {
-        val sb = StringBuilder("{\"players\":[")
-        PlayerSessions.all().forEachIndexed { i, s ->
+    private fun playersJson(limit: Int, offset: Int, maxLimit: Int): String {
+        val all = PlayerSessions.all()
+        val effLimit = limit.coerceIn(0, maxLimit)
+        val effOffset = offset.coerceAtLeast(0)
+        val page = if (effOffset >= all.size) emptyList()
+            else all.subList(effOffset, minOf(all.size, effOffset + effLimit))
+        val sb = StringBuilder("{\"total\":").append(all.size)
+            .append(",\"offset\":").append(effOffset)
+            .append(",\"limit\":").append(effLimit)
+            .append(",\"players\":[")
+        page.forEachIndexed { i, s ->
             if (i > 0) sb.append(',')
             sb.append(playerJson(s))
         }
@@ -254,9 +282,16 @@ private class ApiHandler(
             )
             return
         }
+        // Live pings dial real backend sockets - bound how many can be in flight at once so this
+        // unauthenticated-by-default endpoint can't be turned into a backend-dial amplifier.
+        if (!livePingLimiter.tryAcquire()) {
+            respond(ctx, req, HttpResponseStatus.TOO_MANY_REQUESTS, "{\"error\":\"too many concurrent live pings\"}")
+            return
+        }
         val addrs = try {
             route.resolveBackends(emptyList())
         } catch (e: Exception) {
+            livePingLimiter.release()
             respond(ctx, req, HttpResponseStatus.INTERNAL_SERVER_ERROR, "{\"error\":\"failed to resolve backends\"}")
             return
         }
@@ -273,6 +308,7 @@ private class ApiHandler(
         }
 
         CompletableFuture.allOf(*pings.toTypedArray()).whenComplete { _, _ ->
+            livePingLimiter.release()
             val sb = StringBuilder("{\"index\":").append(index).append(",\"pings\":[")
             pings.forEachIndexed { i, f ->
                 if (i > 0) sb.append(',')
@@ -359,7 +395,7 @@ private class ApiHandler(
      *  which [metricsText] emits as Prometheus series (per-player labels would be unbounded
      *  cardinality - see the doc there) but which cost nothing extra to include here since
      *  [collectMetrics] already gathered them. */
-    private fun metricsJson(s: MetricsSnapshot): String {
+    private fun metricsJson(s: MetricsSnapshot, playerLimit: Int): String {
         val sb = StringBuilder()
         sb.append("{\"playersOnline\":").append(s.playersOnline)
         sb.append(",\"onlineByHost\":{")
@@ -384,8 +420,9 @@ private class ApiHandler(
             sb.append(",\"latencyMillis\":").append(b.latencyMillis ?: "null")
             sb.append('}')
         }
-        sb.append("],\"players\":[")
-        s.players.forEachIndexed { i, p ->
+        sb.append("],\"playersTotal\":").append(s.players.size)
+        sb.append(",\"players\":[")
+        s.players.take(playerLimit.coerceAtLeast(0)).forEachIndexed { i, p ->
             if (i > 0) sb.append(',')
             sb.append(playerJson(p))
         }

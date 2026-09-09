@@ -153,18 +153,48 @@ class LoginRelayHandler(
      *  kicks off the dial. A resolution failure kicks the client, same as an all-backends-down
      *  outcome. */
     private fun beginConnect(ctx: ChannelHandlerContext) {
-        resolvedBackends = try {
-            route.resolveBackends(captures)
-        } catch (e: Exception) {
-            log.warn("Failed to resolve backends for host '{}' from {}: {}", host, clientRemoteAddress, e.toString())
-            releasePendingBuffers()
-            if (ctx.channel().isActive) {
-                ctx.writeAndFlush(encodeLoginDisconnect(toJsonComponent(route.kickMessage)))
-                    .addListener(ChannelFutureListener.CLOSE)
+        // Common case - all backends are IP literals or already cached - resolve inline.
+        if (!route.backendsNeedBlockingResolution(captures)) {
+            val resolved = try {
+                route.resolveBackends(captures)
+            } catch (e: Exception) {
+                failBackendResolution(ctx, e.toString()); return
             }
+            resolvedBackends = resolved
+            connect(ctx, orderBackends(route, runtime, resolvedBackends), 0)
             return
         }
-        connect(ctx, orderBackends(route, runtime, resolvedBackends), 0)
+        // An uncached hostname backend (typically a wildcard route's $N-templated host on its
+        // first hit): do the blocking lookup on the DNS pool, not this event-loop thread, then
+        // re-enter to dial. `pending` stays bounded meanwhile - autoRead was set false by the
+        // caller before beginConnect.
+        val eventLoop = ctx.channel().eventLoop()
+        val submitted = DnsCache.runOffEventLoop {
+            val resolved = try {
+                route.resolveBackends(captures)
+            } catch (e: Exception) {
+                eventLoop.execute { failBackendResolution(ctx, e.toString()) }
+                return@runOffEventLoop
+            }
+            eventLoop.execute {
+                if (pendingReleased || !ctx.channel().isActive || ctx.isRemoved) {
+                    releasePendingBuffers()
+                    return@execute
+                }
+                resolvedBackends = resolved
+                connect(ctx, orderBackends(route, runtime, resolvedBackends), 0)
+            }
+        }
+        if (!submitted) failBackendResolution(ctx, "DNS resolver pool saturated")
+    }
+
+    private fun failBackendResolution(ctx: ChannelHandlerContext, reason: String) {
+        log.warn("Failed to resolve backends for host '{}' from {}: {}", host, clientRemoteAddress, reason)
+        releasePendingBuffers()
+        if (ctx.channel().isActive) {
+            ctx.writeAndFlush(encodeLoginDisconnect(toJsonComponent(route.kickMessage)))
+                .addListener(ChannelFutureListener.CLOSE)
+        }
     }
 
     private fun connect(ctx: ChannelHandlerContext, ordered: List<InetSocketAddress>, attempt: Int) {

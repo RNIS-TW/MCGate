@@ -97,16 +97,14 @@ class StatusHandler(
             return
         }
         val addr = ordered[attempt]
-        // The response cache key includes protocolVersion - a version-multiplexing backend (e.g.
-        // ViaVersion) resolves and reports a different version string/name per client, so a
-        // response cached for one client's protocol version must never be served back to a
-        // different one; that would silently defeat the whole point of forwarding the client's
-        // real protocol version to the backend in the first place (see dialBackendForStatus).
-        // Reachability (down-tracking) is different - a dead backend is dead regardless of which
-        // protocol version asked, so that still just keys off host:port.
+        // Cache key is host:port only, NOT host:port:protocolVersion. Keying per protocol version
+        // let a status flood trivially bypass the cache (cycle the client's declared protocol
+        // version -> every request is a miss -> every request dials the backend). The downside is
+        // a version-multiplexing backend (ViaVersion) may briefly show one client the version
+        // name resolved for another; that's an acceptable trade vs. an unbounded backend dial
+        // amplification vector, and MAX_CONCURRENT_STATUS_DIALS bounds the blast radius anyway.
         val downKey = "${addr.hostString}:${addr.port}"
-        val responseCacheKey = "$downKey:$protocolVersion"
-        val cached = pingCache.get(responseCacheKey)
+        val cached = pingCache.get(downKey)
         if (cached != null) {
             ctx.writeAndFlush(encodeStatusResponse(cached))
             return
@@ -121,8 +119,15 @@ class StatusHandler(
     private fun dialBackendForStatus(ctx: ChannelHandlerContext, ordered: List<InetSocketAddress>, attempt: Int) {
         val addr = ordered[attempt]
         val downKey = "${addr.hostString}:${addr.port}"
-        val responseCacheKey = "$downKey:$protocolVersion"
         val startTime = System.currentTimeMillis()
+
+        if (!runtime.tryBeginStatusDial(addr)) {
+            log.debug("Too many in-flight status dials to {}, failing over", addr)
+            tryBackend(ctx, ordered, attempt + 1)
+            return
+        }
+        val dialSlot = java.util.concurrent.atomic.AtomicBoolean(true)
+        fun releaseDial() { if (dialSlot.compareAndSet(true, false)) runtime.endStatusDial(addr) }
 
         val bootstrap = Bootstrap()
             .group(ctx.channel().eventLoop())
@@ -150,7 +155,7 @@ class StatusHandler(
                             if (ctx.channel().isActive) tryBackend(ctx, ordered, attempt + 1)
                             return@BackendStatusFetcher
                         }
-                        pingCache.put(responseCacheKey, json, route.cachePingTTLMillis)
+                        pingCache.put(downKey, json, route.cachePingTTLMillis)
                         if (ctx.channel().isActive) {
                             ctx.writeAndFlush(encodeStatusResponse(json))
                         }
@@ -160,12 +165,16 @@ class StatusHandler(
 
         bootstrap.connect(addr).addListener(ChannelFutureListener { future ->
             if (!future.isSuccess) {
+                releaseDial()
                 log.debug("Status dial to {} failed: {}", addr, future.cause()?.message)
                 pingCache.markDown(downKey)
                 tryBackend(ctx, ordered, attempt + 1)
                 return@ChannelFutureListener
             }
             val backendChannel = future.channel()
+            // Covers every post-connect completion: response read + close, ReadTimeoutHandler
+            // firing, or the client going away.
+            backendChannel.closeFuture().addListener(ChannelFutureListener { releaseDial() })
             // Backends behind proxyProtocol expect the PROXY header on every connection,
             // including status probes - without it, a strict backend just never responds
             // (connection looks "up" but hangs forever), which looked identical to a dead

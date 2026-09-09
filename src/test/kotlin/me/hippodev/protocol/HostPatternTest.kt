@@ -59,4 +59,10 @@ class HostPatternTest {
     fun `an over-long host is rejected`() {
         assertNull(HostPattern("*.example.com").match("a".repeat(300) + ".example.com"))
     }
+
+    @Test
+    fun `patterns compare equal by their normalized form (enables runtime carry-over on reload)`() {
+        assertEquals(HostPattern("*.MC.example.com."), HostPattern("*.mc.example.com"))
+        assertEquals(HostPattern("*.mc.example.com").hashCode(), HostPattern("*.MC.example.com").hashCode())
+    }
 }

@@ -67,6 +67,16 @@ class ReconnectHandler(
     private val enteredAt = System.currentTimeMillis()
     private var onConfigurationAck: ((ChannelHandlerContext) -> Unit)? = null
     private var done = false
+    /** True while this handler holds a [HeldReconnectSessions] slot - released once, when the
+     *  hold ends (client gone, or transferred onto a real backend). */
+    private var holdingCounted = false
+
+    private fun releaseHold() {
+        if (holdingCounted) {
+            holdingCounted = false
+            HeldReconnectSessions.exit()
+        }
+    }
 
     /** Entry point when the client hasn't logged in yet (initial connect found every backend
      *  down) - ReconnectHandler performs the client's very first Login Success on this
@@ -77,6 +87,14 @@ class ReconnectHandler(
         // connection being held because every backend is down, not a flood. Release the pre-login
         // guard so its deadline doesn't close this held connection out from under us.
         ctx.pipeline().fireUserEventTriggered(ConnectionGuardHandler.PRELOGIN_DONE)
+        if (!HeldReconnectSessions.tryEnter()) {
+            log.warn("Reconnect-hold cap ({}) reached, kicking '{}' instead of holding", HeldReconnectSessions.max, playerName)
+            PlayerSessions.remove(playerUuid)
+            ctx.writeAndFlush(encodeLoginDisconnect(toJsonComponent(route.kickMessage)))
+                .addListener(ChannelFutureListener.CLOSE)
+            return
+        }
+        holdingCounted = true
         ctx.writeAndFlush(encodeLoginSuccess(ids, playerUuid, playerName, compressionThreshold))
         sendWaitingWorld(ctx)
         startKeepAlive(ctx)
@@ -91,6 +109,13 @@ class ReconnectHandler(
      *  Login Success (which a client only ever accepts once per connection). */
     fun enterFromPlay(ctx: ChannelHandlerContext) {
         ctx.channel().config().isAutoRead = true
+        if (!HeldReconnectSessions.tryEnter()) {
+            log.warn("Reconnect-hold cap ({}) reached, kicking '{}' instead of holding", HeldReconnectSessions.max, playerName)
+            PlayerSessions.remove(playerUuid)
+            kickWithMessage(ctx, toLegacyText(route.kickMessage))
+            return
+        }
+        holdingCounted = true
         awaitConfigurationAck(ctx) { ackCtx ->
             sendWaitingWorld(ackCtx)
             startKeepAlive(ackCtx)
@@ -120,7 +145,9 @@ class ReconnectHandler(
             // keepalives, no log, and that one player eventually times out with nothing in the
             // logs to explain why. Catching and logging keeps the failure isolated but visible.
             try {
-                if (ctx.channel().isActive) {
+                // Skip when the client isn't draining what we send - a black-holing held client
+                // would otherwise accumulate keep-alive/animation frames in its outbound buffer.
+                if (ctx.channel().isActive && ctx.channel().isWritable) {
                     ctx.writeAndFlush(encodePlayKeepAlive(ids, System.currentTimeMillis(), compressionThreshold))
                 }
             } catch (e: Exception) {
@@ -137,7 +164,7 @@ class ReconnectHandler(
         if (frames.isEmpty()) return
         animationTask = ctx.channel().eventLoop().scheduleAtFixedRate({
             try {
-                if (ctx.channel().isActive) {
+                if (ctx.channel().isActive && ctx.channel().isWritable) {
                     ctx.writeAndFlush(encodeActionBar(ids, frames[animationFrame % frames.size], compressionThreshold))
                     animationFrame++
                 }
@@ -411,6 +438,7 @@ class ReconnectHandler(
     override fun channelInactive(ctx: ChannelHandlerContext) {
         done = true
         cancelSchedules()
+        releaseHold()
         PlayerSessions.remove(playerUuid)
         VoiceRouting.unregisterChannel(ctx.channel())
         super.channelInactive(ctx)
@@ -418,6 +446,9 @@ class ReconnectHandler(
 
     override fun handlerRemoved0(ctx: ChannelHandlerContext) {
         cancelSchedules()
+        // Fires whether the hold ended in a disconnect or a successful transfer onto a backend
+        // (pipeline replace) - the single reliable "this hold is over" hook.
+        releaseHold()
     }
 
     override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {

@@ -74,6 +74,13 @@ class HostPattern(val raw: String) {
         }
         return captures
     }
+
+    // Value equality on the normalized pattern, so a structurally-identical Route parsed again
+    // on a config reload compares equal - lets RouteRuntime state be carried across reloads
+    // (see GateState in Main.kt).
+    override fun equals(other: Any?): Boolean = other is HostPattern && other.pattern == pattern
+    override fun hashCode(): Int = pattern.hashCode()
+    override fun toString(): String = raw
 }
 
 private val paramPattern = Pattern.compile("\\$(\\d+)")

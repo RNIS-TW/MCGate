@@ -77,7 +77,7 @@ event-loop thread at 100% CPU, stalling every player on that thread.
 
 ---
 
-## P1-4 — Global connection ceiling + per-IP connection-rate throttle
+## P1-4 — Global connection ceiling + per-IP connection-rate throttle ✅ DONE
 
 **Problem.** `maxConnectionsPerIp` defaults to `0` (off) and is disabled under
 `proxyProtocol`. No process-wide max-connections limit, no "new connections per IP per
@@ -105,7 +105,7 @@ window, assert the last is dropped immediately; assert global cap rejects at the
 
 ---
 
-## P1-5 — Status path: stop it being a backend-amplification vector
+## P1-5 — Status path: stop it being a backend-amplification vector ✅ DONE
 
 **Problem.** `StatusHandler` dials the backend on every cache miss, and the cache key
 includes `protocolVersion` — an attacker cycling the protocol version misses the cache
@@ -127,7 +127,7 @@ every time, one backend dial per request, no per-IP or per-backend concurrency l
 
 ---
 
-## P1-6 — Defer / off-load DNS on the status path; cache negative lookups
+## P1-6 — Defer / off-load DNS on the status path; cache negative lookups ✅ DONE
 
 **Problem.** First `DnsCache.resolve()` for any hostname blocks the calling thread.
 `LoginRelayHandler` defers this until Login Start; `StatusHandler` and `dispatch()`'s
@@ -148,7 +148,7 @@ returns an *unresolved* address on failure (never throws) and that gets cached 6
 
 ---
 
-## P1-7 — Gate + cap UDP sessions in `UdpProxy`
+## P1-7 — Gate + cap UDP sessions in `UdpProxy` ✅ DONE
 
 **Problem.** `UdpProxy` opens a `Session` **and a backend-facing datagram socket (fd)** per
 distinct source `ip:port`, no gating. UDP sources are spoofable → unbounded sessions/fds
@@ -170,7 +170,7 @@ senders, assert session map and open-channel count stay bounded.
 
 ---
 
-## P2-8 — Replace global `SecureRandom` in `orderBackends`
+## P2-8 — Replace global `SecureRandom` in `orderBackends` ✅ DONE
 
 **Problem.** `Strategy.RANDOM` calls `secureRandom.nextLong()` per connection;
 `SecureRandom` is synchronized → serializes dispatch across all event loops under a flood.
@@ -185,7 +185,7 @@ balancing.
 
 ---
 
-## P2-9 — Cap the reconnect-hold state
+## P2-9 — Cap the reconnect-hold state ✅ DONE
 
 **Problem.** `reconnect.maxWait` defaults to `0` (unlimited). On an offline-mode server
 with `reconnect.enabled`, a login flood during a backend blip promotes every bot to a
@@ -206,7 +206,7 @@ excess are kicked, not held.
 
 ---
 
-## P2-10 — Preserve `RouteRuntime` across config reload
+## P2-10 — Preserve `RouteRuntime` across config reload ✅ DONE
 
 **Problem.** Each reload builds a fresh `GateState` with an empty `routeRuntimes` map:
 active-connection counts reset to 0 → `least-connections` misroutes and `/metrics`
@@ -224,7 +224,7 @@ backend is still 1.
 
 ---
 
-## P2-11 — API auth + bounded player listing
+## P2-11 — API auth + bounded player listing ✅ DONE
 
 **Problem.** No authentication. `/v1/routes/{i}/ping` = unauthenticated on-demand backend
 dialing. `/v1/players` and `/metrics?type=json` build a multi-MB string on the event loop
@@ -246,8 +246,9 @@ endpoint respects `limit`.
 
 - **IPv6 in `parseHostPort`.** `lastIndexOf(':')` breaks `[::1]:25565`. Parse bracket form.
   `config/Config.kt`.
-- **`DnsCache` refresh executor** has an unbounded work queue; give it a bounded queue +
-  `CallerRunsPolicy` or `DiscardPolicy`. `config/DnsCache.kt`.
+- ~~**`DnsCache` refresh executor** unbounded work queue~~ ✅ DONE (pulled into P1-6:
+  `ThreadPoolExecutor` with a bounded queue + `AbortPolicy`; `runOffEventLoop` returns false
+  on rejection and the caller drops that one connection).
 - **Configurable Netty direct-arena count** (`GateConfig.directArenas`), for busy
   deployments that want throughput over the current 2-arena memory floor. `Main.kt`.
 - **Encoder allocations.** Reconnect animation path allocates a fresh `Unpooled.buffer()`
@@ -260,11 +261,33 @@ endpoint respects `limit`.
 
 ## Suggested sequencing
 
-1. **PR 1 — process-kill bugs:** P0-1, P0-2, P0-3. Small, high-value, well-testable.
-2. **PR 2 — flood ceiling:** P1-4, P1-5, P1-6. The core DDoS story; ship with README updates.
-3. **PR 3 — UDP + reconnect:** P1-7, P2-9.
-4. **PR 4 — correctness/perf:** P2-8, P2-10, P2-11.
-5. **PR 5 — polish:** P3 batch.
+1. **PR 1 — process-kill bugs:** P0-1, P0-2, P0-3. ✅ DONE
+2. **PR 2 — flood ceiling:** P1-4, P1-5, P1-6. ✅ DONE
+3. **PR 3 — UDP + reconnect:** P1-7, P2-9. ✅ DONE
+4. **PR 4 — correctness/perf:** P2-8, P2-10, P2-11. ✅ DONE
+5. **PR 5 — polish:** P3 batch. (remaining: IPv6 parse, arena count, encoder allocs, reaper shutdown)
+
+## Implementation notes (deviations from the plan above)
+
+- **P1-4:** flood ceilings live in `handler/FloodControl.kt` (`GlobalConnections`,
+  `ConnectionRates`, `HeldReconnectSessions`), checked in the child-channel initializer, not
+  in `ConnectionGuardHandler`. Rate limiter is fixed-window (a boundary can allow ~2x
+  briefly — fine for flood mitigation). `maxConnections` sits inside the
+  `connectionThrottle` config object. README not yet updated — `default-config.yml` is.
+- **P1-5:** the per-IP status-request rate limit is just the P1-4 throttle (status pings are
+  connections too); no separate limiter. Cache key dropped to `host:port`; no per-client
+  JSON version rewrite.
+- **P1-6:** the login path also moved off the event loop for resolution — but only when a
+  backend hostname is actually uncached (`Route.backendsNeedBlockingResolution`). Status
+  uses a `BufferingStatusHandler` placeholder so the client's Status Request bytes aren't
+  lost during the async hop.
+- **P2-9:** `reconnect.maxWait` default changed `0` → `10m`; the global held-session cap is
+  `HeldReconnectSessions` (default 500, config `maxHeldReconnectSessions`).
+- **P2-11:** `api.token` (Bearer) + `api.playersPageLimit` (paginate `/v1/players`, cap the
+  list in `/metrics?type=json`) + a `Semaphore(4)` on concurrent live `/ping` dials.
+- New tests: `FloodControlTest`, `RouteRuntimeTest`, `DnsCacheTest`, `CompressionTest`,
+  `HostPatternTest`, plus additions to `HostPatternTest`. 66 tests green; jar builds; manual
+  smoke test of status (inline + async DNS) and login-to-down-backend paths passed.
 
 ## Testing notes
 

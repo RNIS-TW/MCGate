@@ -28,6 +28,12 @@ private const val SESSION_IDLE_MILLIS = 5 * 60_000L
  *  is lossy by nature, so dropping a few packets here is harmless. */
 private const val MAX_PENDING_PACKETS = 256
 
+/** Process-wide cap on concurrent voice relay sessions. New sessions only open for a client with
+ *  a live [VoiceRouting] entry (i.e. a logged-in player), so this is normally bounded by the
+ *  player count anyway - it's a backstop against a spoofed-source flood arriving in the window
+ *  before a routing entry is idle-evicted. */
+private const val MAX_SESSIONS = 8192
+
 /**
  * Relays UDP traffic (Simple Voice Chat and similar mods) on the same port MCGate's Minecraft TCP
  * listener binds - no extra port to open. UDP carries no hostname the way the Minecraft handshake
@@ -122,7 +128,7 @@ class VoiceRelay(private val group: EventLoopGroup) {
         }
 
         val backendAddr = VoiceRouting.resolve(sender.address.hostAddress)
-        if (backendAddr == null) {
+        if (backendAddr == null || sessions.size >= MAX_SESSIONS) {
             content.release()
             return
         }

@@ -8,6 +8,7 @@ import io.netty.channel.ChannelOption
 import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.NioServerSocketChannel
+import io.netty.handler.codec.ByteToMessageDecoder
 import me.hippodev.api.ApiServer
 import me.hippodev.config.*
 import me.hippodev.handler.*
@@ -37,8 +38,22 @@ private const val BANNER = """
 """
 
 /** Everything that gets swapped together on a config reload. */
-private class GateState(val config: GateConfig) {
+private class GateState(val config: GateConfig, previous: GateState? = null) {
     val routeRuntimes = ConcurrentHashMap<Route, RouteRuntime>()
+
+    init {
+        // Carry forward per-backend runtime state (active-connection counts, round-robin cursor,
+        // latency readings) for routes that survived the reload unchanged - otherwise a reload
+        // resets every counter to zero, briefly mis-routing `least-connections` and under-
+        // reporting active connections on `/metrics` until players reconnect. Structural Route
+        // equality makes this work across reloads (see HostPattern.equals).
+        if (previous != null) {
+            val current = HashSet(config.routes)
+            for ((route, runtime) in previous.routeRuntimes) {
+                if (route in current) routeRuntimes[route] = runtime
+            }
+        }
+    }
 }
 
 /** Falls back to "dev" when run outside a packaged jar (e.g. from an IDE run config or
@@ -110,6 +125,7 @@ fun main(args: Array<String>) {
     val initialConfig = ConfigLoader.loadOrCreateDefault(configPath, messagesRef.get())
     log.info("Loaded {} route(s) from {}", initialConfig.routes.size, configPath)
     ConnectionTracker.applyConfig(initialConfig.connectionTracking)
+    HeldReconnectSessions.max = initialConfig.maxHeldReconnectSessions
 
     val stateRef = AtomicReference(GateState(initialConfig))
     val pingCache = PingCache()
@@ -120,6 +136,15 @@ fun main(args: Array<String>) {
     fun currentSnapshot() = collectMetrics(stateRef.get().config.routes) { route -> stateRef.get().routeRuntimes[route] }
     StatsLogger.applyConfig(initialConfig.statsLogging, ::currentSnapshot)
 
+    // Single place every reload path funnels through - swaps the state (carrying runtime counters
+    // across, see GateState) and re-applies every live-reconfigurable subsystem.
+    fun applyConfig(newConfig: GateConfig) {
+        stateRef.set(GateState(newConfig, stateRef.get()))
+        ConnectionTracker.applyConfig(newConfig.connectionTracking)
+        StatsLogger.applyConfig(newConfig.statsLogging, ::currentSnapshot)
+        HeldReconnectSessions.max = newConfig.maxHeldReconnectSessions
+    }
+
     // Shared by the file watchers below and the console `reload` command, so a manual reload
     // behaves identically to a file save - re-reads both files fresh from disk regardless of
     // which one triggered it, since a route can depend on either.
@@ -128,9 +153,7 @@ fun main(args: Array<String>) {
             val newMessages = GateMessages.load(messagesPath)
             messagesRef.set(newMessages)
             val newConfig = GateConfig.load(configPath, newMessages)
-            stateRef.set(GateState(newConfig))
-            ConnectionTracker.applyConfig(newConfig.connectionTracking)
-            StatsLogger.applyConfig(newConfig.statsLogging, ::currentSnapshot)
+            applyConfig(newConfig)
             log.info("{}: reloaded {} route(s) from {} and messages from {}", reason, newConfig.routes.size, configPath, messagesPath)
         } catch (e: Exception) {
             log.error("{}: reload failed, keeping previous config/messages", reason, e)
@@ -139,9 +162,7 @@ fun main(args: Array<String>) {
 
     ConfigLoader.watch(configPath, { messagesRef.get() }) { newConfig ->
         log.info("Config changed, loaded {} route(s)", newConfig.routes.size)
-        stateRef.set(GateState(newConfig))
-        ConnectionTracker.applyConfig(newConfig.connectionTracking)
-        StatsLogger.applyConfig(newConfig.statsLogging, ::currentSnapshot)
+        applyConfig(newConfig)
     }
 
     // Reload config.yml too so routes that don't override a message pick up the new default
@@ -149,10 +170,7 @@ fun main(args: Array<String>) {
     MessagesLoader.watch(messagesPath) { newMessages ->
         messagesRef.set(newMessages)
         log.info("Messages changed, reloading {} with new defaults", configPath)
-        val newConfig = GateConfig.load(configPath, newMessages)
-        stateRef.set(GateState(newConfig))
-        ConnectionTracker.applyConfig(newConfig.connectionTracking)
-        StatsLogger.applyConfig(newConfig.statsLogging, ::currentSnapshot)
+        applyConfig(GateConfig.load(configPath, newMessages))
     }
 
     if (initialConfig.api.enabled) {
@@ -188,7 +206,7 @@ fun main(args: Array<String>) {
         val bootstrap = ServerBootstrap()
             .group(bossGroup, workerGroup)
             .channel(NioServerSocketChannel::class.java)
-            .option(ChannelOption.SO_BACKLOG, 128)
+            .option(ChannelOption.SO_BACKLOG, initialConfig.soBacklog)
             .childOption(ChannelOption.TCP_NODELAY, true)
             // Explicit (not relying on Netty's version-dependent default) write water marks, the
             // trip points the relay's flow control keys off (see FlowControl.kt): once a client's
@@ -214,6 +232,30 @@ fun main(args: Array<String>) {
                 override fun initChannel(ch: SocketChannel) {
                     val pipeline = ch.pipeline()
                     val cfg = stateRef.get().config
+                    val throttle = cfg.connectionThrottle
+
+                    // Process-wide flood ceilings, checked before any per-connection state is
+                    // built. Both are meaningless under proxyProtocol (every connection then
+                    // carries the upstream load balancer's address).
+                    if (!cfg.proxyProtocol && throttle.maxPerIpPerWindow > 0) {
+                        val ip = (ch.remoteAddress() as? java.net.InetSocketAddress)?.address?.hostAddress
+                        if (ip != null && !ConnectionRates.tryAcquire(ip, throttle.maxPerIpPerWindow, throttle.windowMillis)) {
+                            log.debug("Rejecting connection from {} - over connection rate limit", ip)
+                            ch.close()
+                            return
+                        }
+                    }
+                    if (throttle.maxConnections > 0) {
+                        if (GlobalConnections.tryAcquire(throttle.maxConnections)) {
+                            ch.closeFuture().addListener { GlobalConnections.release() }
+                        } else {
+                            log.debug("Rejecting connection from {} - at global connection cap ({})",
+                                ch.remoteAddress(), throttle.maxConnections)
+                            ch.close()
+                            return
+                        }
+                    }
+
                     // Front of the pipeline: bound the pre-login phase (login deadline + per-IP
                     // concurrent cap) so a connection-flood / slow-loris can't tie up channels/fds
                     // or reach the backend. Per-IP capping is skipped under proxyProtocol - every
@@ -556,6 +598,46 @@ private fun printRoutes(state: GateState) {
     }
 }
 
+/**
+ * Placeholder that sits where [StatusHandler] will go while an off-event-loop DNS lookup for the
+ * route's backends is in flight (see the status branch of [dispatch]). It's a [ByteToMessageDecoder]
+ * that never consumes anything, so the client's Status Request bytes stay cumulated and are
+ * replayed to the real [StatusHandler] the moment [ready] swaps it in. [ready]/[fail] are only
+ * ever called on the channel's event loop.
+ */
+private class BufferingStatusHandler : ByteToMessageDecoder() {
+    private var ctxRef: ChannelHandlerContext? = null
+    private var pending: StatusHandler? = null
+    private var failed = false
+
+    override fun handlerAdded(ctx: ChannelHandlerContext) {
+        ctxRef = ctx
+        pending?.let { install(ctx, it) }
+        if (failed && ctx.channel().isActive) ctx.close()
+    }
+
+    override fun decode(ctx: ChannelHandlerContext, buf: ByteBuf, out: MutableList<Any>) {
+        // Intentionally nothing - hold the bytes until the real handler takes over.
+    }
+
+    fun ready(handler: StatusHandler) {
+        val ctx = ctxRef
+        if (ctx == null) { pending = handler; return }
+        install(ctx, handler)
+    }
+
+    fun fail() {
+        val ctx = ctxRef
+        if (ctx == null) { failed = true; return }
+        if (ctx.channel().isActive) ctx.close()
+    }
+
+    private fun install(ctx: ChannelHandlerContext, handler: StatusHandler) {
+        if (ctx.pipeline().context(this) == null) return
+        ctx.pipeline().replace(this, "status", handler)
+    }
+}
+
 private fun dispatch(
     ctx: ChannelHandlerContext,
     state: GateState,
@@ -596,23 +678,38 @@ private fun dispatch(
     when (nextState) {
         1 -> {
             rawFrame.release()
-            // Status needs its backend list now (to dial for the MOTD). A login connection's is
-            // resolved lazily inside LoginRelayHandler instead - only once the client sends Login
-            // Start - so a connection flood to random subdomains on a wildcard route can't force a
-            // blocking DNS lookup per bot on the event loop.
-            val backends = try {
-                resolvedRoute.resolveBackends(captures)
-            } catch (e: Exception) {
-                // Config-driven (regex, DNS, param substitution) - a bad edge case here must only
-                // drop this one connection, never take the rest of the server down.
-                log.warn("Failed to resolve backends for host '{}' from {}: {}", host, ctx.channel().effectiveRemoteAddress(), e.toString())
-                ctx.close()
-                return
-            }
-            ctx.pipeline().addAfter(
-                handlerName, "status",
+            fun installStatus(backends: List<java.net.InetSocketAddress>) =
                 StatusHandler(resolvedRoute, runtime, backends, protocolVersion, host, port, pingCache)
-            )
+
+            if (!resolvedRoute.backendsNeedBlockingResolution(captures)) {
+                // Common case - IP-literal or already-cached backends - resolve inline.
+                val backends = try {
+                    resolvedRoute.resolveBackends(captures)
+                } catch (e: Exception) {
+                    log.warn("Failed to resolve backends for host '{}' from {}: {}", host, ctx.channel().effectiveRemoteAddress(), e.toString())
+                    ctx.close()
+                    return
+                }
+                ctx.pipeline().addAfter(handlerName, "status", installStatus(backends))
+            } else {
+                // An uncached hostname backend (e.g. a wildcard route's $N host on first hit):
+                // do the blocking DNS lookup on the resolver pool, not this event-loop thread.
+                // A buffering placeholder holds the client's Status Request bytes meanwhile.
+                val buffering = BufferingStatusHandler()
+                ctx.pipeline().addAfter(handlerName, "status", buffering)
+                val eventLoop = ctx.channel().eventLoop()
+                val submitted = DnsCache.runOffEventLoop {
+                    val backends = try {
+                        resolvedRoute.resolveBackends(captures)
+                    } catch (e: Exception) {
+                        log.warn("Failed to resolve backends for host '{}': {}", host, e.toString())
+                        eventLoop.execute { buffering.fail() }
+                        return@runOffEventLoop
+                    }
+                    eventLoop.execute { buffering.ready(installStatus(backends)) }
+                }
+                if (!submitted) buffering.fail()
+            }
         }
         else -> {
             registerVoicechatRoute(ctx, resolvedRoute, captures, host)
