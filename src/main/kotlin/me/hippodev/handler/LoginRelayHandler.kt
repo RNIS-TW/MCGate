@@ -373,10 +373,11 @@ class LoginRelayHandler(
         override fun decode(ctx: ChannelHandlerContext, buf: ByteBuf, out: MutableList<Any>) {
             val frameStart = buf.readerIndex()
             val length = try {
-                readVarInt(buf)
-            } catch (e: IncompleteVarIntException) {
-                buf.readerIndex(frameStart); return
-            }
+                readFrameLength(buf, frameStart)
+            } catch (e: IllegalStateException) {
+                log.debug("Backend sent an over-long frame, dropping connection: {}", e.message)
+                ctx.close(); return
+            } ?: return
             val payloadStart = buf.readerIndex()
             if (buf.readableBytes() < length) {
                 buf.readerIndex(frameStart); return

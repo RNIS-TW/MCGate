@@ -59,10 +59,11 @@ class StatusHandler(
     override fun decode(ctx: ChannelHandlerContext, buf: ByteBuf, out: MutableList<Any>) {
         val frameStart = buf.readerIndex()
         val length = try {
-            readVarInt(buf)
-        } catch (e: IncompleteVarIntException) {
-            buf.readerIndex(frameStart); return
-        }
+            readFrameLength(buf, frameStart)
+        } catch (e: IllegalStateException) {
+            log.debug("Rejecting status connection: {}", e.message)
+            ctx.close(); return
+        } ?: return
         if (buf.readableBytes() < length) {
             buf.readerIndex(frameStart); return
         }
@@ -214,10 +215,11 @@ private class BackendStatusFetcher(private val onResult: (String) -> Unit) :
     override fun decode(ctx: ChannelHandlerContext, buf: ByteBuf, out: MutableList<Any>) {
         val frameStart = buf.readerIndex()
         val length = try {
-            readVarInt(buf)
-        } catch (e: IncompleteVarIntException) {
-            buf.readerIndex(frameStart); return
-        }
+            readFrameLength(buf, frameStart)
+        } catch (e: IllegalStateException) {
+            log.debug("Backend status response frame rejected: {}", e.message)
+            ctx.close(); return
+        } ?: return
         if (buf.readableBytes() < length) {
             buf.readerIndex(frameStart); return
         }
@@ -241,7 +243,11 @@ private class PingPongHandler : SimpleChannelInboundHandler<ByteBuf>() {
 
     override fun channelRead0(ctx: ChannelHandlerContext, msg: ByteBuf) {
         val frameStart = msg.readerIndex()
-        val length = readVarInt(msg)
+        val length = try {
+            readFrameLength(msg, frameStart)
+        } catch (e: IllegalStateException) {
+            ctx.close(); return
+        } ?: return
         if (msg.readableBytes() < length) {
             msg.readerIndex(frameStart)
             return
