@@ -9,6 +9,7 @@ import io.netty.channel.EventLoopGroup
 import io.netty.channel.SimpleChannelInboundHandler
 import io.netty.channel.socket.DatagramPacket
 import io.netty.channel.socket.nio.NioDatagramChannel
+import me.hippodev.protocol.parseProxyProtocolHeader
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.util.concurrent.ConcurrentHashMap
@@ -40,12 +41,25 @@ private const val MAX_SESSIONS = 8192
  * does, so which backend a datagram belongs to is looked up by the sender's IP via [VoiceRouting],
  * populated from the TCP side when a route with a `voicechat:` backend is resolved for a client.
  *
+ * When [expectProxyProtocol] is set (the global `proxyProtocol` config - MCGate sits behind an L4
+ * proxy such as Cloudflare Spectrum that also fronts this UDP port), the fronting proxy prepends a
+ * PROXY protocol (v1/v2) header to the **first** datagram of each origin-facing flow (Cloudflare
+ * Spectrum, notably, does not repeat it on every packet). That header is stripped and the real
+ * client address it reports is used for the [VoiceRouting] lookup and as the session key -
+ * otherwise the datagram would look like it came from the fronting proxy's own IP and never match
+ * a routing entry. Subsequent header-less datagrams on the same flow are matched back to that
+ * session by their source address ([byVia]). Backend replies go to the datagram's actual sender
+ * (the fronting proxy), which de-muxes them to the real client - see [Session.via].
+ *
  * Acts as a small NAT: each distinct client gets its own ephemeral backend-facing UDP socket (see
  * [Session.backendChannel]), so the backend sees every player as a distinct source address/port,
  * same as if MCGate weren't in the middle. Funnelling every client through one shared
  * backend-facing socket would make the backend unable to tell players apart at all.
  */
-class VoiceRelay(private val group: EventLoopGroup) {
+class VoiceRelay(
+    private val group: EventLoopGroup,
+    private val expectProxyProtocol: Boolean = false
+) {
     private val log = LoggerFactory.getLogger(VoiceRelay::class.java)
 
     /** [backendChannel] starts null and is filled in once the async `connect()` in
@@ -54,7 +68,11 @@ class VoiceRelay(private val group: EventLoopGroup) {
      *  packets can arrive on the shared public channel's event loop while the connect completion
      *  runs on the new backend channel's own (different) event loop, so this genuinely races,
      *  unlike most other per-connection state in this codebase which is pinned to one thread. */
-    private class Session(@Volatile var lastActive: Long) {
+    /** [via] is where backend replies are sent: the datagram's actual source, which is the
+     *  fronting L4 proxy's address when [expectProxyProtocol] is on (it de-muxes replies back to
+     *  the real client) and the client's own address otherwise. Refreshed on every inbound
+     *  datagram in case the fronting proxy rotates its source port mid-session. */
+    private class Session(@Volatile var lastActive: Long, @Volatile var via: InetSocketAddress) {
         var backendChannel: Channel? = null
         val pending = ArrayDeque<ByteBuf>()
         /** Set once this session is torn down (idle-evicted, client logged out, or its backend
@@ -67,8 +85,29 @@ class VoiceRelay(private val group: EventLoopGroup) {
         @Volatile var repliedOnce = false
     }
 
+    /** Keyed by the *client* address: the datagram's own source normally, or the address from the
+     *  PROXY header under [expectProxyProtocol]. This is the key [disconnectClient] matches on. */
     private val sessions = ConcurrentHashMap<InetSocketAddress, Session>()
+
+    /** [expectProxyProtocol] only: sessions indexed by their current [Session.via] (the fronting
+     *  proxy's source address), so a header-less datagram - every datagram after the first, with
+     *  Cloudflare Spectrum - can still be matched to the session its flow's first (headered)
+     *  datagram established. Kept in lockstep with [Session.via]. */
+    private val byVia = ConcurrentHashMap<InetSocketAddress, Session>()
+
     private var publicChannel: Channel? = null
+
+    /** Rate-limits the "datagram arrived but couldn't be relayed" diagnostics below to at most one
+     *  line every 5s per reason - a mis-set voice_host / proxyProtocol has every client retrying
+     *  ~1/s, which would otherwise flood the log. Just enough to confirm from the MCGate side
+     *  whether voice datagrams are even reaching it, and why they're being dropped. */
+    @Volatile private var lastDropLogAt = 0L
+    private fun logDrop(reason: String, from: Any) {
+        val now = System.currentTimeMillis()
+        if (now - lastDropLogAt < 5_000L) return
+        lastDropLogAt = now
+        log.warn("Voicechat datagram from {} dropped: {}", from, reason)
+    }
     private val reaper = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "voice-relay-reaper").apply { isDaemon = true }
     }
@@ -102,6 +141,7 @@ class VoiceRelay(private val group: EventLoopGroup) {
         reaper.shutdownNow()
         sessions.values.forEach { closeSession(it) }
         sessions.clear()
+        byVia.clear()
         publicChannel?.close()
     }
 
@@ -117,27 +157,79 @@ class VoiceRelay(private val group: EventLoopGroup) {
     }
 
     private fun handleClientPacket(packet: DatagramPacket) {
-        val sender = packet.sender()
-        val content = packet.content().retain()
+        val via = packet.sender()
+        val buf = packet.content()
 
-        val existing = sessions[sender]
+        // The client address this datagram belongs to: its own source normally; under
+        // proxyProtocol, the address in the PROXY header the fronting proxy prepends. Cloudflare
+        // Spectrum (and others) only send that header on the *first* datagram of a flow, so a
+        // parse failure isn't necessarily an error - a header-less datagram is matched back to an
+        // already-open session by its source ([byVia]) instead.
+        val clientAddr: InetSocketAddress = if (expectProxyProtocol) {
+            val parsed = try {
+                parseProxyProtocolHeader(buf)
+            } catch (e: Exception) {
+                val known = byVia[via]
+                if (known != null && !known.dead) {
+                    known.lastActive = System.currentTimeMillis()
+                    forward(known, buf.retain())
+                } else {
+                    logDrop("header-less datagram from an unknown flow (proxyProtocol is on; the fronting proxy sends the PROXY header only on a flow's first datagram - was it lost, or is the proxy not sending one at all?)", via)
+                }
+                return
+            }
+            // A PROXY LOCAL command / UNSPEC family - a health check, nothing to route.
+            parsed ?: return
+        } else {
+            via
+        }
+
+        val content = buf.retain()
+
+        val existing = sessions[clientAddr]
         if (existing != null) {
             existing.lastActive = System.currentTimeMillis()
+            repointVia(existing, via)
             forward(existing, content)
             return
         }
 
-        val backendAddr = VoiceRouting.resolve(sender.address.hostAddress)
-        if (backendAddr == null || sessions.size >= MAX_SESSIONS) {
+        val backendAddr = VoiceRouting.resolve(clientAddr.address.hostAddress)
+        if (backendAddr == null) {
             content.release()
+            logDrop(
+                if (expectProxyProtocol)
+                    "no voicechat route for client ${clientAddr.address.hostAddress} (from PROXY header) - is that the player's real IP, and did they log in through a voicechat: route?"
+                else
+                    "no voicechat route for ${clientAddr.address.hostAddress} - did this client log in through a voicechat: route? (if MCGate is behind an L4 proxy, enable proxyProtocol)",
+                via
+            )
+            return
+        }
+        if (sessions.size >= MAX_SESSIONS) {
+            content.release()
+            logDrop("relay is at its session cap ($MAX_SESSIONS)", via)
             return
         }
 
-        log.info("Opening voicechat relay session: {} -> {}", sender, backendAddr)
-        val session = Session(System.currentTimeMillis())
-        sessions[sender] = session
+        log.info("Opening voicechat relay session: {} (via {}) -> {}", clientAddr, via, backendAddr)
+        val session = Session(System.currentTimeMillis(), via)
+        sessions[clientAddr] = session
+        if (expectProxyProtocol) byVia[via] = session
         forward(session, content)
-        openBackendChannel(sender, backendAddr, session)
+        openBackendChannel(clientAddr, backendAddr, session)
+    }
+
+    /** Points [byVia] at [session] under [newVia], clearing its previous entry - for when a later
+     *  headered datagram for the same client arrives from a different fronting-proxy source. */
+    private fun repointVia(session: Session, newVia: InetSocketAddress) {
+        if (!expectProxyProtocol || session.via == newVia) {
+            session.via = newVia
+            return
+        }
+        byVia.remove(session.via, session)
+        session.via = newVia
+        byVia[newVia] = session
     }
 
     /** Writes to [Session.backendChannel] if it's already connected, otherwise queues on
@@ -177,7 +269,9 @@ class VoiceRelay(private val group: EventLoopGroup) {
                         session.repliedOnce = true
                         log.info("Voicechat backend {} replied for the first time to {}", backendAddr, clientAddr)
                     }
-                    public.writeAndFlush(DatagramPacket(packet.content().retain(), clientAddr))
+                    // Reply to the datagram's actual sender (the fronting L4 proxy when
+                    // proxyProtocol is on, otherwise the client itself) - see [Session.via].
+                    public.writeAndFlush(DatagramPacket(packet.content().retain(), session.via))
                 }
 
                 override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
@@ -202,14 +296,20 @@ class VoiceRelay(private val group: EventLoopGroup) {
             if (!future.isSuccess) {
                 log.warn("Failed to open voicechat relay session for {} -> {}: {}", clientAddr, backendAddr, future.cause()?.toString())
                 sessions.remove(clientAddr, session)
-                synchronized(session) {
-                    session.dead = true
-                    session.pending.forEach { it.release() }
-                    session.pending.clear()
-                }
+                closeSession(session)
                 return@ChannelFutureListener
             }
             synchronized(session) {
+                if (session.dead) {
+                    // The session was torn down (player logged out / idle-evicted / relay stopped)
+                    // while this connect was still in flight. Nothing will ever close this channel
+                    // through [Session.backendChannel] now, so close it here - otherwise its socket
+                    // and Netty's per-channel direct-buffer arena leak for the life of the process.
+                    future.channel().close()
+                    session.pending.forEach { it.release() }
+                    session.pending.clear()
+                    return@ChannelFutureListener
+                }
                 session.backendChannel = future.channel()
                 while (session.pending.isNotEmpty()) {
                     future.channel().writeAndFlush(session.pending.removeFirst())
@@ -219,6 +319,7 @@ class VoiceRelay(private val group: EventLoopGroup) {
     }
 
     private fun closeSession(session: Session) {
+        byVia.remove(session.via, session)
         synchronized(session) {
             session.dead = true
             session.backendChannel?.close()

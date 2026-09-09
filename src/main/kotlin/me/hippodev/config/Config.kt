@@ -226,7 +226,8 @@ data class GateConfig(
      *  MCGate *receiving* one from whatever's in front of it. Off by default: a plain client
      *  connecting straight to MCGate does not send this header, so turning it on when nothing
      *  upstream actually sends one just makes every real connection look like garbage and get
-     *  dropped. */
+     *  dropped. Also honored by [me.hippodev.voice.VoiceRelay] - the inbound voice UDP path then
+     *  expects a PROXY header on every datagram and routes by the real client address it carries. */
     val proxyProtocol: Boolean = false,
     /** Anti-abuse: how long a connection has to complete its handshake *and* send its Login Start
      *  packet before MCGate closes it. A connection-flood / slow-loris opens sockets (and often

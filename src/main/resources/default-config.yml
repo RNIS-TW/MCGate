@@ -98,6 +98,11 @@ config:
   # that header onward to its backend - this is MCGate *receiving* one from whatever's in front of
   # it. Whatever sits in front of MCGate must actually send this header on every connection, or
   # every real client gets dropped as a malformed handshake. Off by default.
+  #
+  # Applies to the voicechat UDP relay too: when on, MCGate expects a PROXY header prepended to
+  # every inbound voice datagram (as Cloudflare Spectrum and similar do) and routes by the real
+  # client address it carries - without this the relay only sees the fronting proxy's own IP and
+  # can't match a datagram to a logged-in player.
   proxyProtocol: false
 
   # Anti-abuse limits for the pre-login phase of a connection - the window a connection-flood /

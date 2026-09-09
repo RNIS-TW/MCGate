@@ -285,7 +285,7 @@ fun main(args: Array<String>) {
         // that UDP port for a feature nobody's using, which conflicts with e.g. a same-port entry
         // in `udpProxy:` below. Like the rest of this section, this is decided once at startup from
         // initialConfig, not re-evaluated on a hot config reload.
-        val voiceRelay = VoiceRelay(workerGroup)
+        val voiceRelay = VoiceRelay(workerGroup, initialConfig.proxyProtocol)
         val hasVoicechatRoutes = initialConfig.routes.any { it.voicechatTemplates.isNotEmpty() }
         if (hasVoicechatRoutes) {
             voiceRelay.start(initialConfig.bindAddress)
@@ -712,7 +712,7 @@ private fun dispatch(
             }
         }
         else -> {
-            registerVoicechatRoute(ctx, resolvedRoute, captures, host)
+            registerVoicechatRoute(ctx, resolvedRoute, captures, host, state.config.logConnections)
             val relay = LoginRelayHandler(resolvedRoute, runtime, captures, protocolVersion, host, port, rawFrame)
             ctx.pipeline().addAfter(handlerName, "relay", relay)
             relay.start(ctx)
@@ -725,12 +725,15 @@ private fun dispatch(
  *  voice traffic once it starts arriving. UDP carries no hostname to route by, so this is the
  *  only point where that association can be made - resolution/param-substitution failures here
  *  must only skip voice routing for this connection, never break the player's actual TCP login. */
-private fun registerVoicechatRoute(ctx: ChannelHandlerContext, route: Route, captures: List<String>, host: String) {
+private fun registerVoicechatRoute(ctx: ChannelHandlerContext, route: Route, captures: List<String>, host: String, logConnections: Boolean) {
     if (route.voicechatTemplates.isEmpty()) return
     try {
         val voiceBackend = route.resolveVoicechat(captures) ?: return
         val clientAddr = ctx.channel().effectiveRemoteAddress() as? java.net.InetSocketAddress ?: return
         VoiceRouting.register(clientAddr.address.hostAddress, voiceBackend)
+        if (logConnections) {
+            log.info("Voicechat route: host='{}' from {} -> {}", host, clientAddr, voiceBackend)
+        }
     } catch (e: Exception) {
         log.warn("Failed to resolve voicechat backend for host '{}': {}", host, e.toString())
     }
