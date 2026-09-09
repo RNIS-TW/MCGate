@@ -80,7 +80,19 @@ fun readCompressedFrame(buf: ByteBuf, frameEnd: Int, compressionThreshold: Int):
     if (dataLength == 0) {
         return readVarInt(buf) to buf
     }
-    val compressed = ByteArray(frameEnd - buf.readerIndex())
+    // dataLength is the peer's claim of the *decompressed* size - it drives the ByteArray
+    // inflate() allocates below. Unbounded, one crafted frame (dataLength ~= Int.MAX) is an
+    // instant OutOfMemoryError, which with -XX:+ExitOnOutOfMemoryError takes the whole proxy
+    // down. Minecraft never frames a packet larger than MAX_PACKET_BYTES; anything past that
+    // is malformed.
+    if (dataLength < 0 || dataLength > MAX_PACKET_BYTES) {
+        throw IllegalStateException("compressed data length $dataLength out of range (max $MAX_PACKET_BYTES)")
+    }
+    val compressedLen = frameEnd - buf.readerIndex()
+    if (compressedLen < 0 || compressedLen > MAX_PACKET_BYTES) {
+        throw IllegalStateException("compressed payload length $compressedLen out of range")
+    }
+    val compressed = ByteArray(compressedLen)
     buf.getBytes(buf.readerIndex(), compressed)
     val inflated = Unpooled.wrappedBuffer(inflate(compressed, dataLength))
     return readVarInt(inflated) to inflated
@@ -92,7 +104,11 @@ fun inflate(src: ByteArray, expectedSize: Int): ByteArray {
     val out = ByteArray(expectedSize)
     var written = 0
     while (written < expectedSize && !inflater.finished()) {
-        written += inflater.inflate(out, written, expectedSize - written)
+        val n = inflater.inflate(out, written, expectedSize - written)
+        // inflate() returns 0 when it needs more input that will never come (a truncated or
+        // lying frame) - without this the loop spins forever, pinning an event-loop thread.
+        if (n == 0) break
+        written += n
     }
     inflater.end()
     return out

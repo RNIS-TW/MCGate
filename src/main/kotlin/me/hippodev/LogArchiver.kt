@@ -7,8 +7,11 @@ import java.util.zip.GZIPOutputStream
 
 /** How many gzipped past-run logs to keep in log/ - archives beyond this many (oldest first) are
  *  deleted on startup so a long-lived install (restarted daily/weekly for months) doesn't
- *  accumulate an ever-growing pile of .log.gz files on disk indefinitely. */
-private const val MAX_ARCHIVED_LOGS = 30
+ *  accumulate an ever-growing pile of .log.gz files on disk indefinitely. Only counts the
+ *  per-run `<timestamp>.log.gz` files this class creates - the `latest.N.log.gz` within-run rolls
+ *  are owned and pruned by logback's own FixedWindowRollingPolicy (see logback.xml), and having
+ *  both prune by mtime across the same directory just made them fight. */
+private const val MAX_ARCHIVED_LOGS = 7
 
 /** Archives the previous run's log/latest.log (if any) as a timestamped .log.gz before logback
  *  opens a fresh log/latest.log for this run, then prunes old archives beyond [MAX_ARCHIVED_LOGS].
@@ -37,7 +40,10 @@ fun archivePreviousLog(logDir: File = File("log")) {
 }
 
 private fun pruneOldArchives(logDir: File) {
-    val archives = logDir.listFiles { f -> f.isFile && f.name.endsWith(".log.gz") } ?: return
+    val archives = logDir.listFiles { f ->
+        // Only the per-run archives this class writes - never logback's own latest.N.log.gz rolls.
+        f.isFile && f.name.endsWith(".log.gz") && !f.name.startsWith("latest.")
+    } ?: return
     archives.sortedByDescending { it.lastModified() }
         .drop(MAX_ARCHIVED_LOGS)
         .forEach { it.delete() }

@@ -6,6 +6,32 @@ import java.net.InetSocketAddress
 
 class IncompleteVarIntException : Exception()
 
+/**
+ * Minecraft's hard ceiling on a single (uncompressed) packet: 2^21 - 1 bytes. The vanilla client
+ * and server both reject anything larger. Every [io.netty.handler.codec.ByteToMessageDecoder] in
+ * MCGate uses this to bound the frame length it's willing to buffer: without it, a peer that
+ * declares a huge frame length and then dribbles bytes makes the decoder's cumulation buffer grow
+ * toward that size, one held connection at a time - a cheap memory-amplification DDoS. A declared
+ * length past this is malformed on its face; close the connection rather than buffer for it.
+ */
+const val MAX_PACKET_BYTES = (1 shl 21) - 1
+
+/** Reads a frame-length varint and range-checks it. Returns null (leaving [buf]'s reader index
+ *  reset to [frameStart]) if the varint isn't fully buffered yet; throws [IllegalStateException]
+ *  for a negative or over-[MAX_PACKET_BYTES] length. */
+fun readFrameLength(buf: ByteBuf, frameStart: Int): Int? {
+    val length = try {
+        readVarInt(buf)
+    } catch (e: IncompleteVarIntException) {
+        buf.readerIndex(frameStart)
+        return null
+    }
+    if (length < 0 || length > MAX_PACKET_BYTES) {
+        throw IllegalStateException("frame length $length out of range (max $MAX_PACKET_BYTES)")
+    }
+    return length
+}
+
 /** Login state, clientbound - stable since the encryption handshake was introduced. Signals the
  *  backend is online-mode; everything after the client's Encryption Response is AES-CFB8
  *  ciphertext that a plain packet parser (like the ones in LoginRelayHandler/ReconnectHandler) can no

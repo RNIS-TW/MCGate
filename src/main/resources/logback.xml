@@ -30,7 +30,7 @@
         <rollingPolicy class="ch.qos.logback.core.rolling.FixedWindowRollingPolicy">
             <fileNamePattern>log/latest.%i.log.gz</fileNamePattern>
             <minIndex>1</minIndex>
-            <maxIndex>30</maxIndex>
+            <maxIndex>7</maxIndex>
         </rollingPolicy>
         <triggeringPolicy class="me.hippodev.LineCountTriggeringPolicy" />
         <encoder>

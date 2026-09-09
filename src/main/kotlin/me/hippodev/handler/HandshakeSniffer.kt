@@ -17,6 +17,11 @@ import org.slf4j.LoggerFactory
  * buffered past the handshake frame are automatically re-delivered by Netty
  * to whichever handler [onHandshake] installs next.
  */
+/** Upper bound on a handshake frame's declared body length - see [HandshakeSniffer.decode]. A
+ *  legitimate handshake is ~30-280 bytes (the host field alone is capped at 255); 512 leaves a
+ *  wide margin while still cutting off the slow-loris amplification vector. */
+private const val MAX_HANDSHAKE_FRAME_BYTES = 512
+
 class HandshakeSniffer(
     private val onHandshake: (
         ctx: ChannelHandlerContext,
@@ -40,7 +45,13 @@ class HandshakeSniffer(
             return
         }
 
-        if (length < 0 || length > 1 shl 21) {
+        // A real handshake frame is tiny - packet id, protocol varint, host (the sniffer itself
+        // caps that at 255), port, next state: well under 300 bytes. A larger declared length is
+        // either garbage or a slow-loris declaring a huge frame and dribbling bytes so this
+        // decoder's cumulation buffer grows toward that size, one held connection at a time - a
+        // cheap memory-amplification DDoS. Reject anything that can't be a handshake outright,
+        // rather than the old 2 MiB ceiling.
+        if (length < 0 || length > MAX_HANDSHAKE_FRAME_BYTES) {
             log.debug("Rejecting connection with bogus handshake length {}", length)
             ctx.close()
             return

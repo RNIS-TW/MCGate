@@ -11,9 +11,9 @@ import io.netty.channel.EventLoopGroup
 import io.netty.channel.socket.SocketChannel
 import io.netty.channel.socket.nio.NioSocketChannel
 import io.netty.handler.codec.ByteToMessageDecoder
-import me.hippodev.protocol.IncompleteVarIntException
 import me.hippodev.protocol.encodeHandshake
 import me.hippodev.protocol.encodeProxyProtocolHeader
+import me.hippodev.protocol.readFrameLength
 import me.hippodev.protocol.readString
 import me.hippodev.protocol.readVarInt
 import me.hippodev.protocol.writeVarInt
@@ -54,10 +54,11 @@ fun pingBackendLive(
                     override fun decode(ctx: ChannelHandlerContext, buf: ByteBuf, out: MutableList<Any>) {
                         val frameStart = buf.readerIndex()
                         val length = try {
-                            readVarInt(buf)
-                        } catch (e: IncompleteVarIntException) {
-                            buf.readerIndex(frameStart); return
-                        }
+                            readFrameLength(buf, frameStart)
+                        } catch (e: IllegalStateException) {
+                            future.completeExceptionally(e)
+                            ctx.close(); return
+                        } ?: return
                         if (buf.readableBytes() < length) {
                             buf.readerIndex(frameStart); return
                         }

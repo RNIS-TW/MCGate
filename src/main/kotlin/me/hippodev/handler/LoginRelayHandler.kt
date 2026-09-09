@@ -30,7 +30,11 @@ import java.net.InetSocketAddress
 class LoginRelayHandler(
     private val route: Route,
     private val runtime: RouteRuntime,
-    private val backends: List<InetSocketAddress>,
+    /** Wildcard host captures for this connection - the backend list is resolved from these
+     *  lazily (see [beginConnect]), only once the client has actually sent its Login Start, so a
+     *  connection flood to random subdomains on a wildcard route can't trigger a blocking DNS
+     *  lookup (and a [me.hippodev.config.DnsCache] entry) per bot on the event loop. */
+    private val captures: List<String>,
     private val protocolVersion: Int,
     private val host: String,
     private val port: Int,
@@ -38,6 +42,8 @@ class LoginRelayHandler(
 ) : ChannelInboundHandlerAdapter() {
 
     private val log = LoggerFactory.getLogger(LoginRelayHandler::class.java)
+    /** Backends resolved from [captures] on the first (deferred) dial - see [beginConnect]. */
+    private var resolvedBackends: List<InetSocketAddress> = emptyList()
     private var backendChannel: Channel? = null
     private var backendAddr: InetSocketAddress? = null
     private val pending = ArrayDeque<ByteBuf>()
@@ -48,6 +54,17 @@ class LoginRelayHandler(
     private var loginSniffed = false
     private var loginLogged = false
     private var awaitedLoginStart = false
+    /** True once [start] has run - the handler is live and owns the connection. Guards the
+     *  deferred backend dial (see [channelRead]) so unit tests that drive [channelRead] directly
+     *  without calling [start] still just buffer, as before. */
+    private var started = false
+    /** True once the first client packet (its Login Start) has arrived and the backend dial has
+     *  been kicked off. MCGate deliberately does *not* dial a backend until this point: a
+     *  connection-flood / slow-loris that completes the handshake but never sends Login Start
+     *  would otherwise make MCGate open (and hold) a backend socket per bot - which the backend
+     *  logs as "[initial connection] ... read timed out". See [ConnectionGuardHandler] for the
+     *  deadline that closes such a connection if Login Start never comes. */
+    private var dialStarted = false
     /** Compression threshold the *backend* negotiated with the client during login (-1 = none),
      *  captured by [BackendLoginSniffer] since MCGate's relay is otherwise byte-blind. Needed so
      *  [ReconnectHandler] can frame the packets it synthesizes to match what the client's decoder
@@ -89,15 +106,17 @@ class LoginRelayHandler(
     /** Must be called explicitly right after this handler is added to the pipeline -
      *  channelActive() will not fire since the channel is already active by then. */
     fun start(ctx: ChannelHandlerContext) {
-        ctx.channel().config().isAutoRead = false
         clientRemoteAddress = ctx.channel().effectiveRemoteAddress().toString()
         frontendChannel = ctx.channel()
         sessionStartedAt = System.currentTimeMillis()
-        connect(ctx, orderBackends(route, runtime, backends), 0)
+        started = true
+        // Keep reading so the client's Login Start packet is delivered to channelRead below; the
+        // backend dial is deferred until it arrives. ConnectionGuardHandler's deadline closes the
+        // connection if it never does.
+        ctx.channel().config().isAutoRead = true
     }
 
     override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
-        val backend = backendChannel
         val buf = msg as ByteBuf
         if (!loginSniffed) {
             loginSniffed = true
@@ -107,6 +126,17 @@ class LoginRelayHandler(
             }
             logLoginIfReady()
         }
+        if (started && !dialStarted) {
+            dialStarted = true
+            // The client has sent Login Start - it's a real login attempt, so committing a backend
+            // connection is now warranted. Tell ConnectionGuardHandler to stop its deadline / free
+            // this connection's per-IP slot, and stop reading until the backend is up so `pending`
+            // stays bounded while dialing.
+            ctx.pipeline().fireUserEventTriggered(ConnectionGuardHandler.PRELOGIN_DONE)
+            ctx.channel().config().isAutoRead = false
+            beginConnect(ctx)
+        }
+        val backend = backendChannel
         packetsToBackend.incrementAndGet()
         bytesToBackend.addAndGet(buf.readableBytes().toLong())
         if (backend != null && backend.isActive) {
@@ -116,6 +146,54 @@ class LoginRelayHandler(
             buf.release()
         } else {
             pending.addLast(buf)
+        }
+    }
+
+    /** Resolves [captures] to a concrete backend list (the deferred DNS work - see [captures]) and
+     *  kicks off the dial. A resolution failure kicks the client, same as an all-backends-down
+     *  outcome. */
+    private fun beginConnect(ctx: ChannelHandlerContext) {
+        // Common case - all backends are IP literals or already cached - resolve inline.
+        if (!route.backendsNeedBlockingResolution(captures)) {
+            val resolved = try {
+                route.resolveBackends(captures)
+            } catch (e: Exception) {
+                failBackendResolution(ctx, e.toString()); return
+            }
+            resolvedBackends = resolved
+            connect(ctx, orderBackends(route, runtime, resolvedBackends), 0)
+            return
+        }
+        // An uncached hostname backend (typically a wildcard route's $N-templated host on its
+        // first hit): do the blocking lookup on the DNS pool, not this event-loop thread, then
+        // re-enter to dial. `pending` stays bounded meanwhile - autoRead was set false by the
+        // caller before beginConnect.
+        val eventLoop = ctx.channel().eventLoop()
+        val submitted = DnsCache.runOffEventLoop {
+            val resolved = try {
+                route.resolveBackends(captures)
+            } catch (e: Exception) {
+                eventLoop.execute { failBackendResolution(ctx, e.toString()) }
+                return@runOffEventLoop
+            }
+            eventLoop.execute {
+                if (pendingReleased || !ctx.channel().isActive || ctx.isRemoved) {
+                    releasePendingBuffers()
+                    return@execute
+                }
+                resolvedBackends = resolved
+                connect(ctx, orderBackends(route, runtime, resolvedBackends), 0)
+            }
+        }
+        if (!submitted) failBackendResolution(ctx, "DNS resolver pool saturated")
+    }
+
+    private fun failBackendResolution(ctx: ChannelHandlerContext, reason: String) {
+        log.warn("Failed to resolve backends for host '{}' from {}: {}", host, clientRemoteAddress, reason)
+        releasePendingBuffers()
+        if (ctx.channel().isActive) {
+            ctx.writeAndFlush(encodeLoginDisconnect(toJsonComponent(route.kickMessage)))
+                .addListener(ChannelFutureListener.CLOSE)
         }
     }
 
@@ -145,7 +223,7 @@ class LoginRelayHandler(
                         backendDialAttempts, packetsToBackend, packetsToClient, bytesToBackend, bytesToClient
                     )
                 )
-                val reconnectHandler = ReconnectHandler(route, runtime, backends, protocolVersion, host, port, name, uuid)
+                val reconnectHandler = ReconnectHandler(route, runtime, resolvedBackends, protocolVersion, host, port, name, uuid)
                 ctx.pipeline().replace(this, "reconnect", reconnectHandler)
                 reconnectHandler.enter(ctx.pipeline().context(reconnectHandler))
             } else {
@@ -295,7 +373,7 @@ class LoginRelayHandler(
                 )
             )
             val reconnectHandler = ReconnectHandler(
-                route, runtime, backends, protocolVersion, host, port, name, uuid, compressionThreshold
+                route, runtime, resolvedBackends, protocolVersion, host, port, name, uuid, compressionThreshold
             )
             clientChannel.pipeline().replace("relay", "reconnect", reconnectHandler)
             reconnectHandler.enterFromPlay(clientChannel.pipeline().context(reconnectHandler))
@@ -325,10 +403,11 @@ class LoginRelayHandler(
         override fun decode(ctx: ChannelHandlerContext, buf: ByteBuf, out: MutableList<Any>) {
             val frameStart = buf.readerIndex()
             val length = try {
-                readVarInt(buf)
-            } catch (e: IncompleteVarIntException) {
-                buf.readerIndex(frameStart); return
-            }
+                readFrameLength(buf, frameStart)
+            } catch (e: IllegalStateException) {
+                log.debug("Backend sent an over-long frame, dropping connection: {}", e.message)
+                ctx.close(); return
+            } ?: return
             val payloadStart = buf.readerIndex()
             if (buf.readableBytes() < length) {
                 buf.readerIndex(frameStart); return

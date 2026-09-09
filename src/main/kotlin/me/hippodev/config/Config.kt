@@ -48,7 +48,9 @@ data class ReconnectConfig(
     val retryIntervalMillis: Long = 5000,
     val maxRetryIntervalMillis: Long = 30000,
     val backoffMultiplier: Double = 2.0,
-    val maxWaitMillis: Long = 0, // 0 = unlimited
+    /** How long a player is held waiting for a backend before being kicked. 0 = unlimited
+     *  (not recommended - a genuinely dead backend then holds bots/players forever). */
+    val maxWaitMillis: Long = 600_000, // 10m
     val title: String = "&eServer is currently offline.",
     val subtitle: String = "&7Waiting to reconnect...",
     val attemptSuffix: String = " (attempt {attempt})",
@@ -91,6 +93,12 @@ data class Route(
     fun resolveBackends(captures: List<String>): List<InetSocketAddress> =
         backendTemplates.map { resolveBackendAddress(substituteParams(it, captures)) }
 
+    /** True if resolving this route's backends for [captures] would perform at least one blocking
+     *  DNS lookup (an uncached hostname). Callers on a Netty event loop use this to decide whether
+     *  to resolve inline or off-thread - see `dispatch()` in Main.kt and LoginRelayHandler. */
+    fun backendsNeedBlockingResolution(captures: List<String>): Boolean =
+        backendTemplates.any { needsBlockingResolution(substituteParams(it, captures)) }
+
     /** Same resolution (param substitution + [DnsCache]) as [resolveBackends], for the optional
      *  `voicechat:` backend. Null when this route has none configured. */
     fun resolveVoicechat(captures: List<String>): InetSocketAddress? =
@@ -110,10 +118,33 @@ data class UdpProxyConfig(val bind: String, val backend: String) {
 
 data class ApiConfig(
     val enabled: Boolean = false,
-    val bind: String = "localhost:8080"
+    val bind: String = "localhost:8080",
+    /** When set, every request must carry `Authorization: Bearer <token>` or it's answered
+     *  with 401. Null (default) leaves the API open - only safe on a trusted bind address. */
+    val token: String? = null,
+    /** Max players returned by `GET /v1/players` in one response; callers page with
+     *  `?limit=&offset=`. Bounds the response size (and the string built on the event loop)
+     *  at very high player counts. */
+    val playersPageLimit: Int = 500
 ) {
     val bindAddress: InetSocketAddress by lazy { parseHostPort(bind, defaultPort = 8080) }
 }
+
+/**
+ * Process-wide flood ceilings, layered on top of the per-IP pre-login cap
+ * ([GateConfig.maxConnectionsPerIp]): a hard cap on total concurrent connections and a per-IP
+ * new-connection rate limit. Both are disabled when [GateConfig.proxyProtocol] is on (every
+ * connection then appears to come from the upstream load balancer). Read fresh on every
+ * connection, so changes take effect on a hot reload.
+ */
+data class ConnectionThrottleConfig(
+    /** Max concurrent client connections process-wide. 0 = unlimited. Over this, new TCP
+     *  connections are accepted and immediately closed. */
+    val maxConnections: Int = 0,
+    /** Max new connections from one source IP within [windowMillis]. 0 = unlimited. */
+    val maxPerIpPerWindow: Int = 8,
+    val windowMillis: Long = 8_000
+)
 
 /**
  * Optional persistence of per-session player connection details (IP, UUID, login attempts,
@@ -196,7 +227,27 @@ data class GateConfig(
      *  connecting straight to MCGate does not send this header, so turning it on when nothing
      *  upstream actually sends one just makes every real connection look like garbage and get
      *  dropped. */
-    val proxyProtocol: Boolean = false
+    val proxyProtocol: Boolean = false,
+    /** Anti-abuse: how long a connection has to complete its handshake *and* send its Login Start
+     *  packet before MCGate closes it. A connection-flood / slow-loris opens sockets (and often
+     *  completes the handshake) but never sends login - each one otherwise pins a channel + an fd
+     *  for as long as it likes. `0` disables the timeout. See [me.hippodev.handler.ConnectionGuardHandler]. */
+    val loginTimeoutMillis: Long = 10_000,
+    /** Anti-abuse: max simultaneous *pre-login* connections from one source IP. A connection stops
+     *  counting the moment it completes login (or is held for reconnect), so a real player opening
+     *  a few connections is unaffected while a single-source socket flood is capped. `0` = unlimited.
+     *  Ignored when [proxyProtocol] is on (every connection would look like it came from the
+     *  upstream load balancer). See [me.hippodev.handler.ConnectionGuardHandler]. */
+    val maxConnectionsPerIp: Int = 8,
+    /** Process-wide flood ceilings - see [ConnectionThrottleConfig]. */
+    val connectionThrottle: ConnectionThrottleConfig = ConnectionThrottleConfig(),
+    /** Listen socket backlog (SO_BACKLOG). Startup-only, like [bind]. */
+    val soBacklog: Int = 128,
+    /** Process-wide cap on players held in the reconnect-wait state at once (see
+     *  [me.hippodev.handler.ReconnectHandler]). Each held player costs a live connection plus
+     *  keep-alive/animation/retry timers; past this cap a would-be-held player is kicked with the
+     *  route's `kickMessage` instead. 0 = unlimited. */
+    val maxHeldReconnectSessions: Int = 500
 ) {
     val bindAddress: InetSocketAddress by lazy { parseHostPort(bind) }
 
@@ -227,11 +278,30 @@ data class GateConfig(
             val workerThreads = configSection["workerThreads"] as? Int ?: 0
             val logConnections = configSection["logConnections"] as? Boolean ?: false
             val proxyProtocol = configSection["proxyProtocol"] as? Boolean ?: false
+            val defaults = GateConfig()
+            val loginTimeoutMillis = (configSection["loginTimeout"] as? String)?.let { parseDuration(it) } ?: defaults.loginTimeoutMillis
+            val maxConnectionsPerIp = configSection["maxConnectionsPerIp"] as? Int ?: defaults.maxConnectionsPerIp
+            val connectionThrottle = parseConnectionThrottle(configSection["connectionThrottle"] as? Map<String, Any>)
+            val soBacklog = configSection["soBacklog"] as? Int ?: defaults.soBacklog
+            val maxHeldReconnectSessions = configSection["maxHeldReconnectSessions"] as? Int ?: defaults.maxHeldReconnectSessions
 
             return GateConfig(
                 bind = bind, routes = routes, udpProxies = udpProxies, api = api, connectionTracking = connectionTracking,
                 statsLogging = statsLogging,
-                workerThreads = workerThreads, logConnections = logConnections, proxyProtocol = proxyProtocol
+                workerThreads = workerThreads, logConnections = logConnections, proxyProtocol = proxyProtocol,
+                loginTimeoutMillis = loginTimeoutMillis, maxConnectionsPerIp = maxConnectionsPerIp,
+                connectionThrottle = connectionThrottle, soBacklog = soBacklog,
+                maxHeldReconnectSessions = maxHeldReconnectSessions
+            )
+        }
+
+        private fun parseConnectionThrottle(c: Map<String, Any>?): ConnectionThrottleConfig {
+            val d = ConnectionThrottleConfig()
+            if (c == null) return d
+            return ConnectionThrottleConfig(
+                maxConnections = c["maxConnections"] as? Int ?: d.maxConnections,
+                maxPerIpPerWindow = c["maxPerIpPerWindow"] as? Int ?: d.maxPerIpPerWindow,
+                windowMillis = (c["window"] as? String)?.let { parseDuration(it) } ?: d.windowMillis
             )
         }
 
@@ -245,10 +315,13 @@ data class GateConfig(
         }
 
         private fun parseApi(a: Map<String, Any>?): ApiConfig {
-            if (a == null) return ApiConfig()
+            val d = ApiConfig()
+            if (a == null) return d
             return ApiConfig(
-                enabled = a["enabled"] as? Boolean ?: false,
-                bind = a["bind"] as? String ?: "localhost:8080"
+                enabled = a["enabled"] as? Boolean ?: d.enabled,
+                bind = a["bind"] as? String ?: d.bind,
+                token = (a["token"] as? String)?.takeIf { it.isNotBlank() } ?: d.token,
+                playersPageLimit = a["playersPageLimit"] as? Int ?: d.playersPageLimit
             )
         }
 
@@ -459,6 +532,14 @@ fun resolveBackendAddress(value: String, defaultPort: Int = 25565): InetSocketAd
     } else {
         DnsCache.resolve(value, defaultPort)
     }
+}
+
+/** Whether [resolveBackendAddress] for this `host:port` string would block on a DNS lookup. */
+fun needsBlockingResolution(value: String, defaultPort: Int = 25565): Boolean {
+    val idx = value.lastIndexOf(':')
+    val host = if (idx >= 0) value.substring(0, idx) else value
+    val port = if (idx >= 0) value.substring(idx + 1).toIntOrNull() ?: defaultPort else defaultPort
+    return !DnsCache.willResolveWithoutBlocking(host, port)
 }
 
 private val durationPattern = Pattern.compile("(-?\\d+)(ms|s|m|h)")

@@ -21,6 +21,19 @@ import java.util.concurrent.TimeUnit
  *  there's no close/FIN to signal "this session is really over". */
 private const val SESSION_IDLE_MILLIS = 5 * 60_000L
 
+/** Hard cap on datagrams buffered per session while its backend-facing socket is still being
+ *  opened (a sub-millisecond window). A client flooding packets in that window - or one whose
+ *  backend connect hangs - must not be able to pin unbounded direct memory in [Session.pending];
+ *  past this, the oldest queued datagram is dropped (and released) to make room. Voice/UDP traffic
+ *  is lossy by nature, so dropping a few packets here is harmless. */
+private const val MAX_PENDING_PACKETS = 256
+
+/** Process-wide cap on concurrent voice relay sessions. New sessions only open for a client with
+ *  a live [VoiceRouting] entry (i.e. a logged-in player), so this is normally bounded by the
+ *  player count anyway - it's a backstop against a spoofed-source flood arriving in the window
+ *  before a routing entry is idle-evicted. */
+private const val MAX_SESSIONS = 8192
+
 /**
  * Relays UDP traffic (Simple Voice Chat and similar mods) on the same port MCGate's Minecraft TCP
  * listener binds - no extra port to open. UDP carries no hostname the way the Minecraft handshake
@@ -44,6 +57,10 @@ class VoiceRelay(private val group: EventLoopGroup) {
     private class Session(@Volatile var lastActive: Long) {
         var backendChannel: Channel? = null
         val pending = ArrayDeque<ByteBuf>()
+        /** Set once this session is torn down (idle-evicted, client logged out, or its backend
+         *  connect failed). A datagram that raced in on the public event loop after the teardown
+         *  began must be released, not re-queued into a [pending] nothing will ever drain. */
+        var dead = false
         /** Set on the first reply seen from the backend - lets [openBackendChannel] log once
          *  whether the backend ever actually answers at all, distinct from repeated per-packet
          *  logging. */
@@ -111,7 +128,7 @@ class VoiceRelay(private val group: EventLoopGroup) {
         }
 
         val backendAddr = VoiceRouting.resolve(sender.address.hostAddress)
-        if (backendAddr == null) {
+        if (backendAddr == null || sessions.size >= MAX_SESSIONS) {
             content.release()
             return
         }
@@ -127,8 +144,19 @@ class VoiceRelay(private val group: EventLoopGroup) {
      *  [Session.pending] for [openBackendChannel]'s connect listener to flush once it lands. */
     private fun forward(session: Session, content: ByteBuf) {
         synchronized(session) {
+            if (session.dead) {
+                content.release()
+                return
+            }
             val channel = session.backendChannel
-            if (channel != null) channel.writeAndFlush(content) else session.pending.addLast(content)
+            if (channel != null) {
+                channel.writeAndFlush(content)
+                return
+            }
+            if (session.pending.size >= MAX_PENDING_PACKETS) {
+                session.pending.removeFirst().release()
+            }
+            session.pending.addLast(content)
         }
     }
 
@@ -175,6 +203,7 @@ class VoiceRelay(private val group: EventLoopGroup) {
                 log.warn("Failed to open voicechat relay session for {} -> {}: {}", clientAddr, backendAddr, future.cause()?.toString())
                 sessions.remove(clientAddr, session)
                 synchronized(session) {
+                    session.dead = true
                     session.pending.forEach { it.release() }
                     session.pending.clear()
                 }
@@ -191,6 +220,7 @@ class VoiceRelay(private val group: EventLoopGroup) {
 
     private fun closeSession(session: Session) {
         synchronized(session) {
+            session.dead = true
             session.backendChannel?.close()
             session.pending.forEach { it.release() }
             session.pending.clear()

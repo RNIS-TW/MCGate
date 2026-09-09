@@ -25,6 +25,12 @@ config:
   api:
     enabled: false
     bind: 0.0.0.0:8080
+    # When set, every request must send `Authorization: Bearer <token>` or it gets a 401. Leave
+    # unset only if the bind address is genuinely trusted (localhost, a private management VLAN).
+    # token: "change-me"
+    # Max players returned by GET /v1/players in one response; page with ?limit=&offset=. Also
+    # caps the player list embedded in GET /metrics?type=json.
+    playersPageLimit: 500
 
   # Standalone static UDP forwards - each entry relays every datagram received on `bind` to
   # `backend`, keyed by source ip:port. Independent of a route's `voicechat:` backend: there's no
@@ -93,6 +99,43 @@ config:
   # it. Whatever sits in front of MCGate must actually send this header on every connection, or
   # every real client gets dropped as a malformed handshake. Off by default.
   proxyProtocol: false
+
+  # Anti-abuse limits for the pre-login phase of a connection - the window a connection-flood /
+  # slow-loris DDoS lives in. Only take effect on (re)start.
+  #
+  # How long a connection has to complete its handshake AND send its Login Start packet before
+  # MCGate closes it. A flood that opens sockets (and often completes the handshake) but never
+  # sends login otherwise pins a channel + an fd each. A real client sends Login Start within
+  # milliseconds of the handshake, so 10s is already very generous. Use 0 to disable. The backend
+  # dial is deferred until Login Start arrives, so bots that never send it never reach the backend.
+  loginTimeout: 10s
+  # Max simultaneous PRE-LOGIN connections from one source IP. A connection stops counting the
+  # moment it completes login (or is held for reconnect), so a real player opening a few
+  # connections in a row is unaffected while a single-source socket flood is capped. 0 =
+  # unlimited. Ignored when proxyProtocol is on (every connection would look like it came from the
+  # upstream load balancer).
+  maxConnectionsPerIp: 8
+
+  # Process-wide flood ceilings, layered on top of maxConnectionsPerIp. Read fresh per connection,
+  # so changes here apply on a hot reload. Both are ignored when proxyProtocol is on.
+  connectionThrottle:
+    # Hard cap on total concurrent client connections. Over this, new TCP connections are accepted
+    # and immediately closed. 0 = unlimited (recommend setting this to a few x your real peak).
+    maxConnections: 0
+    # Max NEW connections from one source IP within `window`. A real player reconnecting a handful
+    # of times is fine; a single-source connect storm is throttled. 0 = unlimited.
+    maxPerIpPerWindow: 8
+    window: 8s
+
+  # Listen socket backlog (SO_BACKLOG). Startup-only. Raise on a busy public server so bursts of
+  # legitimate connections aren't dropped by the kernel during a flood.
+  soBacklog: 128
+
+  # Process-wide cap on players held in the reconnect-wait state at once (see a route's
+  # `reconnect:` block). Each held player costs a live connection + keep-alive/animation/retry
+  # timers; past this cap a would-be-held player is kicked with the route's kickMessage instead.
+  # 0 = unlimited.
+  maxHeldReconnectSessions: 500
 
   routes:
     # Simple 1:1 host -> backend mapping.
@@ -168,8 +211,9 @@ config:
         retryInterval: 5s
         maxRetryInterval: 30s
         backoffMultiplier: 2.0
-        # How long to hold a player waiting before giving up and kicking them. 0 = unlimited.
-        maxWait: 0s
+        # How long to hold a player waiting before giving up and kicking them. Default 10m.
+        # 0 = unlimited (not recommended - a genuinely dead backend then holds players forever).
+        maxWait: 10m
         # All text below defaults to messages.yml (hot-reloadable, shared across every route) -
         # uncomment any of these to override it just for this route.
         # title: "&eServer is currently offline."

@@ -44,11 +44,21 @@ pipeline {
 
         stage('Test') {
             steps {
-                sh 'mvn -B test'
+                // pom.xml sets <skipTests>true</skipTests> so a plain `mvn package` build stays
+                // fast; CI must override it or this stage silently runs zero tests.
+                sh 'mvn -B test -DskipTests=false'
             }
             post {
                 always {
-                    junit testResults: 'target/surefire-reports/*.xml', allowEmptyResults: true
+                    script {
+                        // The junit step's return value carries the counts - reading them off
+                        // currentBuild.rawBuild instead needs an admin script-approval (RunWrapper
+                        // .getRawBuild is not sandbox-whitelisted). Stash into env for commentOnPr.
+                        def summary = junit testResults: 'target/surefire-reports/*.xml', allowEmptyResults: true
+                        env.TEST_TOTAL = "${summary?.totalCount ?: 0}"
+                        env.TEST_FAILED = "${summary?.failCount ?: 0}"
+                        env.TEST_SKIPPED = "${summary?.skipCount ?: 0}"
+                    }
                     sh 'cd target && zip -qr test-reports.zip surefire-reports || true'
                     archiveArtifacts artifacts: 'target/test-reports.zip', allowEmptyArchive: true, fingerprint: true
                 }
@@ -72,6 +82,14 @@ pipeline {
             script {
                 notifyGitHub('SUCCESS', 'Build passed')
                 commentOnPr('✅')
+            }
+        }
+        // A junit test failure marks the build UNSTABLE, not FAILURE - without this block that
+        // would trigger neither success nor failure, leaving the GitHub status stuck on PENDING.
+        unstable {
+            script {
+                notifyGitHub('FAILURE', 'Tests failed')
+                commentOnPr('⚠️')
             }
         }
         failure {
@@ -109,14 +127,13 @@ def commentOnPr(String icon) {
         echo 'Not a PR build (no CHANGE_ID) - skipping PR comment.'
         return
     }
-    def tests = junitResultSummary()
     def reportUrl = "${env.BUILD_URL}artifact/target/test-reports.zip"
     def body = """\
 ${icon} **Jenkins build [#${env.BUILD_NUMBER}](${env.BUILD_URL})** — `${env.GIT_SHA?.take(7)}`
 
 | Result | Total | Failed | Skipped |
 |---|---|---|---|
-| ${currentBuild.currentResult} | ${tests.total} | ${tests.failed} | ${tests.skipped} |
+| ${currentBuild.currentResult} | ${env.TEST_TOTAL ?: 0} | ${env.TEST_FAILED ?: 0} | ${env.TEST_SKIPPED ?: 0} |
 
 📎 [Download test report (test-reports.zip)](${reportUrl})
 """
@@ -125,12 +142,4 @@ ${icon} **Jenkins build [#${env.BUILD_NUMBER}](${env.BUILD_URL})** — `${env.GI
     } catch (NoSuchMethodError | MissingPropertyException e) {
         echo "Could not post PR comment (install the 'Pipeline: GitHub' plugin): ${e.message}"
     }
-}
-
-def junitResultSummary() {
-    def action = currentBuild.rawBuild.getAction(hudson.tasks.junit.TestResultAction.class)
-    if (action == null) {
-        return [total: 0, failed: 0, skipped: 0]
-    }
-    return [total: action.totalCount, failed: action.failCount, skipped: action.skipCount]
 }
