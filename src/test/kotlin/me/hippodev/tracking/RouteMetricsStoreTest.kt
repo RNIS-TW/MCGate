@@ -307,15 +307,21 @@ class RouteMetricsStoreTest {
     @Test
     fun `a deadline already in the past (downtime) triggers exactly one reset on the next tick`() {
         val file = tempFile()
-        // Pre-seed the file with usage and a resetAt well in the past.
+        // Pre-seed with usage and a resetAt of 1ms-past-epoch: decades overdue, so a naive
+        // "loop until future" advance would spin billions of times. The advance must be O(1).
         java.io.File(file).writeText("""{"uploadBytes":999,"downloadBytes":999,"resetAt":1}""")
-        val r = route("a.example.com", file, resetIntervalMillis = 50_000)
+        val intervalMs = 3_600_000L
+        val r = route("a.example.com", file, resetIntervalMillis = intervalMs)
         RouteMetricsStore.applyConfig(listOf(r), flushIntervalMillis = 40)
         val c = RouteMetricsStore.handle(r)!!
 
         assertTrue(waitFor { c.uploadBytes.get() == 0L }, "overdue reset should fire once on startup")
-        // Advanced to a single future boundary, not spun forward forever or left behind.
-        assertTrue(c.resetAt > System.currentTimeMillis())
+        // Advanced to exactly one on-cadence boundary in the future - not left in the past, and
+        // not spun far ahead. The boundary stays aligned to the original resetAt (1ms) cadence,
+        // so it lands within one interval of now.
+        assertTrue(c.resetAt > System.currentTimeMillis(), "deadline must move into the future")
+        assertTrue(c.resetAt <= System.currentTimeMillis() + intervalMs, "deadline must be at most one interval ahead")
+        assertEquals(1L, c.resetAt % intervalMs, "deadline stays aligned to the original cadence")
     }
 
     @Test

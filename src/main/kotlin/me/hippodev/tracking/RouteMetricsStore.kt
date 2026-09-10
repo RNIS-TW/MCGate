@@ -241,11 +241,14 @@ object RouteMetricsStore {
             if (interval <= 0 || counter.resetAt <= 0L || now < counter.resetAt) continue
             counter.uploadBytes.set(0)
             counter.downloadBytes.set(0)
-            var next = counter.resetAt
-            while (next <= now) next += interval
-            counter.resetAt = next
+            // Snap to the first on-cadence boundary strictly after now, in one arithmetic step -
+            // a `while (next <= now) next += interval` loop would spin through millions of
+            // iterations when the stored deadline is far in the past (a very old file, a long
+            // outage). `now >= resetAt` here (guard above), so missed >= 0 and the result > now.
+            val missed = (now - counter.resetAt) / interval
+            counter.resetAt += (missed + 1) * interval
             counter.dirty.set(true)
-            log.info("Route metrics counter '{}' auto-reset; next reset at {}", counter.key, next)
+            log.info("Route metrics counter '{}' auto-reset; next reset at {}", counter.key, counter.resetAt)
         }
     }
 
