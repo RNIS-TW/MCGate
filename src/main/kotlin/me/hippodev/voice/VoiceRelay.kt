@@ -97,16 +97,17 @@ class VoiceRelay(
 
     private var publicChannel: Channel? = null
 
-    /** Rate-limits the "datagram arrived but couldn't be relayed" diagnostics below to at most one
-     *  line every 5s per reason - a mis-set voice_host / proxyProtocol has every client retrying
-     *  ~1/s, which would otherwise flood the log. Just enough to confirm from the MCGate side
-     *  whether voice datagrams are even reaching it, and why they're being dropped. */
+    /** Logs the "datagram arrived but couldn't be relayed" diagnostics below at DEBUG (unmatched
+     *  inbound UDP - disconnected clients still blasting, non-voicechat routes, port scans - is
+     *  routine and noisy), rate-limited to at most one line every 5s per reason so a mis-set
+     *  voice_host / proxyProtocol retrying ~1/s can't flood even debug logs. Just enough to confirm
+     *  from the MCGate side whether voice datagrams are reaching it, and why they're being dropped. */
     @Volatile private var lastDropLogAt = 0L
     private fun logDrop(reason: String, from: Any) {
         val now = System.currentTimeMillis()
         if (now - lastDropLogAt < 5_000L) return
         lastDropLogAt = now
-        log.warn("Voicechat datagram from {} dropped: {}", from, reason)
+        log.debug("Voicechat datagram from {} dropped: {}", from, reason)
     }
     private val reaper = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "voice-relay-reaper").apply { isDaemon = true }
