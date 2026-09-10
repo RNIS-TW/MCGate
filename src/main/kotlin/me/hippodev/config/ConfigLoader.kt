@@ -6,6 +6,18 @@ import java.nio.file.FileSystems
 import java.nio.file.Path
 import java.nio.file.StandardWatchEventKinds
 import java.nio.file.WatchKey
+import java.nio.file.WatchService
+
+/** Consumes and acknowledges every watch key currently ready on [watchService] without blocking.
+ *  Used right after a debounce sleep so the burst of follow-up events a single editor save emits
+ *  doesn't make the next `take()` return straight away and trigger a duplicate reload. */
+internal fun drainPendingEvents(watchService: WatchService) {
+    while (true) {
+        val extra = watchService.poll() ?: break
+        extra.pollEvents()
+        extra.reset()
+    }
+}
 
 object ConfigLoader {
     private val log = LoggerFactory.getLogger(ConfigLoader::class.java)
@@ -64,8 +76,13 @@ object ConfigLoader {
             key.reset()
 
             if (changed) {
-                // Debounce: editors often emit multiple events for a single save.
+                // Debounce: editors often emit several filesystem events for a single save
+                // (truncate + write, or write-temp + rename), which keep landing on the watch key
+                // during this pause.
                 Thread.sleep(200)
+                // Drain those follow-up events now so the next take() doesn't immediately return
+                // with them and fire a second, redundant reload for the same save.
+                drainPendingEvents(watchService)
                 try {
                     onReload(GateConfig.load(file.path, messagesSupplier()))
                     log.info("Reloaded config from {}", file.path)

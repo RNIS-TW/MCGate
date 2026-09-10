@@ -57,8 +57,10 @@ object MessagesLoader {
             key.reset()
 
             if (changed) {
-                // Debounce: editors often emit multiple events for a single save.
+                // Debounce, then drain the follow-up events a single save emits so they don't
+                // trigger a second reload - see drainPendingEvents (ConfigLoader.kt).
                 Thread.sleep(200)
+                drainPendingEvents(watchService)
                 try {
                     onReload(GateMessages.load(file.path))
                     log.info("Reloaded messages from {}", file.path)
