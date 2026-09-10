@@ -13,8 +13,11 @@ import me.hippodev.api.ApiServer
 import me.hippodev.config.*
 import me.hippodev.handler.*
 import me.hippodev.protocol.effectiveRemoteAddress
+import me.hippodev.protocol.encodeLoginDisconnect
+import me.hippodev.protocol.toJsonComponent
 import me.hippodev.routing.*
 import me.hippodev.tracking.ConnectionTracker
+import me.hippodev.tracking.RouteMetricsStore
 import me.hippodev.tracking.StatsLogger
 import me.hippodev.udp.UdpProxy
 import me.hippodev.voice.VoiceRelay
@@ -125,6 +128,8 @@ fun main(args: Array<String>) {
     val initialConfig = ConfigLoader.loadOrCreateDefault(configPath, messagesRef.get())
     log.info("Loaded {} route(s) from {}", initialConfig.routes.size, configPath)
     ConnectionTracker.applyConfig(initialConfig.connectionTracking)
+    RouteMetricsStore.setLimitKickMessageSupplier { messagesRef.get().metricsLimitKickMessage }
+    RouteMetricsStore.applyConfig(initialConfig.routes)
     HeldReconnectSessions.max = initialConfig.maxHeldReconnectSessions
 
     val stateRef = AtomicReference(GateState(initialConfig))
@@ -141,6 +146,7 @@ fun main(args: Array<String>) {
     fun applyConfig(newConfig: GateConfig) {
         stateRef.set(GateState(newConfig, stateRef.get()))
         ConnectionTracker.applyConfig(newConfig.connectionTracking)
+        RouteMetricsStore.applyConfig(newConfig.routes)
         StatsLogger.applyConfig(newConfig.statsLogging, ::currentSnapshot)
         HeldReconnectSessions.max = newConfig.maxHeldReconnectSessions
     }
@@ -320,6 +326,7 @@ fun main(args: Array<String>) {
                 bossGroup.shutdownGracefully().sync()
                 workerGroup.shutdownGracefully().sync()
                 ConnectionTracker.shutdown()
+                RouteMetricsStore.shutdown()
                 StatsLogger.shutdown()
                 log.info("Stopped.")
                 // Everything above is our own graceful cleanup and has already completed by this
@@ -413,6 +420,7 @@ private fun startConsole(
                     "help", "?" -> printHelp()
                     "players", "list", "playerlist" -> printPlayers(stateRef.get())
                     "routes" -> printRoutes(stateRef.get())
+                    "metrics" -> metricsCommand(stateRef.get(), line.trim().substringAfter(' ', "").trim())
                     "version" -> log.info("MCGate v{}", version)
                     "reload" -> reload("Manual reload")
                     "uptime" -> log.info("Uptime: {}", formatDuration(System.currentTimeMillis() - startedAt))
@@ -491,6 +499,7 @@ private fun printHelp() {
     log.info("  kick <player> [message]  - disconnect a player, optionally with a message")
     log.info("  transfer <player> <host:port> - send a player directly to another Minecraft server")
     log.info("  routes                   - list configured routes and backend status")
+    log.info("  metrics [reset <index|host|all>] - show per-route byte usage, or reset a counter to zero")
     log.info("  reload                   - re-read config.yml and messages.yml now")
     log.info("  uptime                   - show how long MCGate has been running")
     log.info("  version                  - show the running MCGate version")
@@ -531,10 +540,12 @@ private fun logNetworkInterfaces() {
 
 private fun formatDuration(millis: Long): String {
     val totalSeconds = millis / 1000
-    val h = totalSeconds / 3600
+    val d = totalSeconds / 86_400
+    val h = (totalSeconds % 86_400) / 3600
     val m = (totalSeconds % 3600) / 60
     val s = totalSeconds % 60
     return when {
+        d > 0 -> "${d}d ${h}h ${m}m"
         h > 0 -> "${h}h ${m}m ${s}s"
         m > 0 -> "${m}m ${s}s"
         else -> "${s}s"
@@ -577,6 +588,78 @@ private fun printPlayers(state: GateState) {
     }
 }
 
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val units = listOf("KiB", "MiB", "GiB", "TiB", "PiB")
+    var value = bytes.toDouble() / 1024
+    var unit = 0
+    while (value >= 1024 && unit < units.size - 1) { value /= 1024; unit++ }
+    return "%.2f %s".format(value, units[unit])
+}
+
+/** `metrics` (print) / `metrics reset <index|host|all>` (zero a counter and persist it). */
+private fun metricsCommand(state: GateState, args: String) {
+    if (args.isEmpty()) {
+        printMetrics(state)
+        return
+    }
+    val parts = args.split(Regex("\\s+"))
+    if (parts[0].lowercase() != "reset" || parts.size != 2) {
+        log.info("Usage: metrics [reset <index|host|all>]")
+        return
+    }
+    val target = parts[1]
+    if (target.equals("all", ignoreCase = true)) {
+        val n = RouteMetricsStore.resetAll()
+        log.info(if (n == 0) "No metrics counters to reset." else "Reset $n metrics counter(s).")
+        return
+    }
+
+    val routes = state.config.routes
+    val matched = target.toIntOrNull()?.let { idx -> routes.getOrNull(idx)?.let { listOf(it) } }
+        ?: routes.filter { r -> r.hostPatterns.any { it.raw == target } || r.match(target) != null }
+
+    if (matched.isEmpty()) {
+        log.info("No route matches '{}' (give a route index, a host, or 'all').", target)
+        return
+    }
+    var reset = 0
+    for (route in matched) {
+        val counter = RouteMetricsStore.reset(route)
+        if (counter != null) {
+            reset++
+            log.info("Reset metrics for '{}': upload/download now 0 bytes.", route.hostPatterns.joinToString(", ") { it.raw })
+        }
+    }
+    if (reset == 0) log.info("Matched {} route(s) but none have metrics accounting enabled.", matched.size)
+}
+
+private fun printMetrics(state: GateState) {
+    val rows = state.config.routes.mapIndexedNotNull { index, route ->
+        RouteMetricsStore.handle(route)?.let { index to it }
+    }
+    if (rows.isEmpty()) {
+        log.info("No routes have metrics accounting enabled.")
+        return
+    }
+    log.info("Per-route traffic usage:")
+    for ((index, c) in rows) {
+        val hosts = state.config.routes[index].hostPatterns.joinToString(", ") { it.raw }
+        log.info("[{}] {}{}", index, hosts, c.file?.let { " (-> $it)" } ?: "")
+        fun line(dir: String, bytes: Long, limit: Long, exceeded: Boolean) {
+            val cap = if (limit >= 0) " of ${formatBytes(limit)}${if (exceeded) " [LIMIT REACHED]" else ""}" else " (no limit)"
+            log.info("      {}: {}{}", dir, formatBytes(bytes), cap)
+        }
+        if (c.uploadEnabled) line("upload  ", c.uploadBytes.get(), c.uploadLimit, c.uploadExceeded())
+        if (c.downloadEnabled) line("download", c.downloadBytes.get(), c.downloadLimit, c.downloadExceeded())
+        if (c.resetIntervalMillis > 0) {
+            val remaining = c.resetAt - System.currentTimeMillis()
+            val next = if (remaining > 0) "in ${formatDuration(remaining)}" else "due now"
+            log.info("      auto-reset: every {}, next {}", formatDuration(c.resetIntervalMillis), next)
+        }
+    }
+}
+
 private fun printRoutes(state: GateState) {
     if (state.config.routes.isEmpty()) {
         log.info("No routes configured.")
@@ -594,6 +677,12 @@ private fun printRoutes(state: GateState) {
             val active = if (addr == null) "?" else runtime?.activeConnections?.get(addr)?.get() ?: 0
             val latency = (addr?.let { runtime?.latencyOf(it) })?.let { "${it}ms" } ?: "n/a"
             log.info("      -> {} (active={}, latency={})", template, active, latency)
+        }
+        RouteMetricsStore.handle(route)?.let { c ->
+            fun fmt(bytes: Long, limit: Long) =
+                if (limit >= 0) "$bytes / $limit bytes" else "$bytes bytes (no limit)"
+            if (c.uploadEnabled) log.info("      metrics upload:   {}", fmt(c.uploadBytes.get(), c.uploadLimit))
+            if (c.downloadEnabled) log.info("      metrics download: {}", fmt(c.downloadBytes.get(), c.downloadLimit))
         }
     }
 }
@@ -712,6 +801,17 @@ private fun dispatch(
             }
         }
         else -> {
+            // Refuse the login outright if this route's cumulative upload/download usage has
+            // already reached its configured limit (RouteMetricsStore also kicks players already
+            // on the route). Just an atomic read - no I/O on the event loop.
+            val counter = RouteMetricsStore.handle(resolvedRoute)
+            if (counter != null && counter.exceeded()) {
+                log.info("Route metrics limit reached for host '{}', refusing login from {}", host, ctx.channel().effectiveRemoteAddress())
+                rawFrame.release()
+                ctx.writeAndFlush(encodeLoginDisconnect(toJsonComponent(RouteMetricsStore.limitKickMessage())))
+                    .addListener(io.netty.channel.ChannelFutureListener.CLOSE)
+                return
+            }
             registerVoicechatRoute(ctx, resolvedRoute, captures, host, state.config.logConnections)
             val relay = LoginRelayHandler(resolvedRoute, runtime, captures, protocolVersion, host, port, rawFrame)
             ctx.pipeline().addAfter(handlerName, "relay", relay)

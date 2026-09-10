@@ -17,6 +17,17 @@ data class ReconnectMessages(
  *  [me.hippodev.config.Route.kickMessage]. */
 data class GateMessages(
     val kickMessage: String = "&cServer is offline. Please reconnect shortly.",
+    /** Shown when a route's `metrics:` upload/download byte limit has been reached - both to
+     *  players kicked off the route and to anyone trying to log in while it's over the cap. Global
+     *  (not per-route) since it's about the gate's own accounting, not a backend being down.
+     *
+     *  Full MiniMessage support incl. gradients (the login-refusal path sends a structured chat
+     *  component; the mid-session kick path samples the gradient into per-character `§x` hex, which
+     *  every 1.16+ client renders identically), and `\n` / a YAML block scalar for multiple lines. */
+    val metricsLimitKickMessage: String =
+        "<gradient:#f85032:#e73827><bold>✦ DATA LIMIT REACHED ✦</bold></gradient>\n" +
+            "<gray>This server has used up its data-transfer allowance.</gray>\n" +
+            "<gradient:#8e9eab:#eef2f3>Please try again later.</gradient>",
     val reconnect: ReconnectMessages = ReconnectMessages()
 ) {
     companion object {
@@ -33,6 +44,7 @@ data class GateMessages(
             val defaults = GateMessages()
             return GateMessages(
                 kickMessage = messagesSection["kickMessage"] as? String ?: defaults.kickMessage,
+                metricsLimitKickMessage = messagesSection["metricsLimitKickMessage"] as? String ?: defaults.metricsLimitKickMessage,
                 reconnect = parseReconnect(messagesSection["reconnect"] as? Map<String, Any>)
             )
         }

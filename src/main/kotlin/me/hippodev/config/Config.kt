@@ -58,6 +58,44 @@ data class ReconnectConfig(
     val animationIntervalMillis: Long = 500
 )
 
+/**
+ * Per-direction traffic-usage accounting for a route: whether to count it at all, and an optional
+ * byte ceiling. `limit` is a cumulative cap in bytes (across the counter's whole lifetime,
+ * including any total loaded back from [RouteMetricsConfig.file] on restart) - once reached, new
+ * logins to the route are refused and any players currently on it are kicked with the route's
+ * `kickMessage`. `-1` (the default) means no ceiling, just accounting.
+ */
+data class RouteMetricUsageConfig(
+    val enabled: Boolean = false,
+    val limit: Long = -1
+)
+
+/**
+ * Optional per-route upload/download byte accounting. "upload" is client -> backend (bytes the
+ * player sent), "download" is backend -> client (bytes the player received). Counters are kept in
+ * memory as plain atomics (no per-connection retained state, so nothing accumulates in the heap as
+ * players come and go) and flushed to [file] as JSON by a single background thread - never on a
+ * Netty event loop. See [me.hippodev.tracking.RouteMetricsStore].
+ *
+ * `file` is loaded on startup so totals survive a restart; when null the counters are memory-only.
+ * Several routes may point at the same `file` - they then share one counter.
+ */
+data class RouteMetricsConfig(
+    val file: String? = null,
+    val upload: RouteMetricUsageConfig = RouteMetricUsageConfig(),
+    val download: RouteMetricUsageConfig = RouteMetricUsageConfig(),
+    /** If > 0, the counters are automatically zeroed every this-many milliseconds (a billing-style
+     *  rolling window). The schedule is anchored in [file] (`resetAt`), not process uptime, so it
+     *  survives restarts and doesn't drift; after long downtime it catches up in one step rather
+     *  than firing repeatedly. 0 (default) = never auto-reset. Config key: `resetInterval` (a
+     *  duration such as `30d`, `168h`, `1d`). */
+    val resetIntervalMillis: Long = 0
+) {
+    /** True when at least one direction is actually being counted - otherwise the block is inert
+     *  and no counter/file is created for the route. */
+    val active: Boolean get() = upload.enabled || download.enabled
+}
+
 data class Route(
     val hostPatterns: List<HostPattern>,
     val backendTemplates: List<String>,
@@ -79,7 +117,10 @@ data class Route(
      *  separate port to open. Empty when the route has no `voicechat:` entry. Only the first
      *  template is used: unlike `backend`, there's no failover/load-balancing concept for a UDP
      *  relay session once it's been handed off to a backend. */
-    val voicechatTemplates: List<String> = emptyList()
+    val voicechatTemplates: List<String> = emptyList(),
+    /** Per-route upload/download byte accounting - null when the route has no `metrics:` block (or
+     *  one with both directions disabled). See [RouteMetricsConfig]. */
+    val metrics: RouteMetricsConfig? = null
 ) {
     /** Returns the wildcard captures of the first matching host pattern, or null if none match. */
     fun match(hostname: String): List<String>? {
@@ -387,6 +428,7 @@ data class GateConfig(
             val priority = r["priority"] as? Int ?: 0
             val reconnect = renderReconnectText(parseReconnect(r["reconnect"] as? Map<String, Any>, messages.reconnect))
             val kickMessage = r["kickMessage"] as? String ?: messages.kickMessage
+            val metrics = parseMetrics(r["metrics"] as? Map<String, Any>, index)
 
             return Route(
                 hostPatterns = hostPatterns,
@@ -399,8 +441,46 @@ data class GateConfig(
                 priority = priority,
                 reconnect = reconnect,
                 kickMessage = kickMessage,
-                voicechatTemplates = voicechatBackends
+                voicechatTemplates = voicechatBackends,
+                metrics = metrics
             )
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        private fun parseMetrics(m: Map<String, Any>?, index: Int): RouteMetricsConfig? {
+            if (m == null) return null
+            fun usage(key: String): RouteMetricUsageConfig {
+                val u = m[key] as? Map<String, Any> ?: return RouteMetricUsageConfig()
+                val limit = when (val raw = u["limit"]) {
+                    is Number -> raw.toLong()
+                    is String -> try {
+                        parseByteSize(raw)
+                    } catch (e: Exception) {
+                        error("Route #$index metrics.$key.limit: ${e.message}")
+                    }
+                    null -> -1L
+                    else -> error("Route #$index metrics.$key.limit is not a byte size: $raw")
+                }
+                return RouteMetricUsageConfig(enabled = u["enabled"] as? Boolean ?: false, limit = limit)
+            }
+            val resetInterval = (m["resetInterval"] as? String)?.let {
+                try {
+                    parseDuration(it)
+                } catch (e: Exception) {
+                    error("Route #$index metrics.resetInterval: ${e.message}")
+                }
+            } ?: 0L
+            val config = RouteMetricsConfig(
+                file = (m["file"] as? String)?.takeIf { it.isNotBlank() },
+                upload = usage("upload"),
+                download = usage("download"),
+                resetIntervalMillis = resetInterval.coerceAtLeast(0)
+            )
+            if (!config.active) {
+                log.warn("Route #{}: metrics block present but neither upload nor download is enabled - ignoring it", index)
+                return null
+            }
+            return config
         }
 
         @Suppress("UNCHECKED_CAST")
@@ -543,9 +623,37 @@ fun needsBlockingResolution(value: String, defaultPort: Int = 25565): Boolean {
     return !DnsCache.willResolveWithoutBlocking(host, port)
 }
 
-private val durationPattern = Pattern.compile("(-?\\d+)(ms|s|m|h)")
+private val byteSizePattern = Pattern.compile("(-?\\d+)\\s*([kmgtp]?)i?b?", Pattern.CASE_INSENSITIVE)
 
-/** Parses durations like "3m", "60s", "500ms", "-1s" into milliseconds. */
+/** Parses byte sizes for `metrics.*.limit`: a plain integer is bytes, or a `k`/`m`/`g`/`t`/`p`
+ *  suffix multiplies by the matching power of 1024 (an optional `i`/`b`/`ib`/`b` is accepted and
+ *  ignored, so `100g`, `100G`, `100GiB`, `100gb` are all 100 * 1024^3). Any negative value means
+ *  "unlimited" and normalizes to -1. Examples: "100g" -> 107374182400, "-1" -> -1, "5242880" ->
+ *  5242880. */
+fun parseByteSize(value: String): Long {
+    val m = byteSizePattern.matcher(value.trim())
+    if (!m.matches()) error("invalid byte size: $value (try e.g. 100g, 512m, 5242880, or -1)")
+    val amount = m.group(1).toLong()
+    if (amount < 0) return -1L
+    val factor = when (m.group(2).lowercase()) {
+        "" -> 1L
+        "k" -> 1024L
+        "m" -> 1024L * 1024
+        "g" -> 1024L * 1024 * 1024
+        "t" -> 1024L * 1024 * 1024 * 1024
+        "p" -> 1024L * 1024 * 1024 * 1024 * 1024
+        else -> error("invalid byte size unit: $value")
+    }
+    return try {
+        Math.multiplyExact(amount, factor)
+    } catch (e: ArithmeticException) {
+        error("byte size out of range: $value")
+    }
+}
+
+private val durationPattern = Pattern.compile("(-?\\d+)(ms|s|m|h|d)")
+
+/** Parses durations like "3m", "60s", "500ms", "-1s", "30d" into milliseconds. */
 fun parseDuration(value: String): Long {
     val m = durationPattern.matcher(value.trim())
     if (!m.matches()) error("Invalid duration: $value")
@@ -555,6 +663,7 @@ fun parseDuration(value: String): Long {
         "s" -> amount * 1000
         "m" -> amount * 60_000
         "h" -> amount * 3_600_000
+        "d" -> amount * 86_400_000
         else -> error("Invalid duration unit: $value")
     }
 }

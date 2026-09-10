@@ -44,3 +44,6 @@ run/
 ### Logs ###
 log/
 *.log
+### Testing use on root folder ###
+config.yml
+messages.yml

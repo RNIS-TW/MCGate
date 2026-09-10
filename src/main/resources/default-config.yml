@@ -227,6 +227,40 @@ config:
         # actionBarFrames: ["&7Reconnecting.", "&7Reconnecting..", "&7Reconnecting..."]
         animationInterval: 500ms
 
+    # Per-route upload/download byte accounting. "upload" is client -> backend (bytes the player
+    # sent), "download" is backend -> client (bytes the player received). Counters live in memory
+    # as two atomics per route (no per-connection state, so nothing accumulates as players come
+    # and go) and are flushed to `file` as JSON every 10s by a single dedicated background thread
+    # - never on a Netty event loop. `file` is loaded on startup so totals survive a restart;
+    # omit it to keep the counters memory-only. Several routes may point at the same `file` to
+    # share one counter. Hot-reloadable: toggling a direction or changing a limit takes effect
+    # without a restart, and the running totals carry across the reload.
+    #
+    # `limit` is a cumulative byte ceiling (-1 = unlimited, the default). A plain number is bytes;
+    # a k/m/g/t/p suffix multiplies by the matching power of 1024 (an optional trailing i/b is
+    # ignored, so `100g`, `100G`, `100GiB`, `100gb` all mean 100 * 1024^3). Once a direction's
+    # total reaches it, new logins to the route are refused and any players currently on it are
+    # kicked with messages.yml's `metricsLimitKickMessage`. Exposed at
+    # GET /v1/routes/{index}/metrics, in GET /metrics
+    # (mcgate_route_bytes_uploaded_total / mcgate_route_bytes_downloaded_total) and
+    # GET /metrics?type=json, and in the console `routes` command.
+    - host: metered.example.com
+      backend: 127.0.0.1:25566
+      metrics:
+        file: data/metered.example.com.json
+        # Optional rolling auto-reset: zero the counters every this-long (a duration - 30d, 168h,
+        # 1d, ...). The next-reset time is stored in the file above, so the schedule is anchored
+        # to wall-clock time and survives restarts without drifting - no external cron needed.
+        # Omit (or 0) to never auto-reset; the console `metrics reset <index|host|all>` command and
+        # a manual reset also restart the window.
+        resetInterval: 30d
+        upload:
+          enabled: true
+          limit: -1
+        download:
+          enabled: true
+          limit: -1
+
     # Rewrites the handshake's virtual host to match the backend address,
     # useful when backends require a specific domain to accept connections.
     - host: rewrite.example.com

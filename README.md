@@ -13,6 +13,7 @@ A Java/Kotlin thin, host-based reverse proxy for Minecraft servers. It routes cl
 - **Per-route `proxyProtocol`** - sends a PROXY protocol v1 header so the backend sees the real client IP
 - **DDoS / flood hardening** - `loginTimeout` closes half-open connections (slow-loris); the backend dial *and* backend DNS resolution are both deferred until the client's Login Start arrives, so a connection flood (e.g. to random subdomains on a wildcard route) never reaches the backend or the resolver; oversized handshake frames are rejected on sight; the ping and DNS caches are size-capped; optional `maxConnectionsPerIp` caps concurrent pre-login connections per source IP
 - **Hot config reload** - edits to the config file are picked up live, no restart needed (except for the `bind` address)
+- **Per-route traffic metrics** - optional cumulative upload/download byte accounting per route (`metrics:`), persisted to a JSON file off the event loop, with optional byte limits that kick players and refuse new logins once reached
 - **Bootstraps a default config** on first run if none exists
 
 ## Build
@@ -104,7 +105,20 @@ config:
         version:
           name: "Try again later!"
           protocol: -1
+
+    - host: metered.example.com
+      backend: 127.0.0.1:25566
+      metrics:
+        file: data/metered.example.com.json   # cumulative totals, persisted here (survives restarts)
+        upload:                                # client -> backend bytes
+          enabled: true
+          limit: -1                            # -1 = unlimited; a cap kicks players + refuses logins when reached
+        download:                              # backend -> client bytes
+          enabled: true
+          limit: 100g                          # bytes, or a k/m/g/t/p suffix (x1024); 100g = 100 GiB
 ```
+
+Per-route `metrics:` accounting keeps two atomics per route in memory (no per-connection state) and flushes them to `file` as JSON from a single background thread — never on a Netty event loop. Totals load back on startup, carry across hot reloads, and are exposed via the API (`/v1/routes/{index}/metrics`, `/metrics`) and the console `metrics` command.
 
 Routes are matched in descending `priority` order (ties keep the order they appear in the file), so a specific host like `vip.wildcard.example.com` can win over an overlapping wildcard such as `*.wildcard.example.com` even though the wildcard is listed first.
 
@@ -129,6 +143,8 @@ Endpoints (all `GET`):
 | `/v1/routes/{index}` | A single route by its index in the config |
 | `/v1/routes/{index}/backends` | Last-known per-backend stats (active connections, latency) for non-wildcard routes |
 | `/v1/routes/{index}/ping` | Dials each backend of the route **right now** (bypassing the ping cache) and returns live online status, latency, and the raw status JSON, or an error per backend that's unreachable |
+| `/v1/routes/{index}/metrics` | This route's cumulative upload/download byte usage, configured limits, and whether a limit is exceeded (`404` unless the route enables `metrics:`) |
+| `/metrics` | Prometheus text format; per-route byte usage appears as `mcgate_route_bytes_uploaded_total` / `mcgate_route_bytes_downloaded_total` when configured. Add `?type=json` for the same data (plus per-player detail and `routeMetrics`) as JSON |
 
 The API only binds when `enabled: true`; bind it to `localhost` or a private interface unless it's behind your own auth/network controls.
 
