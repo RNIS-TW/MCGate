@@ -181,7 +181,15 @@ class StatusHandler(
             // backend from here. Client's real remote address is available since this probe
             // rides on the same ctx as the actual player connection.
             if (route.proxyProtocol) {
-                val clientAddr = ctx.channel().effectiveRemoteAddress() as? InetSocketAddress
+                // Never forward a degenerate source (loopback / wildcard / port 0) - a strict
+                // backend RST-drops such a PROXY header, which looked exactly like a dead backend.
+                // These come from health-check headers on status probes (Cloudflare Spectrum /
+                // TCPShield); ProxyProtocolAttributeHandler already keeps them out of
+                // effectiveRemoteAddress(), so this is belt-and-suspenders.
+                val clientAddr = (ctx.channel().effectiveRemoteAddress() as? InetSocketAddress)
+                    ?.takeIf { a ->
+                        a.port in 1..65535 && a.address?.let { !it.isAnyLocalAddress && !it.isLoopbackAddress } == true
+                    }
                 if (clientAddr != null) {
                     backendChannel.writeAndFlush(encodeProxyProtocolHeader(clientAddr, addr))
                 }

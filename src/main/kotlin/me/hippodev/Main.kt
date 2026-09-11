@@ -32,6 +32,20 @@ import java.util.concurrent.atomic.AtomicReference
 private val colorConsoleInstalled = run { archivePreviousLog(); installColorConsole(); true }
 private val log = LoggerFactory.getLogger("MCGate")
 
+/** Sets the runtime log level for MCGate's own loggers (the `me.hippodev` tree plus the top-level
+ *  "MCGate" logger) from config.yml's `logLevel`. Deliberately scoped to MCGate's packages, not the
+ *  root logger, so `DEBUG` surfaces MCGate's own diagnostics (dropped voice datagrams, status-dial
+ *  failures, PROXY-header quirks, ...) without also turning on Netty/JLine debug spam. Hot-reloaded
+ *  on every config change. Unknown values fall back to INFO. No-ops if the logging backend isn't
+ *  logback (it always is in a normal build). */
+private fun applyLogLevel(level: String) {
+    val lb = ch.qos.logback.classic.Level.toLevel(level.trim().uppercase(), ch.qos.logback.classic.Level.INFO)
+    for (name in listOf("me.hippodev", "MCGate")) {
+        (LoggerFactory.getLogger(name) as? ch.qos.logback.classic.Logger)?.level = lb
+    }
+    log.info("Log level set to {}", lb)
+}
+
 private const val BANNER = """
   __  __  ____  ____       _
  |  \/  |/ ___|/ ___| __ _| |_ ___
@@ -126,11 +140,13 @@ fun main(args: Array<String>) {
     log.info("Loaded messages from {}", messagesPath)
 
     val initialConfig = ConfigLoader.loadOrCreateDefault(configPath, messagesRef.get())
+    applyLogLevel(initialConfig.logLevel)
     log.info("Loaded {} route(s) from {}", initialConfig.routes.size, configPath)
     ConnectionTracker.applyConfig(initialConfig.connectionTracking)
     RouteMetricsStore.setLimitKickMessageSupplier { messagesRef.get().metricsLimitKickMessage }
     RouteMetricsStore.applyConfig(initialConfig.routes)
     HeldReconnectSessions.max = initialConfig.maxHeldReconnectSessions
+    me.hippodev.udp.UdpThrottle.apply(initialConfig.udpThrottle)
 
     val stateRef = AtomicReference(GateState(initialConfig))
     val pingCache = PingCache()
@@ -149,6 +165,8 @@ fun main(args: Array<String>) {
         RouteMetricsStore.applyConfig(newConfig.routes)
         StatsLogger.applyConfig(newConfig.statsLogging, ::currentSnapshot)
         HeldReconnectSessions.max = newConfig.maxHeldReconnectSessions
+        me.hippodev.udp.UdpThrottle.apply(newConfig.udpThrottle)
+        applyLogLevel(newConfig.logLevel)
     }
 
     // Shared by the file watchers below and the console `reload` command, so a manual reload
@@ -291,7 +309,7 @@ fun main(args: Array<String>) {
         // that UDP port for a feature nobody's using, which conflicts with e.g. a same-port entry
         // in `udpProxy:` below. Like the rest of this section, this is decided once at startup from
         // initialConfig, not re-evaluated on a hot config reload.
-        val voiceRelay = VoiceRelay(workerGroup, initialConfig.proxyProtocol)
+        val voiceRelay = VoiceRelay(workerGroup, initialConfig.udp.proxyProtocol)
         val hasVoicechatRoutes = initialConfig.routes.any { it.voicechatTemplates.isNotEmpty() }
         if (hasVoicechatRoutes) {
             voiceRelay.start(initialConfig.bindAddress)

@@ -14,6 +14,13 @@ config:
   # scanners can be frequent enough to be noisy. Hot-reloadable, no restart needed.
   logConnections: false
 
+  # Runtime log level for MCGate's own loggers (me.hippodev.*): TRACE, DEBUG, INFO, WARN, ERROR,
+  # OFF. DEBUG surfaces MCGate's own diagnostics - dropped voice datagrams, status-probe dial
+  # failures, PROXY-protocol header handling, config-watch churn - without turning on Netty/JLine
+  # debug spam (the root logger stays at its logback.xml level). Hot-reloadable; an unrecognised
+  # value falls back to INFO.
+  logLevel: INFO
+
   # Read-only JSON/HTTP status API (routes, backends, live connection/latency stats). Also
   # exposes GET /v1/players (every connected player: IP, UUID, host, login attempts, packets/
   # bytes sent+received, compression/encryption state) and GET /metrics in Prometheus text format
@@ -32,15 +39,31 @@ config:
     # caps the player list embedded in GET /metrics?type=json.
     playersPageLimit: 500
 
+  # UDP-relay settings. `proxyProtocol` here is an INDEPENDENT switch from the top-level
+  # `proxyProtocol` above (which is for the Minecraft TCP listener): when on, the voicechat UDP
+  # relay expects a PROXY protocol (v1/v2) header on inbound datagrams and routes by the real
+  # client address it carries. Kept separate because an L4 front (Cloudflare Spectrum etc.) can be
+  # set to prepend the header on one protocol but not the other. If this block - or this key - is
+  # omitted it inherits the top-level `proxyProtocol` value, so a single-switch config is
+  # unchanged. Startup-only.
+  udp:
+    proxyProtocol: false
+
   # Standalone static UDP forwards - each entry relays every datagram received on `bind` to
   # `backend`, keyed by source ip:port. Independent of a route's `voicechat:` backend: there's no
   # Minecraft login required to open a session, so each entry needs its own bind address/port
   # rather than sharing the main TCP listener's. Useful for forwarding any other UDP service
   # (e.g. a WireGuard endpoint) through the same box/anti-DDoS setup. Bind addresses only take
   # effect on (re)start, not a live config reload.
+  #
+  # `logSessions` (default true) logs an INFO line each time a new source address opens a forward.
+  # Set it false (the line drops to DEBUG) when something like a voice/L4 proxy sits in front and
+  # every client - plus its periodic health probes - arrives as a fresh session, making that line
+  # noise. Hot-reloadable? No - like the rest of this block it's read once at startup.
   udpProxy: []
   #  - bind: 0.0.0.0:51820
   #    backend: 127.0.0.1:51820
+  #    logSessions: true
 
   # Persists per-session player connection details (IP, UUID, login attempts, packets/bytes
   # transferred, compression/encryption state, host) to a local SQLite database - a single
@@ -99,10 +122,9 @@ config:
   # it. Whatever sits in front of MCGate must actually send this header on every connection, or
   # every real client gets dropped as a malformed handshake. Off by default.
   #
-  # Applies to the voicechat UDP relay too: when on, MCGate expects a PROXY header prepended to
-  # every inbound voice datagram (as Cloudflare Spectrum and similar do) and routes by the real
-  # client address it carries - without this the relay only sees the fronting proxy's own IP and
-  # can't match a datagram to a logged-in player.
+  # The voicechat UDP relay has its own `udp.proxyProtocol` switch (see the `udp:` block below);
+  # it defaults to whatever this value is, so leaving it there keeps the old single-switch
+  # behaviour, but you can set it independently if your L4 front handles TCP and UDP differently.
   proxyProtocol: false
 
   # Anti-abuse limits for the pre-login phase of a connection - the window a connection-flood /
@@ -122,7 +144,9 @@ config:
   maxConnectionsPerIp: 8
 
   # Process-wide flood ceilings, layered on top of maxConnectionsPerIp. Read fresh per connection,
-  # so changes here apply on a hot reload. Both are ignored when proxyProtocol is on.
+  # so changes here apply on a hot reload. maxPerIpPerWindow is ignored when proxyProtocol is on
+  # (every connection then carries the upstream load balancer's address); maxConnections still
+  # applies.
   connectionThrottle:
     # Hard cap on total concurrent client connections. Over this, new TCP connections are accepted
     # and immediately closed. 0 = unlimited (recommend setting this to a few x your real peak).
@@ -131,6 +155,27 @@ config:
     # of times is fine; a single-source connect storm is throttled. 0 = unlimited.
     maxPerIpPerWindow: 8
     window: 8s
+
+  # Anti-abuse limits for the UDP relay paths - the voicechat relay (a route's `voicechat:`
+  # backend) and every static `udpProxy:` forward. UDP has no handshake to gate on and a spoofable
+  # source address, so each distinct source that sends a datagram makes MCGate open a relay
+  # session + a backend-facing socket (an fd). Read live per datagram, so changes apply on a hot
+  # reload (the UDP bind ports themselves are startup-only).
+  udpThrottle:
+    # Max concurrent relay sessions across all UDP paths combined. 0 = unlimited. Keep this well
+    # under the process file-descriptor limit (`ulimit -n` / systemd LimitNOFILE) - one fd each.
+    maxSessions: 8192
+    # Max concurrent relay sessions from one source IP. 0 = unlimited. Under proxyProtocol the
+    # voicechat path counts the real client IP from the PROXY header.
+    maxSessionsPerIp: 64
+    # Datagrams buffered per session during the brief window its backend socket is opening; past
+    # this the oldest is dropped (UDP is lossy anyway). Minimum 1.
+    pendingPacketsPerSession: 256
+    # A session with no traffic either way for this long is torn down.
+    idleTimeout: 5m
+    # A session whose backend never replies within this long of opening is torn down early - the
+    # main defence against a spoofed-source flood. 0 disables it.
+    noReplyTeardown: 20s
 
   # Listen socket backlog (SO_BACKLOG). Startup-only. Raise on a busy public server so bursts of
   # legitimate connections aren't dropped by the kernel during a flood.

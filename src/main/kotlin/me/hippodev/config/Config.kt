@@ -152,7 +152,22 @@ data class Route(
  * is required to open a session, so this has its own bind address/port rather than sharing the
  * main TCP listener's. See [me.hippodev.udp.UdpProxy].
  */
-data class UdpProxyConfig(val bind: String, val backend: String) {
+/**
+ * UDP-relay-specific settings, in their own top-level `udp:` block.
+ *
+ * [proxyProtocol] is an independent switch for whether the voicechat UDP relay
+ * ([me.hippodev.voice.VoiceRelay]) expects a PROXY protocol (v1/v2) header on inbound datagrams -
+ * deliberately *not* tied to [GateConfig.proxyProtocol] (the TCP listener's), since an L4 front such
+ * as Cloudflare Spectrum can be configured to prepend the header on one protocol but not the other.
+ * When the `udp:` block (or this key) is absent it falls back to [GateConfig.proxyProtocol] so
+ * existing single-switch configs keep behaving the same. Startup-only, like the UDP bind addresses.
+ */
+data class UdpConfig(val proxyProtocol: Boolean = false)
+
+/** [logSessions] controls the per-session INFO line each time a new source address opens a
+ *  forward. On by default; set false (logged at DEBUG instead) when a proxy sits in front and
+ *  every client - plus its health probes - looks like a fresh session, making that line noise. */
+data class UdpProxyConfig(val bind: String, val backend: String, val logSessions: Boolean = true) {
     val bindAddress: InetSocketAddress by lazy { parseHostPort(bind) }
     val backendAddress: InetSocketAddress by lazy { parseHostPort(backend) }
 }
@@ -174,9 +189,10 @@ data class ApiConfig(
 /**
  * Process-wide flood ceilings, layered on top of the per-IP pre-login cap
  * ([GateConfig.maxConnectionsPerIp]): a hard cap on total concurrent connections and a per-IP
- * new-connection rate limit. Both are disabled when [GateConfig.proxyProtocol] is on (every
- * connection then appears to come from the upstream load balancer). Read fresh on every
- * connection, so changes take effect on a hot reload.
+ * new-connection rate limit. The per-IP rate limit is disabled when [GateConfig.proxyProtocol] is
+ * on (every connection then appears to come from the upstream load balancer); the process-wide
+ * [maxConnections] cap still applies. Read fresh on every connection, so changes take effect on a
+ * hot reload.
  */
 data class ConnectionThrottleConfig(
     /** Max concurrent client connections process-wide. 0 = unlimited. Over this, new TCP
@@ -185,6 +201,33 @@ data class ConnectionThrottleConfig(
     /** Max new connections from one source IP within [windowMillis]. 0 = unlimited. */
     val maxPerIpPerWindow: Int = 8,
     val windowMillis: Long = 8_000
+)
+
+/**
+ * Anti-abuse limits shared by every UDP relay path - the voicechat relay
+ * ([me.hippodev.voice.VoiceRelay]) and each static `udpProxy:` forward. UDP carries no handshake to
+ * gate on and a trivially spoofable source address, so these caps are the only thing bounding how
+ * much a datagram flood can pin: each distinct source opens a session object plus one
+ * backend-facing UDP socket (an fd). Read live on every datagram, so changes take effect on a hot
+ * reload - only the UDP *bind* addresses are startup-only. Applied process-wide via
+ * [me.hippodev.udp.UdpThrottle].
+ */
+data class UdpThrottleConfig(
+    /** Max concurrent relay sessions across all UDP paths combined. 0 = unlimited. Each session
+     *  costs one backend-facing UDP socket - keep this well under the process fd limit. */
+    val maxSessions: Int = 8192,
+    /** Max concurrent relay sessions from one source IP. 0 = unlimited. Under `proxyProtocol` the
+     *  voicechat path keys this off the real client address from the PROXY header. */
+    val maxSessionsPerIp: Int = 64,
+    /** Datagrams buffered per session during the sub-millisecond window its backend socket is
+     *  opening; past this the oldest is dropped (UDP is lossy anyway). Clamped to at least 1. */
+    val pendingPacketsPerSession: Int = 256,
+    /** A session with no traffic in either direction for this long is torn down. */
+    val idleTimeoutMillis: Long = 300_000,
+    /** A session whose backend never replies within this long of being opened is torn down early -
+     *  the main defence against a spoofed-source flood (each fake sender otherwise holds a socket
+     *  for the full idle window). 0 = disabled. */
+    val noReplyTeardownMillis: Long = 20_000
 )
 
 /**
@@ -242,6 +285,7 @@ data class StatsLoggingConfig(
 data class GateConfig(
     val bind: String = "0.0.0.0:25565",
     val routes: List<Route> = emptyList(),
+    val udp: UdpConfig = UdpConfig(),
     val udpProxies: List<UdpProxyConfig> = emptyList(),
     val api: ApiConfig = ApiConfig(),
     val connectionTracking: ConnectionTrackingConfig = ConnectionTrackingConfig(),
@@ -260,6 +304,12 @@ data class GateConfig(
      *  pings, which otherwise aren't logged at all. Off by default since server-list pingers/
      *  scanners can hit a public port frequently enough to be noisy. */
     val logConnections: Boolean = false,
+    /** Runtime log level for MCGate's own loggers (`me.hippodev.*`): TRACE / DEBUG / INFO / WARN /
+     *  ERROR / OFF. `DEBUG` surfaces MCGate's own diagnostics - dropped voice datagrams,
+     *  status-probe dial failures, PROXY-header handling, config-watch churn - without turning on
+     *  Netty/JLine debug noise (the root logger stays at logback.xml's level). Hot-reloadable;
+     *  unknown values fall back to INFO. */
+    val logLevel: String = "INFO",
     /** Accept a PROXY protocol (v1/v2) header at the start of every incoming connection, before
      *  the Minecraft handshake - for when MCGate itself sits behind another load balancer/proxy
      *  that needs to hand it the real client address. Distinct from a [Route]'s own
@@ -267,8 +317,8 @@ data class GateConfig(
      *  MCGate *receiving* one from whatever's in front of it. Off by default: a plain client
      *  connecting straight to MCGate does not send this header, so turning it on when nothing
      *  upstream actually sends one just makes every real connection look like garbage and get
-     *  dropped. Also honored by [me.hippodev.voice.VoiceRelay] - the inbound voice UDP path then
-     *  expects a PROXY header on every datagram and routes by the real client address it carries. */
+     *  dropped. The voicechat UDP relay ([me.hippodev.voice.VoiceRelay]) has its own
+     *  [UdpConfig.proxyProtocol] switch, which defaults to this value but can be set independently. */
     val proxyProtocol: Boolean = false,
     /** Anti-abuse: how long a connection has to complete its handshake *and* send its Login Start
      *  packet before MCGate closes it. A connection-flood / slow-loris opens sockets (and often
@@ -283,6 +333,8 @@ data class GateConfig(
     val maxConnectionsPerIp: Int = 8,
     /** Process-wide flood ceilings - see [ConnectionThrottleConfig]. */
     val connectionThrottle: ConnectionThrottleConfig = ConnectionThrottleConfig(),
+    /** Anti-abuse limits for every UDP relay path - see [UdpThrottleConfig]. */
+    val udpThrottle: UdpThrottleConfig = UdpThrottleConfig(),
     /** Listen socket backlog (SO_BACKLOG). Startup-only, like [bind]. */
     val soBacklog: Int = 128,
     /** Process-wide cap on players held in the reconnect-wait state at once (see
@@ -319,21 +371,36 @@ data class GateConfig(
             val statsLogging = parseStatsLogging(configSection["statsLogging"] as? Map<String, Any>)
             val workerThreads = configSection["workerThreads"] as? Int ?: 0
             val logConnections = configSection["logConnections"] as? Boolean ?: false
+            val logLevel = configSection["logLevel"] as? String ?: GateConfig().logLevel
             val proxyProtocol = configSection["proxyProtocol"] as? Boolean ?: false
+            val udp = parseUdp(configSection["udp"] as? Map<String, Any>, proxyProtocol)
             val defaults = GateConfig()
             val loginTimeoutMillis = (configSection["loginTimeout"] as? String)?.let { parseDuration(it) } ?: defaults.loginTimeoutMillis
             val maxConnectionsPerIp = configSection["maxConnectionsPerIp"] as? Int ?: defaults.maxConnectionsPerIp
             val connectionThrottle = parseConnectionThrottle(configSection["connectionThrottle"] as? Map<String, Any>)
+            val udpThrottle = parseUdpThrottle(configSection["udpThrottle"] as? Map<String, Any>)
             val soBacklog = configSection["soBacklog"] as? Int ?: defaults.soBacklog
             val maxHeldReconnectSessions = configSection["maxHeldReconnectSessions"] as? Int ?: defaults.maxHeldReconnectSessions
 
             return GateConfig(
-                bind = bind, routes = routes, udpProxies = udpProxies, api = api, connectionTracking = connectionTracking,
+                bind = bind, routes = routes, udp = udp, udpProxies = udpProxies, api = api, connectionTracking = connectionTracking,
                 statsLogging = statsLogging,
-                workerThreads = workerThreads, logConnections = logConnections, proxyProtocol = proxyProtocol,
+                workerThreads = workerThreads, logConnections = logConnections, logLevel = logLevel, proxyProtocol = proxyProtocol,
                 loginTimeoutMillis = loginTimeoutMillis, maxConnectionsPerIp = maxConnectionsPerIp,
-                connectionThrottle = connectionThrottle, soBacklog = soBacklog,
+                connectionThrottle = connectionThrottle, udpThrottle = udpThrottle, soBacklog = soBacklog,
                 maxHeldReconnectSessions = maxHeldReconnectSessions
+            )
+        }
+
+        private fun parseUdpThrottle(c: Map<String, Any>?): UdpThrottleConfig {
+            val d = UdpThrottleConfig()
+            if (c == null) return d
+            return UdpThrottleConfig(
+                maxSessions = c["maxSessions"] as? Int ?: d.maxSessions,
+                maxSessionsPerIp = c["maxSessionsPerIp"] as? Int ?: d.maxSessionsPerIp,
+                pendingPacketsPerSession = c["pendingPacketsPerSession"] as? Int ?: d.pendingPacketsPerSession,
+                idleTimeoutMillis = (c["idleTimeout"] as? String)?.let { parseDuration(it) } ?: d.idleTimeoutMillis,
+                noReplyTeardownMillis = (c["noReplyTeardown"] as? String)?.let { parseDuration(it) } ?: d.noReplyTeardownMillis
             )
         }
 
@@ -347,12 +414,21 @@ data class GateConfig(
             )
         }
 
+        /** [defaultProxyProtocol] is the TCP listener's `proxyProtocol` - used when the `udp:` block
+         *  or its `proxyProtocol` key is omitted, so a config with only the single top-level switch
+         *  keeps applying it to the voice relay as before. */
+        private fun parseUdp(c: Map<String, Any>?, defaultProxyProtocol: Boolean): UdpConfig {
+            if (c == null) return UdpConfig(proxyProtocol = defaultProxyProtocol)
+            return UdpConfig(proxyProtocol = c["proxyProtocol"] as? Boolean ?: defaultProxyProtocol)
+        }
+
         private fun parseUdpProxies(raw: List<Map<String, Any>>?): List<UdpProxyConfig> {
             if (raw == null) return emptyList()
             return raw.mapIndexed { index, entry ->
                 val bind = entry["bind"] as? String ?: error("udpProxy #$index missing 'bind'")
                 val backend = entry["backend"] as? String ?: error("udpProxy #$index missing 'backend'")
-                UdpProxyConfig(bind = bind, backend = backend)
+                val logSessions = entry["logSessions"] as? Boolean ?: true
+                UdpProxyConfig(bind = bind, backend = backend, logSessions = logSessions)
             }
         }
 
