@@ -266,6 +266,27 @@ impl Default for ConnectionThrottleConfig {
     }
 }
 
+/// Fail2ban-style auto-ban, layered on top of the other per-IP guards
+/// (`maxConnectionsPerIp`/`connectionThrottle`): repeated violations from one source IP within
+/// `violationWindow` (over any per-IP limit, a login that never completes, a malformed
+/// handshake) earn a temporary ban lasting `banDuration`, rejected at the very top of connection
+/// handling before any other guard runs - see `net::ip_ban`. Ignored when `proxyProtocol` is on,
+/// same reasoning as the other per-IP guards: every connection would otherwise look like it came
+/// from the upstream load balancer's single address.
+#[derive(Debug, Clone)]
+pub struct AutoBanConfig {
+    pub enabled: bool,
+    pub max_violations: i32,
+    pub violation_window_millis: i64,
+    pub ban_duration_millis: i64,
+}
+
+impl Default for AutoBanConfig {
+    fn default() -> Self {
+        Self { enabled: true, max_violations: 10, violation_window_millis: 60_000, ban_duration_millis: 600_000 }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UdpThrottleConfig {
     pub max_sessions: i32,
@@ -351,6 +372,7 @@ pub struct GateConfig {
     pub login_timeout_millis: i64,
     pub max_connections_per_ip: i32,
     pub connection_throttle: ConnectionThrottleConfig,
+    pub auto_ban: AutoBanConfig,
     pub udp_throttle: UdpThrottleConfig,
     pub so_backlog: i32,
     pub max_held_reconnect_sessions: i32,
@@ -373,6 +395,7 @@ impl Default for GateConfig {
             login_timeout_millis: 10_000,
             max_connections_per_ip: 8,
             connection_throttle: ConnectionThrottleConfig::default(),
+            auto_ban: AutoBanConfig::default(),
             udp_throttle: UdpThrottleConfig::default(),
             so_backlog: 128,
             max_held_reconnect_sessions: 500,
@@ -556,6 +579,7 @@ pub fn load_config(path: impl AsRef<Path>, messages: &crate::config::messages::G
         .unwrap_or(defaults.login_timeout_millis);
     let max_connections_per_ip = get_i32(&config_section, "maxConnectionsPerIp").unwrap_or(defaults.max_connections_per_ip);
     let connection_throttle = parse_connection_throttle(get_map(&config_section, "connectionThrottle"))?;
+    let auto_ban = parse_auto_ban(get_map(&config_section, "autoBan"))?;
     let udp_throttle = parse_udp_throttle(get_map(&config_section, "udpThrottle"))?;
     let so_backlog = get_i32(&config_section, "soBacklog").unwrap_or(defaults.so_backlog);
     let max_held_reconnect_sessions =
@@ -576,9 +600,21 @@ pub fn load_config(path: impl AsRef<Path>, messages: &crate::config::messages::G
         login_timeout_millis,
         max_connections_per_ip,
         connection_throttle,
+        auto_ban,
         udp_throttle,
         so_backlog,
         max_held_reconnect_sessions,
+    })
+}
+
+fn parse_auto_ban(c: Option<&serde_yaml::Mapping>) -> Result<AutoBanConfig> {
+    let d = AutoBanConfig::default();
+    let Some(c) = c else { return Ok(d) };
+    Ok(AutoBanConfig {
+        enabled: get_bool(c, "enabled").unwrap_or(d.enabled),
+        max_violations: get_i32(c, "maxViolations").unwrap_or(d.max_violations),
+        violation_window_millis: get_str(c, "violationWindow").map(|s| parse_duration_millis(&s)).transpose()?.unwrap_or(d.violation_window_millis),
+        ban_duration_millis: get_str(c, "banDuration").map(|s| parse_duration_millis(&s)).transpose()?.unwrap_or(d.ban_duration_millis),
     })
 }
 

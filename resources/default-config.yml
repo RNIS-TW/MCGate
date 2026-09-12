@@ -1,34 +1,128 @@
 config:
+  # ============================================================================================
+  # NETWORK - the Minecraft TCP listener itself. All startup-only (a restart is needed for
+  # changes here to take effect, not just a config reload).
+  # ============================================================================================
+
   # The bind address to listen for Minecraft client connections.
   bind: 0.0.0.0:25565
 
   # Number of Netty worker threads. 0 (default) = max(4, 2x CPU cores). Every player's connection
   # is pinned to one of these threads for its whole session, so too few threads on a small
-  # VPS/container can make lag/stalls appear to hit "half the players" at a time - only takes
-  # effect on (re)start, not a live config reload.
+  # VPS/container can make lag/stalls appear to hit "half the players" at a time.
   workerThreads: 0
+
+  # Listen socket backlog (SO_BACKLOG). Raise on a busy public server so bursts of legitimate
+  # connections aren't dropped by the kernel during a flood.
+  soBacklog: 128
+
+  # Accept a PROXY protocol (v1/v2) header at the start of every incoming connection, before the
+  # Minecraft handshake - for when MCGate itself sits behind another load balancer/proxy that
+  # needs to hand it the real client address (bind above then becomes the load balancer's address,
+  # not the public one). Distinct from a route's own `proxyProtocol`, which is MCGate *sending*
+  # that header onward to its backend - this is MCGate *receiving* one from whatever's in front of
+  # it. Whatever sits in front of MCGate must actually send this header on every connection, or
+  # every real client gets dropped as a malformed handshake. Off by default.
+  #
+  # The voicechat UDP relay has its own `udp.proxyProtocol` switch (see the UDP section below); it
+  # defaults to whatever this value is, so leaving it there keeps the old single-switch behaviour,
+  # but you can set it independently if your L4 front handles TCP and UDP differently.
+  proxyProtocol: false
+
+  # ============================================================================================
+  # ANTI-ABUSE / DDOS PROTECTION - layered defenses against connection floods, slow-loris
+  # attacks, and repeat-offending source IPs. Each layer is independent and all but `autoBan`
+  # only take effect on (re)start; read top to bottom, each one catches what the last one didn't:
+  #   1. autoBan            - repeat offenders get dropped for free, before anything else runs
+  #   2. connectionThrottle  - process-wide connection-count/rate ceilings
+  #   3. maxConnectionsPerIp - per-IP cap on connections still in their pre-login phase
+  #   4. loginTimeout        - kicks a connection that never actually logs in
+  # ============================================================================================
+
+  # Fail2ban-style auto-ban: once a single source IP racks up `maxViolations` within
+  # `violationWindow` (from any of the guards below - over `maxConnectionsPerIp`, over
+  # `connectionThrottle.maxPerIpPerWindow`, a login that never completes within `loginTimeout`, or
+  # a malformed/garbage handshake), it's banned for `banDuration`. A banned IP's connections are
+  # rejected at the very top of connection handling - before the PROXY protocol read, before the
+  # per-IP guard, before anything - for the cheapest possible rejection MCGate can do. This is
+  # what turns a sustained flood from a small number of repeat-offending IPs into near-zero-cost
+  # drops instead of paying the same handshake/guard-acquire cost on every single attempt forever.
+  # Hot-reloadable. Ignored when proxyProtocol (above) is on - every connection would otherwise
+  # look like it came from the upstream load balancer's single address.
+  #
+  # Manage active bans from the console: `bans` lists who's currently banned and for how much
+  # longer; `unban <ip>` lifts one early.
+  autoBan:
+    enabled: true
+    # How many violations from one source IP trigger a ban.
+    maxViolations: 10
+    # The rolling window violations are counted within - old violations outside this window don't
+    # count toward the threshold.
+    violationWindow: 60s
+    # How long a ban lasts once triggered.
+    banDuration: 10m
+
+  # Process-wide flood ceilings, layered on top of maxConnectionsPerIp below. Read fresh per
+  # connection, so changes here apply on a hot reload. maxPerIpPerWindow is ignored when
+  # proxyProtocol is on (every connection then carries the upstream load balancer's address);
+  # maxConnections still applies.
+  connectionThrottle:
+    # Hard cap on total concurrent client connections. Over this, new TCP connections are accepted
+    # and immediately closed. 0 = unlimited (recommend setting this to a few x your real peak).
+    maxConnections: 0
+    # Max NEW connections from one source IP within `window`. A real player reconnecting a handful
+    # of times is fine; a single-source connect storm is throttled. 0 = unlimited.
+    maxPerIpPerWindow: 8
+    window: 8s
+
+  # Max simultaneous PRE-LOGIN connections from one source IP. A connection stops counting the
+  # moment it completes login (or is held for reconnect), so a real player opening a few
+  # connections in a row is unaffected while a single-source socket flood is capped. 0 =
+  # unlimited. Ignored when proxyProtocol is on (every connection would look like it came from the
+  # upstream load balancer). Only takes effect on (re)start.
+  maxConnectionsPerIp: 8
+
+  # How long a connection has to complete its handshake AND send its Login Start packet before
+  # MCGate closes it - the window a connection-flood/slow-loris attack lives in. A flood that
+  # opens sockets (and often completes the handshake) but never sends login otherwise pins a
+  # channel + an fd each. A real client sends Login Start within milliseconds of the handshake, so
+  # 10s is already very generous. Use 0 to disable. The backend dial is deferred until Login Start
+  # arrives, so bots that never send it never reach the backend. Only takes effect on (re)start.
+  loginTimeout: 10s
+
+  # Process-wide cap on players held in the reconnect-wait state at once (see a route's
+  # `reconnect:` block). Each held player costs a live connection + keep-alive/animation/retry
+  # timers; past this cap a would-be-held player is kicked with the route's kickMessage instead.
+  # 0 = unlimited.
+  maxHeldReconnectSessions: 500
+
+  # ============================================================================================
+  # LOGGING
+  # ============================================================================================
 
   # Logs every incoming connection at INFO as soon as the handshake is read - host, remote
   # address, whether it's a status ping or a login, and protocol version. Off by default: logins
-  # are already logged (see LoginRelayHandler), and status pings from server-list refreshes/
-  # scanners can be frequent enough to be noisy. Hot-reloadable, no restart needed.
+  # are already logged, and status pings from server-list refreshes/scanners can be frequent
+  # enough to be noisy. Hot-reloadable, no restart needed.
   logConnections: false
 
-  # Runtime log level for MCGate's own loggers (me.hippodev.*): TRACE, DEBUG, INFO, WARN, ERROR,
-  # OFF. DEBUG surfaces MCGate's own diagnostics - dropped voice datagrams, status-probe dial
-  # failures, PROXY-protocol header handling, config-watch churn - without turning on Netty/JLine
-  # debug spam (the root logger stays at its logback.xml level). Hot-reloadable; an unrecognised
-  # value falls back to INFO.
+  # Runtime log level for MCGate's own loggers: TRACE, DEBUG, INFO, WARN, ERROR, OFF. DEBUG
+  # surfaces MCGate's own diagnostics - dropped voice datagrams, status-probe dial failures,
+  # PROXY-protocol header handling, config-watch churn - without turning on dependency-crate debug
+  # spam. Hot-reloadable; an unrecognised value falls back to INFO.
   logLevel: INFO
 
-  # Read-only JSON/HTTP status API (routes, backends, live connection/latency stats). Also
-  # exposes GET /v1/players (every connected player: IP, UUID, host, login attempts, packets/
-  # bytes sent+received, compression/encryption state) and GET /metrics in Prometheus text format
-  # (players online, per-host player counts, uptime, per-backend active connections/latency,
-  # connection-tracking queue/drop counters - add ?type=json for the same data plus the full
-  # player list as JSON). Point a Prometheus scrape_configs target at this host:port + /metrics
-  # to graph MCGate in Grafana; no MCGate-specific plugin needed. Disabled by default - only bind
-  # it to a trusted interface.
+  # ============================================================================================
+  # HTTP API - read-only JSON/HTTP status API (routes, backends, live connection/latency stats).
+  # ============================================================================================
+
+  # Also exposes GET /v1/players (every connected player: IP, UUID, host, login attempts,
+  # packets/bytes sent+received, compression/encryption state) and GET /metrics in Prometheus text
+  # format (players online, per-host player counts, uptime, per-backend active
+  # connections/latency, connection-tracking queue/drop counters - add ?type=json for the same
+  # data plus the full player list as JSON). Point a Prometheus scrape_configs target at this
+  # host:port + /metrics to graph MCGate in Grafana; no MCGate-specific plugin needed. Disabled by
+  # default - only bind it to a trusted interface.
   api:
     enabled: false
     bind: 0.0.0.0:8080
@@ -39,13 +133,17 @@ config:
     # caps the player list embedded in GET /metrics?type=json.
     playersPageLimit: 500
 
-  # UDP-relay settings. `proxyProtocol` here is an INDEPENDENT switch from the top-level
-  # `proxyProtocol` above (which is for the Minecraft TCP listener): when on, the voicechat UDP
-  # relay expects a PROXY protocol (v1/v2) header on inbound datagrams and routes by the real
-  # client address it carries. Kept separate because an L4 front (Cloudflare Spectrum etc.) can be
-  # set to prepend the header on one protocol but not the other. If this block - or this key - is
-  # omitted it inherits the top-level `proxyProtocol` value, so a single-switch config is
-  # unchanged. Startup-only.
+  # ============================================================================================
+  # UDP - the voicechat relay's protocol switch, standalone static UDP forwards, and the shared
+  # anti-abuse limits both of those (plus a route's own `voicechat:` backend) are subject to.
+  # ============================================================================================
+
+  # `proxyProtocol` here is an INDEPENDENT switch from the top-level `proxyProtocol` above (which
+  # is for the Minecraft TCP listener): when on, the voicechat UDP relay expects a PROXY protocol
+  # (v1/v2) header on inbound datagrams and routes by the real client address it carries. Kept
+  # separate because an L4 front (Cloudflare Spectrum etc.) can be set to prepend the header on
+  # one protocol but not the other. If this block - or this key - is omitted it inherits the
+  # top-level `proxyProtocol` value, so a single-switch config is unchanged. Startup-only.
   udp:
     proxyProtocol: false
 
@@ -65,14 +163,38 @@ config:
   #    backend: 127.0.0.1:51820
   #    logSessions: true
 
+  # Anti-abuse limits for the UDP relay paths - the voicechat relay (a route's `voicechat:`
+  # backend) and every static `udpProxy:` forward above. UDP has no handshake to gate on and a
+  # spoofable source address, so each distinct source that sends a datagram makes MCGate open a
+  # relay session + a backend-facing socket (an fd). Read live per datagram, so changes apply on a
+  # hot reload (the UDP bind ports themselves are startup-only).
+  udpThrottle:
+    # Max concurrent relay sessions across all UDP paths combined. 0 = unlimited. Keep this well
+    # under the process file-descriptor limit (`ulimit -n` / systemd LimitNOFILE) - one fd each.
+    maxSessions: 8192
+    # Max concurrent relay sessions from one source IP. 0 = unlimited. Under proxyProtocol the
+    # voicechat path counts the real client IP from the PROXY header.
+    maxSessionsPerIp: 64
+    # Datagrams buffered per session during the brief window its backend socket is opening; past
+    # this the oldest is dropped (UDP is lossy anyway). Minimum 1.
+    pendingPacketsPerSession: 256
+    # A session with no traffic either way for this long is torn down.
+    idleTimeout: 5m
+    # A session whose backend never replies within this long of opening is torn down early - the
+    # main defence against a spoofed-source flood. 0 disables it.
+    noReplyTeardown: 20s
+
+  # ============================================================================================
+  # PERSISTENCE / OBSERVABILITY - optional local SQLite logging, both disabled by default.
+  # ============================================================================================
+
   # Persists per-session player connection details (IP, UUID, login attempts, packets/bytes
   # transferred, compression/encryption state, host) to a local SQLite database - a single
-  # compact binary .db file, not a growing plain-text log. Disabled by default. One row is
-  # written per completed session (at disconnect), via a bounded queue + a single background
-  # writer thread, so it never blocks a player's connection and never grows memory without
-  # bound; a periodic janitor also prunes old/excess rows so the .db file itself stays bounded.
-  # Hot-reloadable - toggling `enabled` (or any other field below) here takes effect without a
-  # restart.
+  # compact binary .db file, not a growing plain-text log. One row is written per completed
+  # session (at disconnect), via a bounded queue + a single background writer thread, so it never
+  # blocks a player's connection and never grows memory without bound; a periodic janitor also
+  # prunes old/excess rows so the .db file itself stays bounded. Hot-reloadable - toggling
+  # `enabled` (or any other field below) here takes effect without a restart.
   connectionTracking:
     enabled: false
     # Path to the SQLite database file (created, along with any parent directories, on first use).
@@ -101,7 +223,7 @@ config:
   # counters) to a local SQLite database - a lightweight local alternative to scraping /metrics
   # with Prometheus if you just want to see traffic trends over time. Distinct from
   # connectionTracking above: this is periodic system-wide snapshots, not per-player session
-  # history. Disabled by default. Hot-reloadable.
+  # history. Hot-reloadable.
   statsLogging:
     enabled: false
     # Path to the SQLite database file (created, along with any parent directories, on first use).
@@ -114,78 +236,10 @@ config:
     # connectionTracking.maxRecords above.
     maxRecords: 50000
 
-  # Accept a PROXY protocol (v1/v2) header at the start of every incoming connection, before the
-  # Minecraft handshake - for when MCGate itself sits behind another load balancer/proxy that
-  # needs to hand it the real client address (bind above then becomes the load balancer's address,
-  # not the public one). Distinct from a route's own `proxyProtocol`, which is MCGate *sending*
-  # that header onward to its backend - this is MCGate *receiving* one from whatever's in front of
-  # it. Whatever sits in front of MCGate must actually send this header on every connection, or
-  # every real client gets dropped as a malformed handshake. Off by default.
-  #
-  # The voicechat UDP relay has its own `udp.proxyProtocol` switch (see the `udp:` block below);
-  # it defaults to whatever this value is, so leaving it there keeps the old single-switch
-  # behaviour, but you can set it independently if your L4 front handles TCP and UDP differently.
-  proxyProtocol: false
-
-  # Anti-abuse limits for the pre-login phase of a connection - the window a connection-flood /
-  # slow-loris DDoS lives in. Only take effect on (re)start.
-  #
-  # How long a connection has to complete its handshake AND send its Login Start packet before
-  # MCGate closes it. A flood that opens sockets (and often completes the handshake) but never
-  # sends login otherwise pins a channel + an fd each. A real client sends Login Start within
-  # milliseconds of the handshake, so 10s is already very generous. Use 0 to disable. The backend
-  # dial is deferred until Login Start arrives, so bots that never send it never reach the backend.
-  loginTimeout: 10s
-  # Max simultaneous PRE-LOGIN connections from one source IP. A connection stops counting the
-  # moment it completes login (or is held for reconnect), so a real player opening a few
-  # connections in a row is unaffected while a single-source socket flood is capped. 0 =
-  # unlimited. Ignored when proxyProtocol is on (every connection would look like it came from the
-  # upstream load balancer).
-  maxConnectionsPerIp: 8
-
-  # Process-wide flood ceilings, layered on top of maxConnectionsPerIp. Read fresh per connection,
-  # so changes here apply on a hot reload. maxPerIpPerWindow is ignored when proxyProtocol is on
-  # (every connection then carries the upstream load balancer's address); maxConnections still
-  # applies.
-  connectionThrottle:
-    # Hard cap on total concurrent client connections. Over this, new TCP connections are accepted
-    # and immediately closed. 0 = unlimited (recommend setting this to a few x your real peak).
-    maxConnections: 0
-    # Max NEW connections from one source IP within `window`. A real player reconnecting a handful
-    # of times is fine; a single-source connect storm is throttled. 0 = unlimited.
-    maxPerIpPerWindow: 8
-    window: 8s
-
-  # Anti-abuse limits for the UDP relay paths - the voicechat relay (a route's `voicechat:`
-  # backend) and every static `udpProxy:` forward. UDP has no handshake to gate on and a spoofable
-  # source address, so each distinct source that sends a datagram makes MCGate open a relay
-  # session + a backend-facing socket (an fd). Read live per datagram, so changes apply on a hot
-  # reload (the UDP bind ports themselves are startup-only).
-  udpThrottle:
-    # Max concurrent relay sessions across all UDP paths combined. 0 = unlimited. Keep this well
-    # under the process file-descriptor limit (`ulimit -n` / systemd LimitNOFILE) - one fd each.
-    maxSessions: 8192
-    # Max concurrent relay sessions from one source IP. 0 = unlimited. Under proxyProtocol the
-    # voicechat path counts the real client IP from the PROXY header.
-    maxSessionsPerIp: 64
-    # Datagrams buffered per session during the brief window its backend socket is opening; past
-    # this the oldest is dropped (UDP is lossy anyway). Minimum 1.
-    pendingPacketsPerSession: 256
-    # A session with no traffic either way for this long is torn down.
-    idleTimeout: 5m
-    # A session whose backend never replies within this long of opening is torn down early - the
-    # main defence against a spoofed-source flood. 0 disables it.
-    noReplyTeardown: 20s
-
-  # Listen socket backlog (SO_BACKLOG). Startup-only. Raise on a busy public server so bursts of
-  # legitimate connections aren't dropped by the kernel during a flood.
-  soBacklog: 128
-
-  # Process-wide cap on players held in the reconnect-wait state at once (see a route's
-  # `reconnect:` block). Each held player costs a live connection + keep-alive/animation/retry
-  # timers; past this cap a would-be-held player is kicked with the route's kickMessage instead.
-  # 0 = unlimited.
-  maxHeldReconnectSessions: 500
+  # ============================================================================================
+  # ROUTES - host -> backend mappings. Higher `priority` routes are matched before lower ones,
+  # regardless of file order; default priority is 0, ties keep file order.
+  # ============================================================================================
 
   routes:
     # Simple 1:1 host -> backend mapping.

@@ -123,6 +123,9 @@ fn handle_command(state: &Arc<AppState>, line: &str) -> bool {
         "uptime" => tracing::info!("Uptime: {}", format_duration(state.started_at.elapsed())),
         "kick" => kick_command(rest),
         "transfer" => transfer_command(rest),
+        "bans" => print_bans(),
+        "ban" => ban_command(state, rest),
+        "unban" => unban_command(rest),
         "whois" => {
             if rest.is_empty() {
                 tracing::info!("Usage: whois <player>");
@@ -145,6 +148,9 @@ fn print_help() {
     tracing::info!("  transfer <player> <host:port> - send a player directly to another Minecraft server");
     tracing::info!("  routes                   - list configured routes and backend status");
     tracing::info!("  metrics [reset <index|host|all>] - show per-route byte usage, or reset a counter to zero");
+    tracing::info!("  ban <ip> [duration]      - manually ban a source IP right away (default duration: autoBan.banDuration)");
+    tracing::info!("  bans                     - list source IPs currently banned, and for how much longer");
+    tracing::info!("  unban <ip>               - lift a ban (auto- or manual) before it expires on its own");
     tracing::info!("  reload                   - re-read config.yml and messages.yml now");
     tracing::info!("  uptime                   - show how long MCGate has been running");
     tracing::info!("  version                  - show the running MCGate version");
@@ -221,6 +227,54 @@ fn transfer_command(rest: &str) {
             s.disconnect.notify_waiters();
             tracing::info!("Transferring '{}' to {target}.", s.name);
         }
+    }
+}
+
+fn print_bans() {
+    let bans = crate::net::ip_ban::ip_ban_list().active_bans();
+    if bans.is_empty() {
+        tracing::info!("No source IPs are currently auto-banned.");
+        return;
+    }
+    tracing::info!("{} source IP(s) currently auto-banned:", bans.len());
+    for (ip, seconds_left) in bans {
+        tracing::info!("  {ip} - {seconds_left}s remaining");
+    }
+}
+
+fn ban_command(state: &Arc<AppState>, rest: &str) {
+    let mut parts = rest.splitn(2, ' ');
+    let ip = parts.next().unwrap_or("").trim();
+    let duration_arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    if ip.is_empty() {
+        tracing::info!("Usage: ban <ip> [duration]  (e.g. 'ban 1.2.3.4 30m'; duration defaults to config.yml's autoBan.banDuration)");
+        return;
+    }
+    let duration_millis = match duration_arg {
+        Some(s) => match crate::config::duration::parse_duration_millis(s) {
+            Ok(ms) => ms,
+            Err(e) => {
+                tracing::info!("Invalid duration '{s}': {e}");
+                return;
+            }
+        },
+        None => state.config().auto_ban.ban_duration_millis,
+    };
+    let duration = std::time::Duration::from_millis(duration_millis.max(0) as u64);
+    crate::net::ip_ban::ip_ban_list().ban(ip, duration);
+    tracing::info!("Banned {ip} for {}s.", duration.as_secs());
+}
+
+fn unban_command(rest: &str) {
+    let ip = rest.trim();
+    if ip.is_empty() {
+        tracing::info!("Usage: unban <ip>");
+        return;
+    }
+    if crate::net::ip_ban::ip_ban_list().unban(ip) {
+        tracing::info!("Lifted the auto-ban on {ip}.");
+    } else {
+        tracing::info!("{ip} isn't currently auto-banned.");
     }
 }
 

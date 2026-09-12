@@ -39,6 +39,25 @@ fn ping_cache() -> &'static PingCache {
     INSTANCE.get_or_init(PingCache::default)
 }
 
+/// Records one auto-ban violation for `ip` (see `net::ip_ban`), logging once at the moment it
+/// actually crosses the threshold and triggers a fresh ban - not on every subsequent rejected
+/// connection attempt from the same already-banned IP, which would just be log spam for exactly
+/// the flood this exists to mitigate.
+fn record_ip_violation(cfg: &crate::config::GateConfig, ip: &str) {
+    if !cfg.auto_ban.enabled {
+        return;
+    }
+    let banned = crate::net::ip_ban::ip_ban_list().record_violation(
+        ip,
+        cfg.auto_ban.max_violations.max(1) as u32,
+        Duration::from_millis(cfg.auto_ban.violation_window_millis.max(0) as u64),
+        Duration::from_millis(cfg.auto_ban.ban_duration_millis.max(0) as u64),
+    );
+    if banned {
+        tracing::warn!("Auto-banning {ip} for {}s after repeated violations", cfg.auto_ban.ban_duration_millis / 1000);
+    }
+}
+
 pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     crate::net::ping_cache::spawn_sweeper(ping_cache());
     let bind = state.config().bind_address()?;
@@ -62,6 +81,19 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
 async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: Arc<AppState>) {
     let cfg = state.config();
 
+    // The cheapest possible rejection: a HashMap lookup, before even the global connection-cap
+    // atomic or any socket I/O. Skipped under proxy_protocol for the same reason every other
+    // per-IP guard below is - at this point (before the PROXY header is read) `peer_addr` is the
+    // upstream load balancer's address, not the real client's, so banning it would ban the load
+    // balancer. See `net::ip_ban` for why this exists on top of the other per-IP guards: it's
+    // what turns a sustained flood from a small number of repeat-offending source IPs into
+    // near-zero-cost drops instead of paying the handshake/guard-acquire cost on every attempt
+    // forever.
+    if !cfg.proxy_protocol && cfg.auto_ban.enabled && crate::net::ip_ban::ip_ban_list().is_banned(&peer_addr.ip().to_string()) {
+        tracing::debug!("Dropping connection from {peer_addr} - source IP is temporarily auto-banned");
+        return;
+    }
+
     let Some(_global_guard) = GlobalConnectionGuard::acquire(cfg.connection_throttle.max_connections) else {
         tracing::debug!("Rejecting connection from {peer_addr} - at global connection cap ({})", cfg.connection_throttle.max_connections);
         return;
@@ -74,6 +106,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
         let window = Duration::from_millis(cfg.connection_throttle.window_millis.max(0) as u64);
         if !connection_rates().try_acquire(&ip, cfg.connection_throttle.max_per_ip_per_window as u32, window) {
             tracing::debug!("Rejecting connection from {peer_addr} - over connection rate limit");
+            record_ip_violation(&cfg, &ip);
             return;
         }
     }
@@ -99,6 +132,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
     let ip_string = (!cfg.proxy_protocol).then(|| effective_addr.ip().to_string());
     let Some(mut guard) = crate::net::connection_guard::PreLoginGuard::acquire(ip_string.as_deref(), per_ip_limit) else {
         tracing::debug!("Dropping connection from {effective_addr} - over per-IP pre-login limit ({per_ip_limit})");
+        if let Some(ip) = &ip_string {
+            record_ip_violation(&cfg, ip);
+        }
         return;
     };
 
@@ -110,6 +146,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
             Ok(r) => r,
             Err(_) => {
                 tracing::debug!("Closing {effective_addr} - did not complete login within {login_timeout} ms");
+                if let Some(ip) = &ip_string {
+                    record_ip_violation(&cfg, ip);
+                }
                 return;
             }
         }
@@ -121,6 +160,9 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
         Err(HandshakeError::Eof) => return, // benign - a health-check/scanner connecting and going away
         Err(e) => {
             tracing::debug!("Rejecting connection from {effective_addr}: {e}");
+            if let Some(ip) = &ip_string {
+                record_ip_violation(&cfg, ip);
+            }
             return;
         }
     };

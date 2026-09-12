@@ -16,7 +16,7 @@ use anyhow::Result;
 use config::loader as config_loader;
 use config::messages;
 use net::api as api_server;
-use net::{dns_cache, flood_control, network_info, server};
+use net::{dns_cache, flood_control, ip_ban, network_info, server};
 use state::{app_state, connection_tracker, route_metrics_store, stats_logger};
 use udp::proxy as udp_proxy;
 use udp::{voice_relay, voice_routing};
@@ -53,7 +53,10 @@ fn parse_args() -> Option<(String, String)> {
                 return None;
             }
             "-V" | "--version" => {
-                println!("mcgate {}", version::version());
+                let dirty = if version::git_dirty() { "-dirty" } else { "" };
+                println!("mcgate {} ({}{})", version::version(), version::git_hash(), dirty);
+                println!("built {} for {}", version::build_timestamp_utc(), version::target_triple());
+                println!("{}", version::rustc_version());
                 return None;
             }
             _ => positional.push(arg),
@@ -76,6 +79,7 @@ async fn main() -> Result<()> {
     state::mark_process_start();
     dns_cache::spawn_evictor();
     flood_control::spawn_connection_rate_sweeper();
+    ip_ban::spawn_sweeper();
 
     let messages = messages::GateMessages::load_or_create_default(&messages_path)?;
     let initial_config = config::load_or_create_default(&config_path, &messages)?;
@@ -83,7 +87,10 @@ async fn main() -> Result<()> {
     let (_file_writer, log_level) = logging::init("log", &initial_config.log_level)?;
 
     println!("{BANNER}");
-    tracing::info!("MCGate v{}", version::version());
+    tracing::info!("MCGate v{}{}", version::version(), if version::git_dirty() { " (modified build)" } else { "" });
+    tracing::info!("Commit {} | Target {} | {}", version::git_hash(), version::target_triple(), version::rustc_version());
+    tracing::info!("Built {}", version::build_timestamp_utc());
+    tracing::info!("https://github.com/RNIS-TW/MCGate (MIT License)");
     network_info::log_network_interfaces();
     tracing::info!("Loaded messages from {messages_path}");
     tracing::info!("Loaded {} route(s) from {}", initial_config.routes.len(), config_path);

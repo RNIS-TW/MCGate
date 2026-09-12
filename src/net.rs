@@ -8,6 +8,7 @@ pub mod buffered_stream;
 pub mod connection_guard;
 pub mod dns_cache;
 pub mod flood_control;
+pub mod ip_ban;
 pub mod network_info;
 pub mod ping_cache;
 pub mod server;
