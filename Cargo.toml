@@ -1,0 +1,31 @@
+[package]
+name = "mcgate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+bytes = "1"
+notify-debouncer-mini = "0.4"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+flate2 = "1"
+if-addrs = "0.13"
+rustyline = "14"
+axum = "0.7"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+crossbeam-channel = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

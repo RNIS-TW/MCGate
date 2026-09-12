@@ -1,9 +1,11 @@
-target/
-!.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
-.kotlin
-dependency-reduced-pom.xml
+/target/
+# Cargo.lock is intentionally tracked, not ignored: this is a binary (an application), and the
+# Rust convention for binaries is to commit the lockfile for reproducible builds - CI builds with
+# `--locked`, which needs it present and up to date. (The opposite convention applies to library
+# crates, which is probably why this line existed originally.)
+config.yml
+messages.yml
+log/
 
 ### IntelliJ IDEA ###
 .idea/modules.xml
@@ -14,36 +16,5 @@ dependency-reduced-pom.xml
 *.iml
 *.ipr
 
-### Eclipse ###
-.apt_generated
-.classpath
-.factorypath
-.project
-.settings
-.springBeans
-.sts4-cache
-
-### NetBeans ###
-/nbproject/private/
-/nbbuild/
-/dist/
-/nbdist/
-/.nb-gradle/
-build/
-!**/src/main/**/build/
-!**/src/test/**/build/
-
-### VS Code ###
-.vscode/
-
 ### Mac OS ###
 .DS_Store
-
-### RUN ###
-run/
-### Logs ###
-log/
-*.log
-### Testing use on root folder ###
-config.yml
-messages.yml

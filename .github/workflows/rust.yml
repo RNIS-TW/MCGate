@@ -1,0 +1,65 @@
+name: Rust (MCGate)
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      # rusqlite's `bundled` feature compiles SQLite from source - both runners ship a C
+      # toolchain by default (build-essential on ubuntu-latest, Xcode CLT on macos-latest), so
+      # this needs no extra setup step; noted here since it's the one non-obvious build
+      # requirement if that ever changes.
+      - name: cargo test
+        run: cargo test --locked --all-targets
+
+  build:
+    name: Build release binary (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Smoke-test the binary
+        run: |
+          ./target/release/mcgate --version
+          ./target/release/mcgate --help
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcgate-${{ matrix.os }}
+          path: target/release/mcgate
+          if-no-files-found: error

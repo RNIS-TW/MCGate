@@ -1,176 +1,98 @@
-# MCGate
+# MCGate (Rust port)
 
-A Java/Kotlin thin, host-based reverse proxy for Minecraft servers. It routes client connections to backend servers by the hostname the client dialed, without acting as a full proxy - no session handling, no server switching, just fast connection forwarding.
+An in-progress Rust/tokio port of the Java/Kotlin MCGate proxy in the repository root. Same
+purpose — a thin, host-based reverse proxy for Minecraft servers — same `config.yml`/
+`messages.yml` format, but compiled to a single native binary instead of running on a JVM.
 
-## Features
-
-- **Host-based routing** with `*` / `?` wildcards and `$1`, `$2`, ... parameter substitution in backend addresses
-- **Per-route `priority`** - higher priority routes are matched before lower ones, regardless of file order (default `0`, ties keep file order)
-- **Multiple backends per route** with load balancing strategies: `sequential`, `random`, `round-robin`, `least-connections`, `lowest-latency`, plus automatic failover on connect failure
-- **Status ping caching** per backend, with a configurable `cachePingTTL` (or `-1s` to disable)
-- **Fallback status response** (motd/version/players/favicon) when all of a route's backends are down
-- **`modifyVirtualHost`** - rewrites the handshake hostname before forwarding to the backend
-- **Per-route `proxyProtocol`** - sends a PROXY protocol v1 header so the backend sees the real client IP
-- **DDoS / flood hardening** - `loginTimeout` closes half-open connections (slow-loris); the backend dial *and* backend DNS resolution are both deferred until the client's Login Start arrives, so a connection flood (e.g. to random subdomains on a wildcard route) never reaches the backend or the resolver; oversized handshake frames are rejected on sight; the ping and DNS caches are size-capped; optional `maxConnectionsPerIp` and `connectionThrottle` cap concurrent/new pre-login connections per source IP and process-wide; `udpThrottle` bounds the voicechat/`udpProxy` UDP relay paths (per-IP and total session caps, plus an early teardown for sessions whose backend never replies - the spoofed-source-flood defence)
-- **Hot config reload** - edits to the config file are picked up live, no restart needed (except for the `bind` address)
-- **Per-route traffic metrics** - optional cumulative upload/download byte accounting per route (`metrics:`), persisted to a JSON file off the event loop, with optional byte limits that kick players and refuse new logins once reached
-- **Bootstraps a default config** on first run if none exists
+See [`plan.md`](plan.md) for exactly what's ported, what's deliberately out of scope, and how
+each piece was verified. Short version: every section is done — config, hot reload, the TCP
+relay (handshake/status/login), backend selection strategies, per-route traffic metrics, SQLite
+connection tracking and stats logging, the UDP/voicechat relays, the console REPL, and the HTTP
+API — except mid-session auto-reconnect-holding (`ReconnectHandler.kt`), which is not ported.
 
 ## Build
 
-Requires JDK 17+ and Maven.
+Requires the Rust toolchain (stable — install via [rustup](https://rustup.rs) if you don't have
+it: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`). The `rusqlite` dependency
+compiles SQLite from source (`bundled` feature), so a C compiler needs to be on `PATH` — already
+true on macOS (Xcode command line tools) and virtually every Linux distro's build tooling; on a
+minimal server image install `build-essential` (Debian/Ubuntu) or `gcc` (RHEL/Alpine) first.
 
 ```
-mvn package -DskipTests
+cargo build --release
 ```
 
-Produces `target/MCGate-1.0-SNAPSHOT.jar`.
+Produces a single self-contained binary at `target/release/mcgate` — no JVM, no separate runtime,
+no other files to ship alongside it (`bundled` SQLite is statically linked in). Copy that one
+file to a server and run it; that's the whole deployment.
 
 ## Run
 
 ```
-java -jar target/MCGate-1.0-SNAPSHOT.jar [path/to/config.yml]
+./target/release/mcgate [config.yml] [messages.yml]
 ```
 
-If the config path doesn't exist yet, it's created from a bundled example covering every feature. Defaults to `config.yml` in the working directory.
-
-### Memory / JVM flags
-
-MCGate is a byte-relay: its own working set is tiny (a few hundred KiB per connected player). Almost all of the RSS you see is the JVM heap reservation and Netty's pooled buffer arenas, both of which size themselves off the CPU/RAM the JVM *thinks* it has. On a shared hosting node (Pterodactyl and similar) the JVM often sees the whole physical box, not your slice, and over-reserves badly - e.g. ~900 MiB resident with only ~50 players.
-
-The build already shrinks Netty's side of this (small fixed arena count, capped worker threads, a 96 MiB direct-memory ceiling - see `tuneNettyMemoryFootprint` in `Main.kt`). For the heap, pass explicit flags - for a 1 GiB container:
+Both arguments are optional and default to `config.yml`/`messages.yml` in the current directory;
+a missing file is bootstrapped from the built-in defaults on first run, same as the Kotlin build.
 
 ```
-java -Xms128m -Xmx512m \
-     -XX:+UseSerialGC \
-     -XX:MaxDirectMemorySize=128m \
-     -XX:+ExitOnOutOfMemoryError \
-     -jar MCGate-1.0-SNAPSHOT.jar
+./target/release/mcgate --help       # usage
+./target/release/mcgate --version    # prints the built version
 ```
 
-`-Xmx512m` leaves headroom for direct buffers, thread stacks, and metaspace under the 1 GiB cap. `-XX:+UseSerialGC` has the smallest footprint and actually returns freed memory to the OS, which G1 (the default) largely won't at this heap size. Scale `-Xmx` with the container: roughly `limit - 256m - (players / 500)m`.
+### Running as a service
+
+A minimal systemd unit (adjust `User`, `WorkingDirectory`, and the binary path):
+
+```ini
+[Unit]
+Description=MCGate
+After=network.target
+
+[Service]
+Type=simple
+User=mcgate
+WorkingDirectory=/opt/mcgate
+ExecStart=/opt/mcgate/mcgate config.yml messages.yml
+Restart=on-failure
+RestartSec=5
+# The process handles SIGINT itself (graceful shutdown - see main.rs); SIGTERM's default
+# behavior (immediate termination) is fine too since state is either persisted continuously
+# (SQLite, route metrics) or doesn't need draining.
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+sudo systemctl enable --now mcgate
+journalctl -u mcgate -f     # logs (also written to ./log/latest.log regardless)
+```
+
+### Memory
+
+Unlike the JVM build, there's no separate heap/arena sizing story here: no `-Xmx`, no
+`MaxDirectMemorySize`, no allocator arena tuning (see `plan.md`'s section 3 note on why
+`tuneNettyMemoryFootprint`'s equivalent isn't needed — tokio has no comparable fixed per-thread
+buffer-cache overhead that scales off a container's misreported CPU count). The binary's resident
+set is close to its actual working set: a small fixed amount for the runtime plus a modest
+per-connection cost, not a pre-reserved heap. Nothing to configure for typical deployments.
+
+## Test
+
+```
+cargo test              # unit tests + real-socket integration tests (TCP/UDP, no mocks)
+cargo build --release   # the release binary CI also builds
+```
 
 ## Continuous integration
 
-`Jenkinsfile` defines a declarative pipeline:
+`.github/workflows/rust.yml` (GitHub Actions) runs on any push or pull request:
 
-| Stage | What it does |
+| Job | What it does |
 | --- | --- |
-| Checkout | `checkout scm` and records the commit SHA; posts a `PENDING` GitHub commit status (`ci/jenkins`) |
-| Build | `mvn -B clean compile` |
-| Test | `mvn -B test -DskipTests=false` (the pom skips tests by default), publishes JUnit results, zips `surefire-reports` and archives `test-reports.zip` |
-| Package | `mvn -B package -DskipTests`, archives `target/MCGate-*.jar` |
+| `test` | `cargo test --locked` on Linux and macOS |
+| `build` | `cargo build --release --locked`, uploads the resulting binary as a workflow artifact |
 
-On completion it sets the GitHub commit status to `SUCCESS` / `FAILURE` (the check shown on commits and PRs). On pull-request builds (a Multibranch Pipeline job) it also comments on the PR with a pass/fail/skipped table and a link to the archived test report.
-
-**Jenkins setup:**
-
-- Tools named `JDK 21` and `Maven 3` configured under *Manage Jenkins → Tools*.
-- Plugins: *GitHub API for Pipeline* (`githubNotify`), *JUnit*; for PR builds/comments also *GitHub Branch Source* and *Pipeline: GitHub*.
-- A global **Username with password** credential `github-rnis` (username = a GitHub user with write access to `RNIS-TW/MCGate`, password = a token with *Commit statuses* and *Pull requests* read/write). Update `GITHUB_ACCOUNT` / `GITHUB_REPO` / `GITHUB_CRED` in `Jenkinsfile` if these differ.
-- For automatic PR builds, use a *Multibranch Pipeline* job with "Discover pull requests" and a GitHub webhook to `/github-webhook/`.
-
-**If a new branch / PR gets no build ("Checks 0"):** the job hasn't *discovered* it yet — the `pollSCM` trigger in `Jenkinsfile` only re-polls branches that already have a job, it does not discover new ones.
-- Immediate: open the Multibranch job → **Scan Repository Now**.
-- Permanent: set *Scan Repository Triggers → "Periodically if not otherwise run"* (e.g. 1 hour) as a fallback, and add a GitHub webhook (repo *Settings → Webhooks → `https://<jenkins>/github-webhook/`*, JSON, "push" + "pull request" events).
-- The Branch Source **Behaviours** must include *"Discover branches"* and *"Discover pull requests from origin"* (add *"…from forks"* if PRs come from forks).
-- If the job is a plain single-branch *Pipeline* (not *Multibranch*), it will never build PRs — recreate it as *Multibranch Pipeline*; this `Jenkinsfile` already assumes that (`env.CHANGE_ID`).
-- Note: with the PR "merge" discovery strategy, `git rev-parse HEAD` is the ephemeral merge commit, so the `ci/jenkins` status lands on a commit GitHub doesn't show on the PR. Use the *"The current pull request revision"* (head) strategy so the status attaches to the PR head.
-
-## Configuration
-
-```yaml
-config:
-  bind: 0.0.0.0:25565
-  routes:
-    - host: survival.example.com
-      backend: 127.0.0.1:25566
-
-    - host: "*.wildcard.example.com"
-      backend: "$1.servers.svc:25568"
-
-    - host: vip.wildcard.example.com
-      backend: 127.0.0.1:25573
-      priority: 10
-
-    - host: lobby.example.com
-      backend: [127.0.0.1:25569, 127.0.0.1:25570]
-      strategy: round-robin
-      cachePingTTL: 60s
-
-    - host: localhost
-      backend: 127.0.0.1:25572
-      fallback:
-        motd: Server is offline.
-        version:
-          name: "Try again later!"
-          protocol: -1
-
-    - host: metered.example.com
-      backend: 127.0.0.1:25566
-      metrics:
-        file: data/metered.example.com.json   # cumulative totals, persisted here (survives restarts)
-        upload:                                # client -> backend bytes
-          enabled: true
-          limit: -1                            # -1 = unlimited; a cap kicks players + refuses logins when reached
-        download:                              # backend -> client bytes
-          enabled: true
-          limit: 100g                          # bytes, or a k/m/g/t/p suffix (x1024); 100g = 100 GiB
-```
-
-Per-route `metrics:` accounting keeps two atomics per route in memory (no per-connection state) and flushes them to `file` as JSON from a single background thread — never on a Netty event loop. Totals load back on startup, carry across hot reloads, and are exposed via the API (`/v1/routes/{index}/metrics`, `/metrics`) and the console `metrics` command.
-
-Routes are matched in descending `priority` order (ties keep the order they appear in the file), so a specific host like `vip.wildcard.example.com` can win over an overlapping wildcard such as `*.wildcard.example.com` even though the wildcard is listed first.
-
-See `src/main/resources/default-config.yml` for a complete annotated example.
-
-## API
-
-MCGate can expose a small read-only JSON/HTTP status API. Disabled by default:
-
-```yaml
-config:
-  api:
-    enabled: false
-    bind: localhost:8080
-```
-
-Endpoints (all `GET`):
-
-| Path | Description |
-| --- | --- |
-| `/v1/routes` | All routes: hosts, backend templates, strategy, TTL, flags |
-| `/v1/routes/{index}` | A single route by its index in the config |
-| `/v1/routes/{index}/backends` | Last-known per-backend stats (active connections, latency) for non-wildcard routes |
-| `/v1/routes/{index}/ping` | Dials each backend of the route **right now** (bypassing the ping cache) and returns live online status, latency, and the raw status JSON, or an error per backend that's unreachable |
-| `/v1/routes/{index}/metrics` | This route's cumulative upload/download byte usage, configured limits, and whether a limit is exceeded (`404` unless the route enables `metrics:`) |
-| `/metrics` | Prometheus text format; per-route byte usage appears as `mcgate_route_bytes_uploaded_total` / `mcgate_route_bytes_downloaded_total` when configured. Add `?type=json` for the same data (plus per-player detail and `routeMetrics`) as JSON |
-
-The API only binds when `enabled: true`; bind it to `localhost` or a private interface unless it's behind your own auth/network controls.
-
-## Project layout
-
-```
-src/main/kotlin/me/hippodev/
-  Main.kt               - bootstrap, config hot-reload wiring, connection dispatch
-  ConfigLoader.kt        - default-config bootstrapping + file watcher
-  Config.kt               - YAML config model and parsing
-  HostPattern.kt          - wildcard host matching and $N substitution
-  BackendSelector.kt      - load balancing strategies and per-route runtime state
-  HandshakeSniffer.kt     - reads just enough of the handshake packet to route
-  LoginRelayHandler.kt    - raw TCP relay for real (login) connections
-  StatusHandler.kt        - status ping handling, caching, fallback
-  PingCache.kt            - TTL cache for backend status responses
-  StatusJson.kt           - fallback status JSON building
-  MinecraftProtocol.kt    - varint/string/packet encode-decode helpers
-src/main/resources/
-  default-config.yml      - bundled example config, copied on first run
-```
-
-```
-Jenkinsfile               - CI pipeline: checkout, build, test, package, GitHub status + PR comment
-```
-
-## License
-
-MIT - see [LICENSE](LICENSE).
+Both jobs cache the cargo registry and build output (`Swatinem/rust-cache`) so most runs only
+recompile what actually changed.
