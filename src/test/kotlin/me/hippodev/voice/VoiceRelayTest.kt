@@ -101,7 +101,7 @@ class VoiceRelayTest {
         val relayPort = freeUdpPort()
         relay.start(InetSocketAddress("127.0.0.1", relayPort))
         try {
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             val reply = sendAndAwaitReply(InetSocketAddress("127.0.0.1", relayPort), "hello-voice".toByteArray())
 
@@ -119,7 +119,7 @@ class VoiceRelayTest {
         val relayPort = freeUdpPort()
         relay.start(InetSocketAddress("127.0.0.1", relayPort))
         try {
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
             val target = InetSocketAddress("127.0.0.1", relayPort)
 
             // First session from 127.0.0.1 is allowed and relays end-to-end.
@@ -160,7 +160,7 @@ class VoiceRelayTest {
             // Routing entry is keyed by the address inside the PROXY header, not the datagram's
             // own source (which here is an ephemeral loopback port standing in for a fronting
             // proxy like Cloudflare Spectrum).
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             val framed = v2Header("127.0.0.1", 34567) + "hello-proxied".toByteArray()
             val reply = sendAndAwaitReply(InetSocketAddress("127.0.0.1", relayPort), framed)
@@ -196,7 +196,7 @@ class VoiceRelayTest {
             .bind(InetSocketAddress("127.0.0.1", 0)).sync().channel()
         val target = InetSocketAddress("127.0.0.1", relayPort)
         try {
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             // First datagram: PROXY header + payload. Rest: payload only.
             client.writeAndFlush(DatagramPacket(Unpooled.wrappedBuffer(v2Header("127.0.0.1", 4962) + "one".toByteArray()), target)).sync()
@@ -236,7 +236,7 @@ class VoiceRelayTest {
             .bind(InetSocketAddress("127.0.0.1", 0)).sync().channel()
         val target = InetSocketAddress("127.0.0.1", relayPort)
         try {
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             client.writeAndFlush(DatagramPacket(Unpooled.wrappedBuffer(v2Header("127.0.0.1", 4962) + "up".toByteArray()), target)).sync()
             assertArrayEquals("up".toByteArray(), backendReceived.poll(2, TimeUnit.SECONDS))
@@ -262,7 +262,7 @@ class VoiceRelayTest {
         val relayPort = freeUdpPort()
         relay.start(InetSocketAddress("127.0.0.1", relayPort))
         try {
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             val reply = sendAndAwaitReply(InetSocketAddress("127.0.0.1", relayPort), "no-header-here".toByteArray())
 

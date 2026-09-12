@@ -222,8 +222,9 @@ class LoginRelayHandler(
 
             val name = playerName
             val uuid = playerUuid
+            val tag = if (name != null) " ($name${uuid?.let { ", $it" } ?: ""})" else ""
             if (route.reconnect.enabled && reconnectSupported(protocolVersion) && name != null && uuid != null) {
-                log.info("All backends unreachable for host '{}', holding '{}' for reconnect", host, name)
+                log.info("All backends unreachable for host '{}', holding{} from {} for reconnect (tried {})", host, tag, clientRemoteAddress, ordered)
                 PlayerSessions.put(
                     PlayerSession(
                         name, uuid, host, clientRemoteAddress, null, System.currentTimeMillis(),
@@ -235,7 +236,7 @@ class LoginRelayHandler(
                 ctx.pipeline().replace(this, "reconnect", reconnectHandler)
                 reconnectHandler.enter(ctx.pipeline().context(reconnectHandler))
             } else {
-                log.warn("All backends unreachable for host '{}', kicking client", host)
+                log.warn("All backends unreachable for host '{}', kicking{} from {} (tried {})", host, tag, clientRemoteAddress, ordered)
                 ctx.writeAndFlush(encodeLoginDisconnect(toJsonComponent(route.kickMessage))).addListener(ChannelFutureListener.CLOSE)
             }
             return

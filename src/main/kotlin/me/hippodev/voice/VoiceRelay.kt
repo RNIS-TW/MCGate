@@ -62,6 +62,7 @@ class VoiceRelay(
      *  datagram in case the fronting proxy rotates its source port mid-session. */
     private class Session(
         val clientIp: String,
+        val host: String,
         @Volatile var lastActive: Long,
         @Volatile var via: InetSocketAddress
     ) {
@@ -194,8 +195,8 @@ class VoiceRelay(
         }
 
         val clientIp = clientAddr.address.hostAddress
-        val backendAddr = VoiceRouting.resolve(clientIp)
-        if (backendAddr == null) {
+        val route = VoiceRouting.resolve(clientIp)
+        if (route == null) {
             content.release()
             logDrop(
                 if (expectProxyProtocol)
@@ -206,6 +207,7 @@ class VoiceRelay(
             )
             return
         }
+        val backendAddr = route.backend
         val globalCap = UdpThrottle.maxSessions
         if (globalCap > 0 && sessions.size >= globalCap) {
             content.release()
@@ -218,8 +220,8 @@ class VoiceRelay(
             return
         }
 
-        log.info("Opening voicechat relay session: {} (via {}) -> {}", clientAddr, via, backendAddr)
-        val session = Session(clientIp, System.currentTimeMillis(), via)
+        log.info("Opening voicechat relay session: '{}' from {} (via {}) -> {}", route.host, clientAddr, via, backendAddr)
+        val session = Session(clientIp, route.host, System.currentTimeMillis(), via)
         sessions[clientAddr] = session
         if (expectProxyProtocol) byVia[via] = session
         forward(session, content)
@@ -290,7 +292,7 @@ class VoiceRelay(
                     session.lastActive = System.currentTimeMillis()
                     if (!session.repliedOnce) {
                         session.repliedOnce = true
-                        log.info("Voicechat backend {} replied for the first time to {}", backendAddr, clientAddr)
+                        log.debug("Voicechat backend {} replied for the first time to '{}' {}", backendAddr, session.host, clientAddr)
                     }
                     // Reply to the datagram's actual sender (the fronting L4 proxy when
                     // proxyProtocol is on, otherwise the client itself) - see [Session.via].
@@ -311,13 +313,13 @@ class VoiceRelay(
                     // same client instead of a session actually holding. The channel stays open and
                     // keeps trying; only real idle timeout ([evictStaleSessions]) or the player
                     // logging out ([VoiceRouting.unregister]) tears a session down now.
-                    log.info("Voicechat backend session error for {}: {}", clientAddr, cause.toString())
+                    log.info("Voicechat backend {} session error for '{}' {}: {}", backendAddr, session.host, clientAddr, cause.toString())
                 }
             })
 
         bootstrap.connect(backendAddr).addListener(ChannelFutureListener { future ->
             if (!future.isSuccess) {
-                log.warn("Failed to open voicechat relay session for {} -> {}: {}", clientAddr, backendAddr, future.cause()?.toString())
+                log.warn("Failed to open voicechat relay session for '{}' {} -> {}: {}", session.host, clientAddr, backendAddr, future.cause()?.toString())
                 sessions.remove(clientAddr, session)
                 closeSession(session)
                 return@ChannelFutureListener

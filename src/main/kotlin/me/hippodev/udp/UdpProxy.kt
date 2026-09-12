@@ -159,7 +159,7 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
                 }
 
                 override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
-                    log.info("UDP proxy backend session error for {}: {}", clientAddr, cause.toString())
+                    log.info("UDP proxy backend {} session error for {}: {}", config.backendAddress, clientAddr, cause.toString())
                 }
             })
 

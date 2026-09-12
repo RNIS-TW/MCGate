@@ -848,7 +848,7 @@ private fun registerVoicechatRoute(ctx: ChannelHandlerContext, route: Route, cap
     try {
         val voiceBackend = route.resolveVoicechat(captures) ?: return
         val clientAddr = ctx.channel().effectiveRemoteAddress() as? java.net.InetSocketAddress ?: return
-        VoiceRouting.register(clientAddr.address.hostAddress, voiceBackend)
+        VoiceRouting.register(clientAddr.address.hostAddress, host, voiceBackend)
         if (logConnections) {
             log.info("Voicechat route: host='{}' from {} -> {}", host, clientAddr, voiceBackend)
         }
