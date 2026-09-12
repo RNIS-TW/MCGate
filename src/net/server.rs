@@ -370,6 +370,16 @@ async fn handle_login(
 
                 register_voicechat_route(route, captures, client_addr, &handshake.host, state.config().log_connections).await;
 
+                // Observe the backend's real Login-state response just long enough to learn its
+                // actual compression threshold and whether it's encrypted - needed for `kick
+                // <player> <message>` and `transfer` to frame an injected packet correctly later
+                // (see `sniff_backend_login`'s doc). `unwrap_or((-1, false))` on a sniff failure
+                // (backend closed/errored mid-login-response) matches this connection's prior
+                // always-hardcoded behavior rather than changing failover semantics here - the
+                // now-dead backend fails the same way in `relay`'s own read loop either way.
+                let mut backend = BufferedStream::new(backend);
+                let (compression_threshold, encrypted) = sniff_backend_login(stream, &mut backend).await.unwrap_or((-1, false));
+
                 let session = parsed_login.as_ref().and_then(|(name, uuid)| {
                     let uuid = (*uuid)?;
                     let session = Arc::new(PlayerSession {
@@ -380,14 +390,15 @@ async fn handle_login(
                         backend: Some(*addr),
                         connected_at_millis: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0),
                         protocol_version: handshake.protocol_version,
-                        compression_threshold: -1,
-                        encrypted: false,
+                        compression_threshold,
+                        encrypted,
                         login_attempts: std::sync::atomic::AtomicU32::new(1),
                         packets_sent: std::sync::atomic::AtomicI64::new(0),
                         packets_received: std::sync::atomic::AtomicI64::new(0),
                         bytes_sent: std::sync::atomic::AtomicI64::new(0),
                         bytes_received: std::sync::atomic::AtomicI64::new(0),
                         disconnect: tokio::sync::Notify::new(),
+                        pending_action: std::sync::Mutex::new(crate::state::SessionAction::default()),
                     });
                     player_sessions().put(session.clone());
                     Some(session)
@@ -469,77 +480,202 @@ async fn dial_backend(route: &Route, addr: SocketAddr, handshake: &crate::protoc
     Ok(backend)
 }
 
-/// The actual byte splice, once a backend is connected. A custom loop (not
-/// `tokio::io::copy_bidirectional`) because live per-session/per-route byte counters
-/// (`PlayerSession`, `RouteMetricsStore`) need to see bytes as they flow, not only a final total
-/// after the connection ends — and because a console/API `kick` needs a way to interrupt the
-/// splice, via `session.disconnect`. Backpressure is still equivalent to
+/// Observes the backend's Login-state response just long enough to learn the connection's real
+/// compression threshold and whether it's encrypted, forwarding every frame it reads to the
+/// client unmodified along the way (`relay` takes over as a raw byte splice the moment this
+/// returns, using whatever it determined). Also relays client -> backend bytes unmodified for the
+/// same window: some backends (e.g. a "modern"/secure proxy-forwarding plugin) send a Login
+/// Plugin Request expecting a Login Plugin Response from the client before continuing, and
+/// without forwarding that direction too during this window, the response would never reach the
+/// backend and the login would hang forever.
+///
+/// Only Login-state packet IDs are used here (`0x00` Disconnect, `0x01` Encryption Request,
+/// `0x02` Login Success, `0x03` Set Compression) — these have been stable across every Minecraft
+/// version since compression/encryption were introduced, unlike Configuration/Play IDs (which
+/// shift release to release, see `reconnect_protocol.rs`'s file header), so this deliberately
+/// stops the instant Login Success arrives rather than trying to track anything past Login state.
+///
+/// The moment an Encryption Request is observed, every packet the backend sends from then on is
+/// ciphertext MCGate never has the key for — trying to parse any of it as a plaintext frame would
+/// be reading garbage, not a real protocol violation, so this returns immediately with
+/// `encrypted: true` rather than attempting another read.
+///
+/// Returns `None` if the backend closes/errors before Login Success arrives (nothing real to
+/// report — `relay`'s own read loop will surface the same failure immediately once it starts) or
+/// a frame turns out unparsable for any other reason (never trust `compression_threshold` off a
+/// read that's already suspect).
+async fn sniff_backend_login(client: &mut BufferedStream<TcpStream>, backend: &mut BufferedStream<TcpStream>) -> Option<(i32, bool)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut compression_threshold: i32 = -1;
+    let mut upload_buf = [0u8; 4096];
+
+    // A single loop selecting fresh per-iteration futures - not two long-lived closures each
+    // needing both `client` and `backend` for their own entire lifetime (`client` read in one,
+    // written in the other; same for `backend`) - which the borrow checker can't allow, since
+    // both would be live at once for as long as the whole sniff runs. Each iteration's two
+    // branch futures only ever borrow one of the two variables apiece; `select!` drops
+    // whichever branch didn't win before running the winner's body, so there's no overlap.
+    loop {
+        tokio::select! {
+            result = client.read(&mut upload_buf) => {
+                let n = match result {
+                    Ok(0) | Err(_) => return None,
+                    Ok(n) => n,
+                };
+                if backend.write_all(&upload_buf[..n]).await.is_err() {
+                    return None;
+                }
+            }
+            frame_result = tokio::time::timeout(Duration::from_secs(10), backend.read_frame(MAX_PACKET_BYTES)) => {
+                let frame = match frame_result {
+                    Ok(Ok(f)) => f,
+                    _ => return None,
+                };
+                if client.write_all(&frame).await.is_err() {
+                    return None;
+                }
+                let (_len, header_len) = read_var_int(&frame).ok()?;
+                match crate::protocol::compression::read_compressed_frame(&frame[header_len..], compression_threshold) {
+                    Ok((0x01, _)) => return Some((compression_threshold, true)), // Encryption Request
+                    Ok((0x03, fields)) => {
+                        // Set Compression: a single VarInt field, the new threshold.
+                        if let Ok((threshold, _)) = read_var_int(&fields) {
+                            compression_threshold = threshold;
+                        }
+                    }
+                    Ok((0x02, _)) => return Some((compression_threshold, false)), // Login Success
+                    Ok((0x00, _)) => return None,                                 // Disconnect (login)
+                    Ok(_) => {}   // Login Plugin Request or anything else - not relevant here
+                    Err(_) => return Some((compression_threshold, true)), // unparsable - assume the worst
+                }
+            }
+        }
+    }
+}
+
+/// The actual byte splice, once a backend is connected and its Login-state response has been
+/// sniffed. A custom loop (not `tokio::io::copy_bidirectional`) because live per-session/per-route
+/// byte counters (`PlayerSession`, `RouteMetricsStore`) need to see bytes as they flow, not only a
+/// final total after the connection ends — and because a console/API `kick`/`transfer` needs to
+/// both interrupt the splice AND (when the session isn't encrypted) write one real packet into it
+/// first, via `session.disconnect` + `session.pending_action`. Backpressure is still equivalent to
 /// `copy_bidirectional`/Netty's water-mark-driven `pauseOrResumeReads`: each direction only reads
 /// more once its own `write_all` call has returned, so a slow reader on one side naturally stalls
 /// reads from the other via normal `AsyncRead`/`AsyncWrite` polling - nothing extra to port for
 /// `FlowControl.kt`.
-async fn relay(client: &mut BufferedStream<TcpStream>, backend: TcpStream, session: Option<&PlayerSession>, route_counter: Option<&crate::state::route_metrics_store::RouteTrafficCounter>) {
+///
+/// A single loop selecting between three branches each iteration (rather than two long-lived
+/// upload/download futures plus a `disconnect` watch, as this originally was) so that the
+/// disconnect/pending-action branch can also write to `client_w` — a pre-built `download` future
+/// would hold an exclusive borrow of it for its own entire lifetime, which the borrow checker
+/// won't let a sibling `select!` branch also touch.
+async fn relay(client: &mut BufferedStream<TcpStream>, backend: BufferedStream<TcpStream>, session: Option<&PlayerSession>, route_counter: Option<&crate::state::route_metrics_store::RouteTrafficCounter>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut client_r, mut client_w) = tokio::io::split(client);
     let (mut backend_r, mut backend_w) = tokio::io::split(backend);
+    let mut upload_buf = [0u8; 8192];
+    let mut download_buf = [0u8; 8192];
 
-    let upload = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = match client_r.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            if let Some(s) = session {
-                s.packets_sent.fetch_add(1, Ordering::Relaxed);
-                s.bytes_sent.fetch_add(n as i64, Ordering::Relaxed);
+    loop {
+        tokio::select! {
+            result = client_r.read(&mut upload_buf) => {
+                let n = match result {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                if let Some(s) = session {
+                    s.packets_sent.fetch_add(1, Ordering::Relaxed);
+                    s.bytes_sent.fetch_add(n as i64, Ordering::Relaxed);
+                }
+                if let Some(c) = route_counter {
+                    c.add_upload(n as i64);
+                }
+                if backend_w.write_all(&upload_buf[..n]).await.is_err() {
+                    break;
+                }
             }
-            if let Some(c) = route_counter {
-                c.add_upload(n as i64);
+            result = backend_r.read(&mut download_buf) => {
+                let n = match result {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                if let Some(s) = session {
+                    s.packets_received.fetch_add(1, Ordering::Relaxed);
+                    s.bytes_received.fetch_add(n as i64, Ordering::Relaxed);
+                }
+                if let Some(c) = route_counter {
+                    c.add_download(n as i64);
+                }
+                if client_w.write_all(&download_buf[..n]).await.is_err() {
+                    break;
+                }
             }
-            if backend_w.write_all(&buf[..n]).await.is_err() {
-                return;
-            }
-        }
-    };
-    let download = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = match backend_r.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
-            if let Some(s) = session {
-                s.packets_received.fetch_add(1, Ordering::Relaxed);
-                s.bytes_received.fetch_add(n as i64, Ordering::Relaxed);
-            }
-            if let Some(c) = route_counter {
-                c.add_download(n as i64);
-            }
-            if client_w.write_all(&buf[..n]).await.is_err() {
-                return;
-            }
-        }
-    };
-
-    match session {
-        Some(s) => {
-            tokio::select! {
-                _ = upload => {},
-                _ = download => {},
-                _ = s.disconnect.notified() => {
-                    tracing::debug!("Session for '{}' interrupted by kick", s.name);
-                },
-            }
-        }
-        None => {
-            tokio::select! {
-                _ = upload => {},
-                _ = download => {},
+            _ = wait_for_pending_action(session) => {
+                if let Some(s) = session {
+                    handle_pending_action(s, &mut client_w).await;
+                }
+                break;
             }
         }
     }
+}
+
+/// `None` never fires - a session-less relay (status/no-UUID logins) has nothing to be kicked or
+/// transferred by, so this branch of `relay`'s `select!` should just never win.
+async fn wait_for_pending_action(session: Option<&PlayerSession>) {
+    match session {
+        Some(s) => s.disconnect.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Runs whatever `session.pending_action` was set to when `session.disconnect` last fired,
+/// writing a real packet to the client first for the two variants that need one - unless the
+/// session is encrypted or its protocol version isn't in `reconnect_protocol`'s verified bracket,
+/// in which case this falls back to a plain disconnect (the original, message-less `kick`
+/// behavior) rather than risk corrupting the stream with a packet framed on a guess.
+async fn handle_pending_action<W: tokio::io::AsyncWrite + Unpin>(session: &PlayerSession, client_w: &mut W) {
+    use tokio::io::AsyncWriteExt;
+
+    let action = std::mem::take(&mut *session.pending_action.lock().unwrap());
+    let (verb, packet) = match action {
+        crate::state::SessionAction::Disconnect => {
+            tracing::debug!("Session for '{}' interrupted by kick", session.name);
+            return;
+        }
+        crate::state::SessionAction::KickWithMessage(msg) if can_inject_packet(session) => {
+            let ids = crate::protocol::reconnect_protocol::reconnect_packet_ids(session.protocol_version);
+            let rendered = crate::protocol::text_format::to_legacy_text(&msg);
+            ("kick", crate::protocol::reconnect_protocol::encode_play_disconnect(&ids, &rendered, session.compression_threshold))
+        }
+        crate::state::SessionAction::Transfer { host, port } if can_inject_packet(session) => {
+            let ids = crate::protocol::reconnect_protocol::reconnect_packet_ids(session.protocol_version);
+            ("transfer", crate::protocol::reconnect_protocol::encode_transfer(&ids, &host, port, session.compression_threshold))
+        }
+        other => {
+            tracing::debug!(
+                "Can't {} '{}' with a message - session is encrypted or protocol {} is unsupported for packet injection, disconnecting instead",
+                if matches!(other, crate::state::SessionAction::Transfer { .. }) { "transfer" } else { "kick" },
+                session.name,
+                session.protocol_version,
+            );
+            return;
+        }
+    };
+    if let Err(e) = client_w.write_all(&packet).await {
+        tracing::debug!("Failed to send {verb} packet to '{}': {e}", session.name);
+    }
+}
+
+/// Whether it's safe to write a synthesized packet into `session`'s connection: the session must
+/// not be encrypted (MCGate never has the shared secret, so it can't produce a packet the
+/// client's cipher would decrypt correctly) and its protocol version must be one
+/// `reconnect_protocol` has a verified packet-ID bracket for (packet IDs otherwise aren't known to
+/// be correct for that version, and `reconnect_packet_ids` would panic).
+fn can_inject_packet(session: &PlayerSession) -> bool {
+    !session.encrypted && crate::protocol::reconnect_protocol::reconnect_supported(session.protocol_version)
 }
 
 /// Records this connecting client's IP -> voicechat backend mapping (`voice_routing.rs`) if
@@ -566,6 +702,7 @@ async fn register_voicechat_route(route: &Route, captures: &[String], client_add
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     #[test]
     fn is_valid_status_json_requires_numeric_protocol() {
@@ -574,5 +711,135 @@ mod tests {
         assert!(!is_valid_status_json(r#"{"version":{"protocol":"not-a-number"}}"#));
         assert!(!is_valid_status_json("not json at all"));
         assert!(!is_valid_status_json(r#"{"no_version_field":true}"#));
+    }
+
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_var_int(&mut out, payload.len() as i32);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn packet(id: i32, fields: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        write_var_int(&mut payload, id);
+        payload.extend_from_slice(fields);
+        frame(&payload)
+    }
+
+    /// Connects a real client<->"backend" TCP pair and runs `sniff_backend_login` against
+    /// whatever the given closure writes as the backend's response, returning its result plus
+    /// everything the (simulated) client side received - real sockets, not an in-memory mock,
+    /// same reasoning as `backend_pinger`'s tests: this is on the connection-accept hot path and
+    /// deserves the same real-protocol-bytes-over-a-real-socket confidence as everything else
+    /// here.
+    async fn run_sniff(backend_writes: Vec<u8>) -> (Option<(i32, bool)>, Vec<u8>) {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut sock, &backend_writes).await.unwrap();
+            // Keep the socket open briefly so a client-side write (Login Plugin Response, etc.)
+            // has somewhere to land instead of an immediate reset, then let it drop/close.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let client_task = tokio::spawn(async move {
+            let (mut sock, _) = client_listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_millis(200), tokio::io::AsyncReadExt::read_to_end(&mut sock, &mut received)).await;
+            received
+        });
+
+        let client_side = tokio::net::TcpStream::connect(client_addr).await.unwrap();
+        let backend_side = tokio::net::TcpStream::connect(backend_addr).await.unwrap();
+        let mut client = BufferedStream::new(client_side);
+        let mut backend = BufferedStream::new(backend_side);
+
+        let result = sniff_backend_login(&mut client, &mut backend).await;
+        drop(client);
+        backend_task.await.unwrap();
+        let received = client_task.await.unwrap();
+        (result, received)
+    }
+
+    #[tokio::test]
+    async fn login_success_with_no_compression_or_encryption() {
+        let (result, forwarded) = run_sniff(packet(0x02, b"whatever fields")).await;
+        assert_eq!(result, Some((-1, false)));
+        assert_eq!(forwarded, packet(0x02, b"whatever fields"));
+    }
+
+    #[tokio::test]
+    async fn set_compression_then_login_success_reports_the_threshold() {
+        let mut backend_writes = packet(0x03, &{
+            let mut v = Vec::new();
+            write_var_int(&mut v, 256);
+            v
+        });
+        // Once Set Compression is sent, every packet after it - Login Success included - uses
+        // compressed-style framing (a leading `data_length` VarInt, `0` here since the payload
+        // is under the threshold) even though `packet()` above always writes the pre-compression
+        // shape; a real backend never mixes the two, so build this one with the actual
+        // production `compression::frame` instead of `packet()`.
+        let mut login_success_payload = Vec::new();
+        write_var_int(&mut login_success_payload, 0x02);
+        backend_writes.extend_from_slice(&crate::protocol::compression::frame(&login_success_payload, 256));
+        let (result, _forwarded) = run_sniff(backend_writes).await;
+        assert_eq!(result, Some((256, false)));
+    }
+
+    #[tokio::test]
+    async fn encryption_request_stops_immediately_and_reports_encrypted() {
+        // A real Encryption Request has more fields (server id, public key, verify token) - none
+        // of them matter here since sniffing only reacts to the packet id.
+        let (result, _forwarded) = run_sniff(packet(0x01, b"pretend-encryption-request-fields")).await;
+        assert_eq!(result, Some((-1, true)));
+    }
+
+    #[tokio::test]
+    async fn disconnect_before_login_success_reports_nothing() {
+        let (result, _forwarded) = run_sniff(packet(0x00, b"kicked")).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn backend_closing_mid_response_reports_nothing() {
+        // Set Compression arrives, then the backend vanishes before Login Success - never
+        // fabricate a result off an incomplete login.
+        let backend_writes = packet(0x03, &{
+            let mut v = Vec::new();
+            write_var_int(&mut v, 64);
+            v
+        });
+        let (result, _forwarded) = run_sniff(backend_writes).await;
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn can_inject_packet_refuses_encrypted_or_unsupported_sessions() {
+        let base = |protocol_version: i32, encrypted: bool| crate::state::PlayerSession {
+            name: "Steve".into(),
+            uuid: uuid::Uuid::new_v4(),
+            host: "example.com".into(),
+            remote_address: "127.0.0.1:0".into(),
+            backend: None,
+            connected_at_millis: 0,
+            protocol_version,
+            compression_threshold: -1,
+            encrypted,
+            login_attempts: std::sync::atomic::AtomicU32::new(1),
+            packets_sent: std::sync::atomic::AtomicI64::new(0),
+            packets_received: std::sync::atomic::AtomicI64::new(0),
+            bytes_sent: std::sync::atomic::AtomicI64::new(0),
+            bytes_received: std::sync::atomic::AtomicI64::new(0),
+            disconnect: tokio::sync::Notify::new(),
+            pending_action: std::sync::Mutex::new(crate::state::SessionAction::default()),
+        };
+        assert!(can_inject_packet(&base(776, false)));
+        assert!(!can_inject_packet(&base(776, true)), "an encrypted session must never be injected into");
+        assert!(!can_inject_packet(&base(1, false)), "an unverified/unsupported protocol version must never be injected into");
     }
 }

@@ -19,10 +19,13 @@
 //! back to plain automatically if stdin/stdout turn out not to both be a real pty, or if
 //! `rustyline` fails to initialize.
 //!
-//! `kick` really disconnects a live session now (`PlayerSession::disconnect`, awaited alongside
-//! the relay splice in `server.rs`) but can't carry a message — see `state.rs`'s `PlayerSession`
-//! doc for why. `transfer` still just reports "not yet supported": a real Play-state `transfer`
-//! packet needs the same compression-threshold framing knowledge kick messages do.
+//! `kick` (with or without a message) and `transfer` both work against a live session now:
+//! `server.rs`'s `sniff_backend_login` learns the connection's real compression threshold and
+//! whether it's encrypted during login, `PlayerSession.pending_action` carries what to actually
+//! do, and `relay`'s `disconnect`-notified branch does the write. Either falls back to a plain,
+//! message-less disconnect (logged at debug) for a session that turns out encrypted or on a
+//! protocol version `reconnect_protocol` doesn't have a verified packet-ID bracket for — see
+//! `state.rs`'s `SessionAction`/`PlayerSession` docs and `server.rs`'s `can_inject_packet`.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -187,13 +190,11 @@ fn kick_command(rest: &str) {
     match player_sessions().find_by_name(name) {
         None => tracing::info!("No player named '{name}' is connected."),
         Some(s) => {
-            if message.is_some() {
-                // See state.rs's PlayerSession doc: a message-carrying kick needs the
-                // connection's negotiated compression threshold, which needs backend login
-                // sniffing (not ported) to know safely - silently dropping the message here
-                // rather than risking a corrupted packet on a connection MCGate can't safely
-                // write an ad-hoc frame into.
-                tracing::debug!("kick message ignored for '{}' - message-carrying kick isn't supported yet", s.name);
+            if let Some(msg) = message {
+                // relay()'s pending-action handler (server.rs) itself falls back to a plain
+                // disconnect if the session turns out encrypted/unsupported for injection - see
+                // its doc and state.rs's `SessionAction`/`PlayerSession` docs for why.
+                *s.pending_action.lock().unwrap() = crate::state::SessionAction::KickWithMessage(msg.to_string());
             }
             s.disconnect.notify_waiters();
             tracing::info!("Kicked '{}'.", s.name);
@@ -211,11 +212,15 @@ fn transfer_command(rest: &str) {
     }
     match player_sessions().find_by_name(name) {
         None => tracing::info!("No player named '{name}' is connected."),
-        // A real transfer needs a Play-state `transfer` packet framed with the connection's
-        // negotiated compression threshold - same limitation as a message-carrying kick (see
-        // state.rs's PlayerSession doc). Not supported yet; report that plainly rather than
-        // silently doing nothing.
-        Some(s) => tracing::info!("Can't transfer '{}': not yet supported (needs backend login sniffing for correct packet framing)", s.name),
+        Some(s) => {
+            let (host, port) = crate::config::split_host_port(target, 25565);
+            // relay()'s pending-action handler (server.rs) checks whether this session is
+            // actually encrypted/protocol-supported before honoring this, and falls back to a
+            // plain disconnect (logged at debug) if not - see its doc for why.
+            *s.pending_action.lock().unwrap() = crate::state::SessionAction::Transfer { host, port };
+            s.disconnect.notify_waiters();
+            tracing::info!("Transferring '{}' to {target}.", s.name);
+        }
     }
 }
 

@@ -176,7 +176,10 @@ impl Route {
     }
 }
 
-fn split_host_port(value: &str, default_port: u16) -> (String, u16) {
+/// Also used by the console `transfer` command to parse its `<host:port>` argument - that one
+/// deliberately doesn't resolve/validate the host at all, since it's the *client* that connects
+/// to it after receiving the `transfer` packet, not MCGate.
+pub(crate) fn split_host_port(value: &str, default_port: u16) -> (String, u16) {
     match value.rfind(':') {
         Some(i) => (value[..i].to_string(), value[i + 1..].parse().unwrap_or(default_port)),
         None => (value.to_string(), default_port),

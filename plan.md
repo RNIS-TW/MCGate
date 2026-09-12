@@ -231,11 +231,17 @@ connection, and — since it shares the same `RouteRuntime` — `active`/`latenc
       `server.rs` on every real login (and removed on disconnect), with live packet/byte counters
       updated as bytes actually flow through the relay (see section 5's custom relay loop below).
       `kick` really disconnects a live session now, via `PlayerSession::disconnect` (a
-      `tokio::sync::Notify` the relay task selects on alongside the byte splice). **Still can't
-      carry a kick message or support `transfer`**: both need the connection's negotiated
-      compression threshold to frame a packet safely, which needs backend login sniffing
-      (`BackendLoginSniffer` — deliberately not ported, see section 3's notes) to know without
-      risking corrupting the stream. Reports this plainly rather than silently no-op'ing.
+      `tokio::sync::Notify` the relay task selects on alongside the byte splice).
+      **Update**: `kick <player> <message>` and `transfer` are both implemented now too —
+      `server::sniff_backend_login` (a scoped, from-scratch replacement for `BackendLoginSniffer`,
+      not a port of it: it only watches Login-state packet IDs 0x00-0x03, which are stable across
+      every version, and deliberately stops the instant Login Success arrives rather than trying
+      to track Configuration/Play IDs, which shift release to release) learns the real
+      compression threshold and whether the session is encrypted during login, and
+      `PlayerSession.pending_action` + `relay`'s `disconnect`-notified branch (`server.rs`) does
+      the actual packet write. Both fall back to a plain, message-less disconnect for a session
+      that turns out encrypted or on an unverified protocol version, rather than risk corrupting
+      the stream.
 - [x] `live_metrics.rs` — `state::collect_metrics` now actually resolves non-wildcard routes'
       backends and reads real `RouteRuntime`/`RouteMetricsStore` data, instead of hardcoding
       zero/empty. Made `async` (it now awaits DNS resolution) — updated its one caller

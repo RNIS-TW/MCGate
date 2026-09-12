@@ -129,6 +129,21 @@ fn spawn_fake_backend() -> SocketAddr {
                     let _login_len = read_var_int(&mut stream);
                     let mut rest = vec![0u8; _login_len as usize];
                     stream.read_exact(&mut rest).unwrap();
+                    // A real, framed Login Success (0x02) - mcgate's `sniff_backend_login`
+                    // watches for this before falling back to a raw byte splice, and without a
+                    // real one here it would sit waiting (up to its own timeout) for a login
+                    // response that never properly arrives. Field contents don't matter, only
+                    // the packet id.
+                    let mut payload = Vec::new();
+                    write_var_int(&mut payload, 0x02);
+                    payload.extend_from_slice(&[0u8; 16]); // uuid (dummy)
+                    write_string(&mut payload, "Steve");
+                    write_var_int(&mut payload, 0); // properties count
+                    payload.extend_from_slice(&[0u8; 16]); // session id (dummy)
+                    let mut frame = Vec::new();
+                    write_var_int(&mut frame, payload.len() as i32);
+                    frame.extend_from_slice(&payload);
+                    let _ = stream.write_all(&frame);
                     let _ = stream.write_all(b"HELLO-FROM-BACKEND");
                     let mut buf = [0u8; 256];
                     loop {
@@ -221,6 +236,13 @@ fn status_ping_and_login_relay_over_real_sockets() {
         let mut stream = TcpStream::connect(mcgate_addr).unwrap();
         stream.write_all(&encode_handshake(767, "test.example.com", mcgate_port, 2)).unwrap();
         stream.write_all(&encode_login_start("Steve")).unwrap();
+
+        // mcgate's login sniffer forwards the backend's real Login Success frame to the client
+        // unmodified before the raw splice takes over - skip past it (by its own length prefix)
+        // rather than assuming a fixed size, same as a real client would.
+        let login_success_len = read_var_int(&mut stream) as usize;
+        let mut login_success_buf = vec![0u8; login_success_len];
+        stream.read_exact(&mut login_success_buf).unwrap();
 
         let mut greeting = [0u8; "HELLO-FROM-BACKEND".len()];
         stream.read_exact(&mut greeting).unwrap();

@@ -91,6 +91,23 @@ Plain `cargo build --target ...` isn't enough for cross-OS builds — it still u
 linker, which can't produce a Linux glibc binary from macOS. `cross` runs the build inside a
 Docker container with the right target toolchain instead.
 
+`cross` writes the binary back out through a bind mount from inside that container, so it doesn't
+always come back execute-bit-set (or even owned by you) on the host side — if the server says
+`Permission denied` on startup, `chmod +x mcgate` (or `sudo chown` first, if it's owned by root)
+before running it. [`build.sh`](build.sh) does this for you automatically (see below).
+
+### `build.sh`: an interactive build picker
+
+```
+./build.sh
+```
+
+An arrow-key menu over the targets above — `Up`/`Down` to move, `Space` to check one or more,
+`A` to select all, `Enter` to build. Installs the needed `rustup` target and `cross` automatically,
+picks plain `cargo build` vs. `cross build` per target the same way this section does, and
+`chmod +x`'s the result. Non-interactive: `./build.sh <target-triple> [<target-triple> ...]`,
+`./build.sh --all`, or `./build.sh --list` to see the known targets.
+
 ## Run
 
 ```

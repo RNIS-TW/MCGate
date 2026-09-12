@@ -20,14 +20,34 @@ use uuid::Uuid;
 
 use crate::config::Route;
 
+/// What a `disconnect.notify_waiters()` wake-up should actually do, checked by `server::relay`
+/// right after it wakes: a plain kick just ends the splice (the original, message-less
+/// behavior); the other two write a real packet to the client first. `compression_threshold`/
+/// `encrypted` (learned by `server::sniff_backend_login` during login) gate whether that's safe
+/// - an encrypted session's traffic is opaque to MCGate (it never sees the shared secret), so
+/// writing an unframed/wrongly-framed packet into it would corrupt the stream rather than be
+/// understood; `relay` falls back to a plain disconnect in that case instead.
+#[derive(Debug, Clone, Default)]
+pub enum SessionAction {
+    #[default]
+    Disconnect,
+    KickWithMessage(String),
+    Transfer {
+        host: String,
+        port: u16,
+    },
+}
+
 /// One connected player. Mirrors `PlayerSession` in `PlayerSessions.kt`, minus `channel: Channel`
 /// (Netty-specific) — replaced by `disconnect`, a `Notify` the owning relay task (`server.rs`)
 /// awaits alongside the byte splice, so the console `kick`/API-triggered disconnect can end a
-/// live connection. Unlike the Kotlin version, this can't carry a kick *message* yet: doing so
-/// correctly requires knowing the connection's negotiated compression threshold, which needs
-/// backend login sniffing (deliberately not ported — see plan.md section 3) since writing an
-/// unframed packet into a compressed/encrypted stream would corrupt it. A kicked player is simply
-/// disconnected, same as Kotlin's own fallback path for a connection it can't safely message.
+/// live connection, plus `pending_action` (what to actually do on that wake-up - see
+/// `SessionAction`). `compression_threshold`/`encrypted` are learned per-session by
+/// `server::sniff_backend_login` observing the backend's real Login-state response (Set
+/// Compression / Encryption Request) — not guessed or hardcoded — which is what makes a real
+/// message-carrying kick and `transfer` possible: injecting a packet into an already-established
+/// connection has to match whatever framing the client's decoder already expects, or it
+/// corrupts the stream.
 pub struct PlayerSession {
     pub name: String,
     pub uuid: Uuid,
@@ -45,6 +65,7 @@ pub struct PlayerSession {
     pub bytes_sent: AtomicI64,
     pub bytes_received: AtomicI64,
     pub disconnect: Notify,
+    pub pending_action: Mutex<SessionAction>,
 }
 
 /// Process-wide registry of currently connected players, keyed by UUID — mirrors
@@ -333,6 +354,7 @@ mod tests {
             bytes_sent: AtomicI64::new(0),
             bytes_received: AtomicI64::new(0),
             disconnect: Notify::new(),
+            pending_action: Mutex::new(SessionAction::default()),
         })
     }
 
