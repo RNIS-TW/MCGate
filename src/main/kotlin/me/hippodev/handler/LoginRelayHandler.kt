@@ -18,6 +18,7 @@ import me.hippodev.routing.*
 import me.hippodev.protocol.*
 import me.hippodev.tracking.ConnectionRecord
 import me.hippodev.tracking.ConnectionTracker
+import me.hippodev.tracking.RouteMetricsStore
 import me.hippodev.voice.VoiceRouting
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
@@ -102,6 +103,11 @@ class LoginRelayHandler(
     private val packetsToClient = java.util.concurrent.atomic.AtomicLong(0)
     private val bytesToClient = java.util.concurrent.atomic.AtomicLong(0)
     private var trackingFlushed = false
+    /** Process-wide per-route upload/download byte counter, or null when this route has no active
+     *  `metrics:` block. Just an [java.util.concurrent.atomic.AtomicLong] pair - see
+     *  [RouteMetricsStore]; incrementing it on the event loop already handling this packet costs a
+     *  few nanoseconds and holds no per-connection state. */
+    private val trafficCounter = RouteMetricsStore.handle(route)
 
     /** Must be called explicitly right after this handler is added to the pipeline -
      *  channelActive() will not fire since the channel is already active by then. */
@@ -137,8 +143,10 @@ class LoginRelayHandler(
             beginConnect(ctx)
         }
         val backend = backendChannel
+        val upBytes = buf.readableBytes().toLong()
         packetsToBackend.incrementAndGet()
-        bytesToBackend.addAndGet(buf.readableBytes().toLong())
+        bytesToBackend.addAndGet(upBytes)
+        trafficCounter?.addUpload(upBytes)
         if (backend != null && backend.isActive) {
             backend.writeAndFlush(buf)
         } else if (pendingReleased) {
@@ -214,8 +222,9 @@ class LoginRelayHandler(
 
             val name = playerName
             val uuid = playerUuid
+            val tag = if (name != null) " ($name${uuid?.let { ", $it" } ?: ""})" else ""
             if (route.reconnect.enabled && reconnectSupported(protocolVersion) && name != null && uuid != null) {
-                log.info("All backends unreachable for host '{}', holding '{}' for reconnect", host, name)
+                log.info("All backends unreachable for host '{}', holding{} from {} for reconnect (tried {})", host, tag, clientRemoteAddress, ordered)
                 PlayerSessions.put(
                     PlayerSession(
                         name, uuid, host, clientRemoteAddress, null, System.currentTimeMillis(),
@@ -227,7 +236,7 @@ class LoginRelayHandler(
                 ctx.pipeline().replace(this, "reconnect", reconnectHandler)
                 reconnectHandler.enter(ctx.pipeline().context(reconnectHandler))
             } else {
-                log.warn("All backends unreachable for host '{}', kicking client", host)
+                log.warn("All backends unreachable for host '{}', kicking{} from {} (tried {})", host, tag, clientRemoteAddress, ordered)
                 ctx.writeAndFlush(encodeLoginDisconnect(toJsonComponent(route.kickMessage))).addListener(ChannelFutureListener.CLOSE)
             }
             return
@@ -428,8 +437,10 @@ class LoginRelayHandler(
 
             buf.readerIndex(frameStart)
             val frameBytes = buf.readRetainedSlice(frameEnd - frameStart)
+            val downBytes = frameBytes.readableBytes().toLong()
             packetsToClient.incrementAndGet()
-            bytesToClient.addAndGet(frameBytes.readableBytes().toLong())
+            bytesToClient.addAndGet(downBytes)
+            trafficCounter?.addDownload(downBytes)
             if (clientChannel.isActive) clientChannel.writeAndFlush(frameBytes) else frameBytes.release()
 
             if (packetId == LOGIN_ENCRYPTION_REQUEST) {
@@ -488,8 +499,10 @@ class LoginRelayHandler(
         }
 
         override fun channelRead0(ctx: ChannelHandlerContext, msg: ByteBuf) {
+            val downBytes = msg.readableBytes().toLong()
             packetsToClient.incrementAndGet()
-            bytesToClient.addAndGet(msg.readableBytes().toLong())
+            bytesToClient.addAndGet(downBytes)
+            trafficCounter?.addDownload(downBytes)
             if (clientChannel.isActive) clientChannel.writeAndFlush(msg.retain())
         }
 

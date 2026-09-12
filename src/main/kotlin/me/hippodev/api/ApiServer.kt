@@ -27,6 +27,7 @@ import me.hippodev.routing.PlayerSessions
 import me.hippodev.routing.RouteRuntime
 import me.hippodev.routing.collectMetrics
 import me.hippodev.routing.pingBackendLive
+import me.hippodev.tracking.RouteMetricsStore
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.util.concurrent.CompletableFuture
@@ -42,6 +43,7 @@ import java.util.concurrent.Semaphore
  *   GET /v1/routes/{index}         - a single route by its index in the config
  *   GET /v1/routes/{index}/backends - last-known per-backend stats (active connections, latency)
  *   GET /v1/routes/{index}/ping     - dials each backend right now and returns a live status/latency reading
+ *   GET /v1/routes/{index}/metrics  - this route's cumulative upload/download byte usage and limits (404 unless configured)
  *   GET /v1/players                 - every currently-connected player: IP, UUID, host, login attempts,
  *                                      packets/bytes sent+received, compression/encryption state
  *   GET /metrics                   - Prometheus text-format metrics, for scraping into Grafana
@@ -156,6 +158,14 @@ private class ApiHandler(
                 if (route == null) notFound(ctx, req) else respond(ctx, req, HttpResponseStatus.OK, backendsJson(route))
             }
 
+            segments.size == 4 && segments[0] == "v1" && segments[1] == "routes" && segments[2].toIntOrNull() != null && segments[3] == "metrics" -> {
+                val index = segments[2].toInt()
+                val route = routes.getOrNull(index)
+                val counter = route?.let { RouteMetricsStore.handle(it) }
+                if (route == null || counter == null) notFound(ctx, req)
+                else respond(ctx, req, HttpResponseStatus.OK, routeMetricsJson(index, route, counter))
+            }
+
             segments.size == 4 && segments[0] == "v1" && segments[1] == "routes" && segments[2].toIntOrNull() != null && segments[3] == "ping" -> {
                 val index = segments[2].toInt()
                 val route = routes.getOrNull(index)
@@ -199,6 +209,32 @@ private class ApiHandler(
         sb.append(",\"modifyVirtualHost\":").append(route.modifyVirtualHost)
         sb.append(",\"proxyProtocol\":").append(route.proxyProtocol)
         sb.append(",\"hasFallback\":").append(route.fallback != null)
+        sb.append(",\"hasMetrics\":").append(route.metrics?.active == true)
+        sb.append('}')
+        return sb.toString()
+    }
+
+    /** One route's live upload/download byte accounting - see `GET /v1/routes/{index}/metrics`. */
+    private fun routeMetricsJson(index: Int, route: Route, c: RouteMetricsStore.RouteTrafficCounter): String {
+        val sb = StringBuilder()
+        sb.append("{\"index\":").append(index)
+        sb.append(",\"hosts\":[")
+        route.hostPatterns.forEachIndexed { i, p ->
+            if (i > 0) sb.append(',')
+            sb.append('"').append(escapeJson(p.raw)).append('"')
+        }
+        sb.append(']')
+        sb.append(",\"file\":").append(if (c.file != null) "\"${escapeJson(c.file!!)}\"" else "null")
+        sb.append(",\"upload\":{\"enabled\":").append(c.uploadEnabled)
+        sb.append(",\"bytes\":").append(c.uploadBytes.get())
+        sb.append(",\"limit\":").append(c.uploadLimit)
+        sb.append(",\"exceeded\":").append(c.uploadExceeded()).append('}')
+        sb.append(",\"download\":{\"enabled\":").append(c.downloadEnabled)
+        sb.append(",\"bytes\":").append(c.downloadBytes.get())
+        sb.append(",\"limit\":").append(c.downloadLimit)
+        sb.append(",\"exceeded\":").append(c.downloadExceeded()).append('}')
+        sb.append(",\"resetIntervalMillis\":").append(c.resetIntervalMillis)
+        sb.append(",\"resetAt\":").append(c.resetAt)
         sb.append('}')
         return sb.toString()
     }
@@ -386,6 +422,30 @@ private class ApiHandler(
             sb.append("mcgate_connection_tracking_dropped_records_total ").append(s.trackingDroppedRecordsTotal).append('\n')
         }
 
+        if (s.routeMetrics.isNotEmpty()) {
+            // Low cardinality: one series per route (its hostnames joined into a single label),
+            // never per player. Cumulative byte counters, so `counter` type.
+            sb.append("# HELP mcgate_route_bytes_uploaded_total Cumulative client->backend bytes relayed per route.\n")
+            sb.append("# TYPE mcgate_route_bytes_uploaded_total counter\n")
+            sb.append("# HELP mcgate_route_bytes_downloaded_total Cumulative backend->client bytes relayed per route.\n")
+            sb.append("# TYPE mcgate_route_bytes_downloaded_total counter\n")
+            sb.append("# HELP mcgate_route_bytes_limit Configured byte ceiling per route/direction (absent when unlimited).\n")
+            sb.append("# TYPE mcgate_route_bytes_limit gauge\n")
+            for (m in s.routeMetrics) {
+                val labels = "route=\"${m.routeIndex}\",hosts=\"${escapeLabel(m.hosts.joinToString(","))}\""
+                if (m.uploadEnabled) {
+                    sb.append("mcgate_route_bytes_uploaded_total{").append(labels).append("} ").append(m.uploadBytes).append('\n')
+                    if (m.uploadLimit >= 0)
+                        sb.append("mcgate_route_bytes_limit{").append(labels).append(",direction=\"upload\"} ").append(m.uploadLimit).append('\n')
+                }
+                if (m.downloadEnabled) {
+                    sb.append("mcgate_route_bytes_downloaded_total{").append(labels).append("} ").append(m.downloadBytes).append('\n')
+                    if (m.downloadLimit >= 0)
+                        sb.append("mcgate_route_bytes_limit{").append(labels).append(",direction=\"download\"} ").append(m.downloadLimit).append('\n')
+                }
+            }
+        }
+
         return sb.toString()
     }
 
@@ -420,7 +480,27 @@ private class ApiHandler(
             sb.append(",\"latencyMillis\":").append(b.latencyMillis ?: "null")
             sb.append('}')
         }
-        sb.append("],\"playersTotal\":").append(s.players.size)
+        sb.append("],\"routeMetrics\":[")
+        s.routeMetrics.forEachIndexed { i, m ->
+            if (i > 0) sb.append(',')
+            sb.append("{\"route\":").append(m.routeIndex)
+            sb.append(",\"hosts\":[")
+            m.hosts.forEachIndexed { hi, h ->
+                if (hi > 0) sb.append(',')
+                sb.append('"').append(escapeJson(h)).append('"')
+            }
+            sb.append(']')
+            sb.append(",\"file\":").append(if (m.file != null) "\"${escapeJson(m.file)}\"" else "null")
+            sb.append(",\"upload\":{\"enabled\":").append(m.uploadEnabled)
+                .append(",\"bytes\":").append(m.uploadBytes).append(",\"limit\":").append(m.uploadLimit).append('}')
+            sb.append(",\"download\":{\"enabled\":").append(m.downloadEnabled)
+                .append(",\"bytes\":").append(m.downloadBytes).append(",\"limit\":").append(m.downloadLimit).append('}')
+            sb.append(",\"resetIntervalMillis\":").append(m.resetIntervalMillis)
+            sb.append(",\"resetAt\":").append(m.resetAt)
+            sb.append('}')
+        }
+        sb.append("]")
+        sb.append(",\"playersTotal\":").append(s.players.size)
         sb.append(",\"players\":[")
         s.players.take(playerLimit.coerceAtLeast(0)).forEachIndexed { i, p ->
             if (i > 0) sb.append(',')

@@ -9,6 +9,8 @@ import io.netty.channel.SimpleChannelInboundHandler
 import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.DatagramPacket
 import io.netty.channel.socket.nio.NioDatagramChannel
+import me.hippodev.config.UdpThrottleConfig
+import me.hippodev.udp.UdpThrottle
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -53,6 +55,7 @@ class VoiceRelayTest {
     @AfterEach
     fun tearDown() {
         VoiceRouting.unregister("127.0.0.1")
+        UdpThrottle.reset()
         backend.close().sync()
         group.shutdownGracefully(0, 1, TimeUnit.SECONDS).sync()
     }
@@ -98,12 +101,35 @@ class VoiceRelayTest {
         val relayPort = freeUdpPort()
         relay.start(InetSocketAddress("127.0.0.1", relayPort))
         try {
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             val reply = sendAndAwaitReply(InetSocketAddress("127.0.0.1", relayPort), "hello-voice".toByteArray())
 
             assertArrayEquals("hello-voice".toByteArray(), backendReceived.poll(2, TimeUnit.SECONDS))
             assertArrayEquals("echo:hello-voice".toByteArray(), reply)
+        } finally {
+            relay.stop()
+        }
+    }
+
+    @Test
+    fun `caps concurrent sessions per source IP`() {
+        UdpThrottle.apply(UdpThrottleConfig(maxSessionsPerIp = 1))
+        val relay = VoiceRelay(group)
+        val relayPort = freeUdpPort()
+        relay.start(InetSocketAddress("127.0.0.1", relayPort))
+        try {
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
+            val target = InetSocketAddress("127.0.0.1", relayPort)
+
+            // First session from 127.0.0.1 is allowed and relays end-to-end.
+            assertArrayEquals("echo:one".toByteArray(), sendAndAwaitReply(target, "one".toByteArray()))
+
+            // A second concurrent session from the same IP (fresh ephemeral port) is over the
+            // per-IP cap - dropped, no reply, nothing reaches the backend.
+            backendReceived.clear()
+            assertEquals(null, sendAndAwaitReply(target, "two".toByteArray()))
+            assertEquals(null, backendReceived.poll(500, TimeUnit.MILLISECONDS))
         } finally {
             relay.stop()
         }
@@ -134,7 +160,7 @@ class VoiceRelayTest {
             // Routing entry is keyed by the address inside the PROXY header, not the datagram's
             // own source (which here is an ephemeral loopback port standing in for a fronting
             // proxy like Cloudflare Spectrum).
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             val framed = v2Header("127.0.0.1", 34567) + "hello-proxied".toByteArray()
             val reply = sendAndAwaitReply(InetSocketAddress("127.0.0.1", relayPort), framed)
@@ -170,7 +196,7 @@ class VoiceRelayTest {
             .bind(InetSocketAddress("127.0.0.1", 0)).sync().channel()
         val target = InetSocketAddress("127.0.0.1", relayPort)
         try {
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             // First datagram: PROXY header + payload. Rest: payload only.
             client.writeAndFlush(DatagramPacket(Unpooled.wrappedBuffer(v2Header("127.0.0.1", 4962) + "one".toByteArray()), target)).sync()
@@ -210,7 +236,7 @@ class VoiceRelayTest {
             .bind(InetSocketAddress("127.0.0.1", 0)).sync().channel()
         val target = InetSocketAddress("127.0.0.1", relayPort)
         try {
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             client.writeAndFlush(DatagramPacket(Unpooled.wrappedBuffer(v2Header("127.0.0.1", 4962) + "up".toByteArray()), target)).sync()
             assertArrayEquals("up".toByteArray(), backendReceived.poll(2, TimeUnit.SECONDS))
@@ -236,7 +262,7 @@ class VoiceRelayTest {
         val relayPort = freeUdpPort()
         relay.start(InetSocketAddress("127.0.0.1", relayPort))
         try {
-            VoiceRouting.register("127.0.0.1", backendAddress())
+            VoiceRouting.register("127.0.0.1", "voice.test", backendAddress())
 
             val reply = sendAndAwaitReply(InetSocketAddress("127.0.0.1", relayPort), "no-header-here".toByteArray())
 

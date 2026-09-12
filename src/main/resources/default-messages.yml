@@ -13,6 +13,20 @@ messages:
   # via config.yml's top-level `kickMessage` (not nested under `reconnect:`).
   kickMessage: "&cServer is offline. Please reconnect shortly."
 
+  # Kick/disconnect message shown when a route's per-route `metrics:` upload or download byte
+  # limit has been reached - sent both to players already on the route (kicked off it) and to
+  # anyone trying to log in while it's still over the cap. Global, not per-route: it's about
+  # MCGate's own traffic accounting rather than a backend being unreachable.
+  #
+  # Multi-line (YAML block scalar below, or "\n" in a quoted string) and full MiniMessage,
+  # gradients included. On a login refusal MCGate sends a real chat component; on a mid-session
+  # kick the gradient is sampled to per-character "§x" hex, which every 1.16+ client renders the
+  # same way.
+  metricsLimitKickMessage: |-
+    <gradient:#f85032:#e73827><bold>✦ DATA LIMIT REACHED ✦</bold></gradient>
+    <gray>This server has used up its data-transfer allowance.</gray>
+    <gradient:#8e9eab:#eef2f3>Please try again later.</gradient>
+
   # Text for the auto-reconnect waiting screen (route `reconnect:` config).
   reconnect:
     # Title/subtitle shown while a player is held waiting to reconnect.

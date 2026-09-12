@@ -58,6 +58,44 @@ data class ReconnectConfig(
     val animationIntervalMillis: Long = 500
 )
 
+/**
+ * Per-direction traffic-usage accounting for a route: whether to count it at all, and an optional
+ * byte ceiling. `limit` is a cumulative cap in bytes (across the counter's whole lifetime,
+ * including any total loaded back from [RouteMetricsConfig.file] on restart) - once reached, new
+ * logins to the route are refused and any players currently on it are kicked with the route's
+ * `kickMessage`. `-1` (the default) means no ceiling, just accounting.
+ */
+data class RouteMetricUsageConfig(
+    val enabled: Boolean = false,
+    val limit: Long = -1
+)
+
+/**
+ * Optional per-route upload/download byte accounting. "upload" is client -> backend (bytes the
+ * player sent), "download" is backend -> client (bytes the player received). Counters are kept in
+ * memory as plain atomics (no per-connection retained state, so nothing accumulates in the heap as
+ * players come and go) and flushed to [file] as JSON by a single background thread - never on a
+ * Netty event loop. See [me.hippodev.tracking.RouteMetricsStore].
+ *
+ * `file` is loaded on startup so totals survive a restart; when null the counters are memory-only.
+ * Several routes may point at the same `file` - they then share one counter.
+ */
+data class RouteMetricsConfig(
+    val file: String? = null,
+    val upload: RouteMetricUsageConfig = RouteMetricUsageConfig(),
+    val download: RouteMetricUsageConfig = RouteMetricUsageConfig(),
+    /** If > 0, the counters are automatically zeroed every this-many milliseconds (a billing-style
+     *  rolling window). The schedule is anchored in [file] (`resetAt`), not process uptime, so it
+     *  survives restarts and doesn't drift; after long downtime it catches up in one step rather
+     *  than firing repeatedly. 0 (default) = never auto-reset. Config key: `resetInterval` (a
+     *  duration such as `30d`, `168h`, `1d`). */
+    val resetIntervalMillis: Long = 0
+) {
+    /** True when at least one direction is actually being counted - otherwise the block is inert
+     *  and no counter/file is created for the route. */
+    val active: Boolean get() = upload.enabled || download.enabled
+}
+
 data class Route(
     val hostPatterns: List<HostPattern>,
     val backendTemplates: List<String>,
@@ -79,7 +117,10 @@ data class Route(
      *  separate port to open. Empty when the route has no `voicechat:` entry. Only the first
      *  template is used: unlike `backend`, there's no failover/load-balancing concept for a UDP
      *  relay session once it's been handed off to a backend. */
-    val voicechatTemplates: List<String> = emptyList()
+    val voicechatTemplates: List<String> = emptyList(),
+    /** Per-route upload/download byte accounting - null when the route has no `metrics:` block (or
+     *  one with both directions disabled). See [RouteMetricsConfig]. */
+    val metrics: RouteMetricsConfig? = null
 ) {
     /** Returns the wildcard captures of the first matching host pattern, or null if none match. */
     fun match(hostname: String): List<String>? {
@@ -111,7 +152,22 @@ data class Route(
  * is required to open a session, so this has its own bind address/port rather than sharing the
  * main TCP listener's. See [me.hippodev.udp.UdpProxy].
  */
-data class UdpProxyConfig(val bind: String, val backend: String) {
+/**
+ * UDP-relay-specific settings, in their own top-level `udp:` block.
+ *
+ * [proxyProtocol] is an independent switch for whether the voicechat UDP relay
+ * ([me.hippodev.voice.VoiceRelay]) expects a PROXY protocol (v1/v2) header on inbound datagrams -
+ * deliberately *not* tied to [GateConfig.proxyProtocol] (the TCP listener's), since an L4 front such
+ * as Cloudflare Spectrum can be configured to prepend the header on one protocol but not the other.
+ * When the `udp:` block (or this key) is absent it falls back to [GateConfig.proxyProtocol] so
+ * existing single-switch configs keep behaving the same. Startup-only, like the UDP bind addresses.
+ */
+data class UdpConfig(val proxyProtocol: Boolean = false)
+
+/** [logSessions] controls the per-session INFO line each time a new source address opens a
+ *  forward. On by default; set false (logged at DEBUG instead) when a proxy sits in front and
+ *  every client - plus its health probes - looks like a fresh session, making that line noise. */
+data class UdpProxyConfig(val bind: String, val backend: String, val logSessions: Boolean = true) {
     val bindAddress: InetSocketAddress by lazy { parseHostPort(bind) }
     val backendAddress: InetSocketAddress by lazy { parseHostPort(backend) }
 }
@@ -133,9 +189,10 @@ data class ApiConfig(
 /**
  * Process-wide flood ceilings, layered on top of the per-IP pre-login cap
  * ([GateConfig.maxConnectionsPerIp]): a hard cap on total concurrent connections and a per-IP
- * new-connection rate limit. Both are disabled when [GateConfig.proxyProtocol] is on (every
- * connection then appears to come from the upstream load balancer). Read fresh on every
- * connection, so changes take effect on a hot reload.
+ * new-connection rate limit. The per-IP rate limit is disabled when [GateConfig.proxyProtocol] is
+ * on (every connection then appears to come from the upstream load balancer); the process-wide
+ * [maxConnections] cap still applies. Read fresh on every connection, so changes take effect on a
+ * hot reload.
  */
 data class ConnectionThrottleConfig(
     /** Max concurrent client connections process-wide. 0 = unlimited. Over this, new TCP
@@ -144,6 +201,33 @@ data class ConnectionThrottleConfig(
     /** Max new connections from one source IP within [windowMillis]. 0 = unlimited. */
     val maxPerIpPerWindow: Int = 8,
     val windowMillis: Long = 8_000
+)
+
+/**
+ * Anti-abuse limits shared by every UDP relay path - the voicechat relay
+ * ([me.hippodev.voice.VoiceRelay]) and each static `udpProxy:` forward. UDP carries no handshake to
+ * gate on and a trivially spoofable source address, so these caps are the only thing bounding how
+ * much a datagram flood can pin: each distinct source opens a session object plus one
+ * backend-facing UDP socket (an fd). Read live on every datagram, so changes take effect on a hot
+ * reload - only the UDP *bind* addresses are startup-only. Applied process-wide via
+ * [me.hippodev.udp.UdpThrottle].
+ */
+data class UdpThrottleConfig(
+    /** Max concurrent relay sessions across all UDP paths combined. 0 = unlimited. Each session
+     *  costs one backend-facing UDP socket - keep this well under the process fd limit. */
+    val maxSessions: Int = 8192,
+    /** Max concurrent relay sessions from one source IP. 0 = unlimited. Under `proxyProtocol` the
+     *  voicechat path keys this off the real client address from the PROXY header. */
+    val maxSessionsPerIp: Int = 64,
+    /** Datagrams buffered per session during the sub-millisecond window its backend socket is
+     *  opening; past this the oldest is dropped (UDP is lossy anyway). Clamped to at least 1. */
+    val pendingPacketsPerSession: Int = 256,
+    /** A session with no traffic in either direction for this long is torn down. */
+    val idleTimeoutMillis: Long = 300_000,
+    /** A session whose backend never replies within this long of being opened is torn down early -
+     *  the main defence against a spoofed-source flood (each fake sender otherwise holds a socket
+     *  for the full idle window). 0 = disabled. */
+    val noReplyTeardownMillis: Long = 20_000
 )
 
 /**
@@ -201,6 +285,7 @@ data class StatsLoggingConfig(
 data class GateConfig(
     val bind: String = "0.0.0.0:25565",
     val routes: List<Route> = emptyList(),
+    val udp: UdpConfig = UdpConfig(),
     val udpProxies: List<UdpProxyConfig> = emptyList(),
     val api: ApiConfig = ApiConfig(),
     val connectionTracking: ConnectionTrackingConfig = ConnectionTrackingConfig(),
@@ -219,6 +304,12 @@ data class GateConfig(
      *  pings, which otherwise aren't logged at all. Off by default since server-list pingers/
      *  scanners can hit a public port frequently enough to be noisy. */
     val logConnections: Boolean = false,
+    /** Runtime log level for MCGate's own loggers (`me.hippodev.*`): TRACE / DEBUG / INFO / WARN /
+     *  ERROR / OFF. `DEBUG` surfaces MCGate's own diagnostics - dropped voice datagrams,
+     *  status-probe dial failures, PROXY-header handling, config-watch churn - without turning on
+     *  Netty/JLine debug noise (the root logger stays at logback.xml's level). Hot-reloadable;
+     *  unknown values fall back to INFO. */
+    val logLevel: String = "INFO",
     /** Accept a PROXY protocol (v1/v2) header at the start of every incoming connection, before
      *  the Minecraft handshake - for when MCGate itself sits behind another load balancer/proxy
      *  that needs to hand it the real client address. Distinct from a [Route]'s own
@@ -226,8 +317,8 @@ data class GateConfig(
      *  MCGate *receiving* one from whatever's in front of it. Off by default: a plain client
      *  connecting straight to MCGate does not send this header, so turning it on when nothing
      *  upstream actually sends one just makes every real connection look like garbage and get
-     *  dropped. Also honored by [me.hippodev.voice.VoiceRelay] - the inbound voice UDP path then
-     *  expects a PROXY header on every datagram and routes by the real client address it carries. */
+     *  dropped. The voicechat UDP relay ([me.hippodev.voice.VoiceRelay]) has its own
+     *  [UdpConfig.proxyProtocol] switch, which defaults to this value but can be set independently. */
     val proxyProtocol: Boolean = false,
     /** Anti-abuse: how long a connection has to complete its handshake *and* send its Login Start
      *  packet before MCGate closes it. A connection-flood / slow-loris opens sockets (and often
@@ -242,6 +333,8 @@ data class GateConfig(
     val maxConnectionsPerIp: Int = 8,
     /** Process-wide flood ceilings - see [ConnectionThrottleConfig]. */
     val connectionThrottle: ConnectionThrottleConfig = ConnectionThrottleConfig(),
+    /** Anti-abuse limits for every UDP relay path - see [UdpThrottleConfig]. */
+    val udpThrottle: UdpThrottleConfig = UdpThrottleConfig(),
     /** Listen socket backlog (SO_BACKLOG). Startup-only, like [bind]. */
     val soBacklog: Int = 128,
     /** Process-wide cap on players held in the reconnect-wait state at once (see
@@ -278,21 +371,36 @@ data class GateConfig(
             val statsLogging = parseStatsLogging(configSection["statsLogging"] as? Map<String, Any>)
             val workerThreads = configSection["workerThreads"] as? Int ?: 0
             val logConnections = configSection["logConnections"] as? Boolean ?: false
+            val logLevel = configSection["logLevel"] as? String ?: GateConfig().logLevel
             val proxyProtocol = configSection["proxyProtocol"] as? Boolean ?: false
+            val udp = parseUdp(configSection["udp"] as? Map<String, Any>, proxyProtocol)
             val defaults = GateConfig()
             val loginTimeoutMillis = (configSection["loginTimeout"] as? String)?.let { parseDuration(it) } ?: defaults.loginTimeoutMillis
             val maxConnectionsPerIp = configSection["maxConnectionsPerIp"] as? Int ?: defaults.maxConnectionsPerIp
             val connectionThrottle = parseConnectionThrottle(configSection["connectionThrottle"] as? Map<String, Any>)
+            val udpThrottle = parseUdpThrottle(configSection["udpThrottle"] as? Map<String, Any>)
             val soBacklog = configSection["soBacklog"] as? Int ?: defaults.soBacklog
             val maxHeldReconnectSessions = configSection["maxHeldReconnectSessions"] as? Int ?: defaults.maxHeldReconnectSessions
 
             return GateConfig(
-                bind = bind, routes = routes, udpProxies = udpProxies, api = api, connectionTracking = connectionTracking,
+                bind = bind, routes = routes, udp = udp, udpProxies = udpProxies, api = api, connectionTracking = connectionTracking,
                 statsLogging = statsLogging,
-                workerThreads = workerThreads, logConnections = logConnections, proxyProtocol = proxyProtocol,
+                workerThreads = workerThreads, logConnections = logConnections, logLevel = logLevel, proxyProtocol = proxyProtocol,
                 loginTimeoutMillis = loginTimeoutMillis, maxConnectionsPerIp = maxConnectionsPerIp,
-                connectionThrottle = connectionThrottle, soBacklog = soBacklog,
+                connectionThrottle = connectionThrottle, udpThrottle = udpThrottle, soBacklog = soBacklog,
                 maxHeldReconnectSessions = maxHeldReconnectSessions
+            )
+        }
+
+        private fun parseUdpThrottle(c: Map<String, Any>?): UdpThrottleConfig {
+            val d = UdpThrottleConfig()
+            if (c == null) return d
+            return UdpThrottleConfig(
+                maxSessions = c["maxSessions"] as? Int ?: d.maxSessions,
+                maxSessionsPerIp = c["maxSessionsPerIp"] as? Int ?: d.maxSessionsPerIp,
+                pendingPacketsPerSession = c["pendingPacketsPerSession"] as? Int ?: d.pendingPacketsPerSession,
+                idleTimeoutMillis = (c["idleTimeout"] as? String)?.let { parseDuration(it) } ?: d.idleTimeoutMillis,
+                noReplyTeardownMillis = (c["noReplyTeardown"] as? String)?.let { parseDuration(it) } ?: d.noReplyTeardownMillis
             )
         }
 
@@ -306,12 +414,21 @@ data class GateConfig(
             )
         }
 
+        /** [defaultProxyProtocol] is the TCP listener's `proxyProtocol` - used when the `udp:` block
+         *  or its `proxyProtocol` key is omitted, so a config with only the single top-level switch
+         *  keeps applying it to the voice relay as before. */
+        private fun parseUdp(c: Map<String, Any>?, defaultProxyProtocol: Boolean): UdpConfig {
+            if (c == null) return UdpConfig(proxyProtocol = defaultProxyProtocol)
+            return UdpConfig(proxyProtocol = c["proxyProtocol"] as? Boolean ?: defaultProxyProtocol)
+        }
+
         private fun parseUdpProxies(raw: List<Map<String, Any>>?): List<UdpProxyConfig> {
             if (raw == null) return emptyList()
             return raw.mapIndexed { index, entry ->
                 val bind = entry["bind"] as? String ?: error("udpProxy #$index missing 'bind'")
                 val backend = entry["backend"] as? String ?: error("udpProxy #$index missing 'backend'")
-                UdpProxyConfig(bind = bind, backend = backend)
+                val logSessions = entry["logSessions"] as? Boolean ?: true
+                UdpProxyConfig(bind = bind, backend = backend, logSessions = logSessions)
             }
         }
 
@@ -387,6 +504,7 @@ data class GateConfig(
             val priority = r["priority"] as? Int ?: 0
             val reconnect = renderReconnectText(parseReconnect(r["reconnect"] as? Map<String, Any>, messages.reconnect))
             val kickMessage = r["kickMessage"] as? String ?: messages.kickMessage
+            val metrics = parseMetrics(r["metrics"] as? Map<String, Any>, index)
 
             return Route(
                 hostPatterns = hostPatterns,
@@ -399,8 +517,46 @@ data class GateConfig(
                 priority = priority,
                 reconnect = reconnect,
                 kickMessage = kickMessage,
-                voicechatTemplates = voicechatBackends
+                voicechatTemplates = voicechatBackends,
+                metrics = metrics
             )
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        private fun parseMetrics(m: Map<String, Any>?, index: Int): RouteMetricsConfig? {
+            if (m == null) return null
+            fun usage(key: String): RouteMetricUsageConfig {
+                val u = m[key] as? Map<String, Any> ?: return RouteMetricUsageConfig()
+                val limit = when (val raw = u["limit"]) {
+                    is Number -> raw.toLong()
+                    is String -> try {
+                        parseByteSize(raw)
+                    } catch (e: Exception) {
+                        error("Route #$index metrics.$key.limit: ${e.message}")
+                    }
+                    null -> -1L
+                    else -> error("Route #$index metrics.$key.limit is not a byte size: $raw")
+                }
+                return RouteMetricUsageConfig(enabled = u["enabled"] as? Boolean ?: false, limit = limit)
+            }
+            val resetInterval = (m["resetInterval"] as? String)?.let {
+                try {
+                    parseDuration(it)
+                } catch (e: Exception) {
+                    error("Route #$index metrics.resetInterval: ${e.message}")
+                }
+            } ?: 0L
+            val config = RouteMetricsConfig(
+                file = (m["file"] as? String)?.takeIf { it.isNotBlank() },
+                upload = usage("upload"),
+                download = usage("download"),
+                resetIntervalMillis = resetInterval.coerceAtLeast(0)
+            )
+            if (!config.active) {
+                log.warn("Route #{}: metrics block present but neither upload nor download is enabled - ignoring it", index)
+                return null
+            }
+            return config
         }
 
         @Suppress("UNCHECKED_CAST")
@@ -543,9 +699,37 @@ fun needsBlockingResolution(value: String, defaultPort: Int = 25565): Boolean {
     return !DnsCache.willResolveWithoutBlocking(host, port)
 }
 
-private val durationPattern = Pattern.compile("(-?\\d+)(ms|s|m|h)")
+private val byteSizePattern = Pattern.compile("(-?\\d+)\\s*([kmgtp]?)i?b?", Pattern.CASE_INSENSITIVE)
 
-/** Parses durations like "3m", "60s", "500ms", "-1s" into milliseconds. */
+/** Parses byte sizes for `metrics.*.limit`: a plain integer is bytes, or a `k`/`m`/`g`/`t`/`p`
+ *  suffix multiplies by the matching power of 1024 (an optional `i`/`b`/`ib`/`b` is accepted and
+ *  ignored, so `100g`, `100G`, `100GiB`, `100gb` are all 100 * 1024^3). Any negative value means
+ *  "unlimited" and normalizes to -1. Examples: "100g" -> 107374182400, "-1" -> -1, "5242880" ->
+ *  5242880. */
+fun parseByteSize(value: String): Long {
+    val m = byteSizePattern.matcher(value.trim())
+    if (!m.matches()) error("invalid byte size: $value (try e.g. 100g, 512m, 5242880, or -1)")
+    val amount = m.group(1).toLong()
+    if (amount < 0) return -1L
+    val factor = when (m.group(2).lowercase()) {
+        "" -> 1L
+        "k" -> 1024L
+        "m" -> 1024L * 1024
+        "g" -> 1024L * 1024 * 1024
+        "t" -> 1024L * 1024 * 1024 * 1024
+        "p" -> 1024L * 1024 * 1024 * 1024 * 1024
+        else -> error("invalid byte size unit: $value")
+    }
+    return try {
+        Math.multiplyExact(amount, factor)
+    } catch (e: ArithmeticException) {
+        error("byte size out of range: $value")
+    }
+}
+
+private val durationPattern = Pattern.compile("(-?\\d+)(ms|s|m|h|d)")
+
+/** Parses durations like "3m", "60s", "500ms", "-1s", "30d" into milliseconds. */
 fun parseDuration(value: String): Long {
     val m = durationPattern.matcher(value.trim())
     if (!m.matches()) error("Invalid duration: $value")
@@ -555,6 +739,7 @@ fun parseDuration(value: String): Long {
         "s" -> amount * 1000
         "m" -> amount * 60_000
         "h" -> amount * 3_600_000
+        "d" -> amount * 86_400_000
         else -> error("Invalid duration unit: $value")
     }
 }

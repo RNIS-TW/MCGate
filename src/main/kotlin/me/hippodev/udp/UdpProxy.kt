@@ -16,26 +16,11 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-private const val SESSION_IDLE_MILLIS = 5 * 60_000L
 /** How often the reaper runs - short, so no-reply sessions from a spoofed-source flood are torn
- *  down quickly rather than lingering for [SESSION_IDLE_MILLIS]. */
+ *  down quickly rather than lingering for the full idle window. All the actual limits it enforces
+ *  (idle / no-reply timeouts, session caps, per-session buffering) come from the hot-reloadable
+ *  [UdpThrottle]. */
 private const val REAPER_INTERVAL_MILLIS = 15_000L
-/** A session whose backend never answers within this long is torn down - a UDP source address is
- *  trivially spoofable, so a flood of one-off fake senders would otherwise each hold a Session
- *  plus a backend-facing socket (an fd) for the full idle window. */
-private const val NO_REPLY_TEARDOWN_MILLIS = 20_000L
-
-/** Hard cap on datagrams buffered per session while its backend-facing socket is opening - see
- *  [me.hippodev.voice.VoiceRelay]'s constant of the same name. Past this the oldest queued
- *  datagram is dropped and released so a flood (or a hung backend connect) can't pin unbounded
- *  direct memory. */
-private const val MAX_PENDING_PACKETS = 256
-
-/** Process-wide cap on concurrent relay sessions (each = a Session object + a backend-facing UDP
- *  socket). Past this, datagrams from not-yet-seen senders are dropped. */
-private const val MAX_SESSIONS = 8192
-/** Cap on concurrent sessions from a single source IP. */
-private const val MAX_SESSIONS_PER_IP = 64
 
 /**
  * Plain static UDP forwarder: every datagram arriving on [UdpProxyConfig.bind] is relayed to
@@ -107,19 +92,25 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
             return
         }
 
-        if (sessions.size >= MAX_SESSIONS) {
+        val globalCap = UdpThrottle.maxSessions
+        if (globalCap > 0 && sessions.size >= globalCap) {
             content.release()
             return
         }
         val ip = sender.address.hostAddress
-        val ipCount = sessionsPerIp.computeIfAbsent(ip) { java.util.concurrent.atomic.AtomicInteger(0) }
-        if (ipCount.incrementAndGet() > MAX_SESSIONS_PER_IP) {
+        val perIpCap = UdpThrottle.maxSessionsPerIp
+        val ipCount = if (perIpCap > 0) sessionsPerIp.computeIfAbsent(ip) { java.util.concurrent.atomic.AtomicInteger(0) } else null
+        if (ipCount != null && ipCount.incrementAndGet() > perIpCap) {
             if (ipCount.decrementAndGet() == 0) sessionsPerIp.remove(ip, ipCount)
             content.release()
             return
         }
 
-        log.info("Opening UDP relay session: {} -> {}", sender, config.backendAddress)
+        if (config.logSessions) {
+            log.info("Opening UDP relay session: {} -> {}", sender, config.backendAddress)
+        } else {
+            log.debug("Opening UDP relay session: {} -> {}", sender, config.backendAddress)
+        }
         val session = Session(ip, System.currentTimeMillis())
         val prev = sessions.putIfAbsent(sender, session)
         if (prev != null) {
@@ -148,7 +139,7 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
                 channel.writeAndFlush(content)
                 return
             }
-            if (session.pending.size >= MAX_PENDING_PACKETS) {
+            if (session.pending.size >= UdpThrottle.pendingPacketsPerSession) {
                 session.pending.removeFirst().release()
             }
             session.pending.addLast(content)
@@ -168,7 +159,7 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
                 }
 
                 override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
-                    log.info("UDP proxy backend session error for {}: {}", clientAddr, cause.toString())
+                    log.info("UDP proxy backend {} session error for {}: {}", config.backendAddress, clientAddr, cause.toString())
                 }
             })
 
@@ -201,9 +192,11 @@ class UdpProxy(private val group: EventLoopGroup, private val config: UdpProxyCo
 
     private fun evictStaleSessions() {
         val now = System.currentTimeMillis()
+        val idleCutoff = UdpThrottle.idleTimeoutMillis
+        val noReply = UdpThrottle.noReplyTeardownMillis
         val stale = sessions.entries.filter { (_, s) ->
-            now - s.lastActive > SESSION_IDLE_MILLIS ||
-                (!s.backendReplied && now - s.createdAt > NO_REPLY_TEARDOWN_MILLIS)
+            now - s.lastActive > idleCutoff ||
+                (!s.backendReplied && noReply > 0 && now - s.createdAt > noReply)
         }
         for (entry in stale) {
             if (sessions.remove(entry.key, entry.value)) closeSession(entry.value)

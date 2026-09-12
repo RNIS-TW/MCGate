@@ -10,30 +10,18 @@ import io.netty.channel.SimpleChannelInboundHandler
 import io.netty.channel.socket.DatagramPacket
 import io.netty.channel.socket.nio.NioDatagramChannel
 import me.hippodev.protocol.parseProxyProtocolHeader
+import me.hippodev.udp.UdpThrottle
 import org.slf4j.LoggerFactory
 import java.net.InetSocketAddress
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
-/** How long a client<->backend UDP session can go without traffic in either direction before it's
- *  torn down. A voice mod only sends packets while a player is actually transmitting audio, so
- *  this has to be generous enough to survive a player just being quiet for a while - unlike TCP,
- *  there's no close/FIN to signal "this session is really over". */
-private const val SESSION_IDLE_MILLIS = 5 * 60_000L
-
-/** Hard cap on datagrams buffered per session while its backend-facing socket is still being
- *  opened (a sub-millisecond window). A client flooding packets in that window - or one whose
- *  backend connect hangs - must not be able to pin unbounded direct memory in [Session.pending];
- *  past this, the oldest queued datagram is dropped (and released) to make room. Voice/UDP traffic
- *  is lossy by nature, so dropping a few packets here is harmless. */
-private const val MAX_PENDING_PACKETS = 256
-
-/** Process-wide cap on concurrent voice relay sessions. New sessions only open for a client with
- *  a live [VoiceRouting] entry (i.e. a logged-in player), so this is normally bounded by the
- *  player count anyway - it's a backstop against a spoofed-source flood arriving in the window
- *  before a routing entry is idle-evicted. */
-private const val MAX_SESSIONS = 8192
+/** How often the reaper runs. Short so the no-reply teardown ([UdpThrottle.noReplyTeardownMillis])
+ *  actually catches a spoofed-source flood promptly, rather than the sessions lingering for the
+ *  full idle window. All the limits it enforces come from the hot-reloadable [UdpThrottle]. */
+private const val REAPER_INTERVAL_MILLIS = 15_000L
 
 /**
  * Relays UDP traffic (Simple Voice Chat and similar mods) on the same port MCGate's Minecraft TCP
@@ -72,7 +60,13 @@ class VoiceRelay(
      *  fronting L4 proxy's address when [expectProxyProtocol] is on (it de-muxes replies back to
      *  the real client) and the client's own address otherwise. Refreshed on every inbound
      *  datagram in case the fronting proxy rotates its source port mid-session. */
-    private class Session(@Volatile var lastActive: Long, @Volatile var via: InetSocketAddress) {
+    private class Session(
+        val clientIp: String,
+        val host: String,
+        @Volatile var lastActive: Long,
+        @Volatile var via: InetSocketAddress
+    ) {
+        val createdAt = lastActive
         var backendChannel: Channel? = null
         val pending = ArrayDeque<ByteBuf>()
         /** Set once this session is torn down (idle-evicted, client logged out, or its backend
@@ -95,18 +89,23 @@ class VoiceRelay(
      *  datagram established. Kept in lockstep with [Session.via]. */
     private val byVia = ConcurrentHashMap<InetSocketAddress, Session>()
 
+    /** Concurrent session count per client IP, for [UdpThrottle.maxSessionsPerIp]. Entries
+     *  self-remove at zero. */
+    private val sessionsPerIp = ConcurrentHashMap<String, AtomicInteger>()
+
     private var publicChannel: Channel? = null
 
-    /** Rate-limits the "datagram arrived but couldn't be relayed" diagnostics below to at most one
-     *  line every 5s per reason - a mis-set voice_host / proxyProtocol has every client retrying
-     *  ~1/s, which would otherwise flood the log. Just enough to confirm from the MCGate side
-     *  whether voice datagrams are even reaching it, and why they're being dropped. */
+    /** Logs the "datagram arrived but couldn't be relayed" diagnostics below at DEBUG (unmatched
+     *  inbound UDP - disconnected clients still blasting, non-voicechat routes, port scans - is
+     *  routine and noisy), rate-limited to at most one line every 5s per reason so a mis-set
+     *  voice_host / proxyProtocol retrying ~1/s can't flood even debug logs. Just enough to confirm
+     *  from the MCGate side whether voice datagrams are reaching it, and why they're being dropped. */
     @Volatile private var lastDropLogAt = 0L
     private fun logDrop(reason: String, from: Any) {
         val now = System.currentTimeMillis()
         if (now - lastDropLogAt < 5_000L) return
         lastDropLogAt = now
-        log.warn("Voicechat datagram from {} dropped: {}", from, reason)
+        log.debug("Voicechat datagram from {} dropped: {}", from, reason)
     }
     private val reaper = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "voice-relay-reaper").apply { isDaemon = true }
@@ -132,7 +131,7 @@ class VoiceRelay(
         publicChannel = bootstrap.bind(bindAddress).sync().channel()
         log.info("Relaying UDP (voicechat) on {}", bindAddress)
 
-        reaper.scheduleAtFixedRate({ evictIdleSessions() }, SESSION_IDLE_MILLIS, SESSION_IDLE_MILLIS, TimeUnit.MILLISECONDS)
+        reaper.scheduleAtFixedRate({ evictStaleSessions() }, REAPER_INTERVAL_MILLIS, REAPER_INTERVAL_MILLIS, TimeUnit.MILLISECONDS)
         VoiceRouting.attachRelay(this)
     }
 
@@ -142,6 +141,7 @@ class VoiceRelay(
         sessions.values.forEach { closeSession(it) }
         sessions.clear()
         byVia.clear()
+        sessionsPerIp.clear()
         publicChannel?.close()
     }
 
@@ -194,26 +194,34 @@ class VoiceRelay(
             return
         }
 
-        val backendAddr = VoiceRouting.resolve(clientAddr.address.hostAddress)
-        if (backendAddr == null) {
+        val clientIp = clientAddr.address.hostAddress
+        val route = VoiceRouting.resolve(clientIp)
+        if (route == null) {
             content.release()
             logDrop(
                 if (expectProxyProtocol)
-                    "no voicechat route for client ${clientAddr.address.hostAddress} (from PROXY header) - is that the player's real IP, and did they log in through a voicechat: route?"
+                    "no voicechat route for client $clientIp (from PROXY header) - is that the player's real IP, and did they log in through a voicechat: route?"
                 else
-                    "no voicechat route for ${clientAddr.address.hostAddress} - did this client log in through a voicechat: route? (if MCGate is behind an L4 proxy, enable proxyProtocol)",
+                    "no voicechat route for $clientIp - did this client log in through a voicechat: route? (if MCGate is behind an L4 proxy, enable proxyProtocol)",
                 via
             )
             return
         }
-        if (sessions.size >= MAX_SESSIONS) {
+        val backendAddr = route.backend
+        val globalCap = UdpThrottle.maxSessions
+        if (globalCap > 0 && sessions.size >= globalCap) {
             content.release()
-            logDrop("relay is at its session cap ($MAX_SESSIONS)", via)
+            logDrop("relay is at its session cap ($globalCap)", via)
+            return
+        }
+        if (!acquireIpSlot(clientIp)) {
+            content.release()
+            logDrop("too many voicechat sessions from $clientIp (cap ${UdpThrottle.maxSessionsPerIp})", via)
             return
         }
 
-        log.info("Opening voicechat relay session: {} (via {}) -> {}", clientAddr, via, backendAddr)
-        val session = Session(System.currentTimeMillis(), via)
+        log.info("Opening voicechat relay session: '{}' from {} (via {}) -> {}", route.host, clientAddr, via, backendAddr)
+        val session = Session(clientIp, route.host, System.currentTimeMillis(), via)
         sessions[clientAddr] = session
         if (expectProxyProtocol) byVia[via] = session
         forward(session, content)
@@ -232,6 +240,23 @@ class VoiceRelay(
         byVia[newVia] = session
     }
 
+    /** Reserves a per-IP session slot for [ip] unless [UdpThrottle.maxSessionsPerIp] is already
+     *  reached (0 = unlimited, not tracked). Balanced by [releaseIpSlot] from [closeSession]. */
+    private fun acquireIpSlot(ip: String): Boolean {
+        val max = UdpThrottle.maxSessionsPerIp
+        if (max <= 0) return true
+        val c = sessionsPerIp.computeIfAbsent(ip) { AtomicInteger(0) }
+        if (c.incrementAndGet() > max) {
+            if (c.decrementAndGet() == 0) sessionsPerIp.remove(ip, c)
+            return false
+        }
+        return true
+    }
+
+    private fun releaseIpSlot(ip: String) {
+        sessionsPerIp.computeIfPresent(ip) { _, c -> if (c.decrementAndGet() <= 0) null else c }
+    }
+
     /** Writes to [Session.backendChannel] if it's already connected, otherwise queues on
      *  [Session.pending] for [openBackendChannel]'s connect listener to flush once it lands. */
     private fun forward(session: Session, content: ByteBuf) {
@@ -245,7 +270,7 @@ class VoiceRelay(
                 channel.writeAndFlush(content)
                 return
             }
-            if (session.pending.size >= MAX_PENDING_PACKETS) {
+            if (session.pending.size >= UdpThrottle.pendingPacketsPerSession) {
                 session.pending.removeFirst().release()
             }
             session.pending.addLast(content)
@@ -267,7 +292,7 @@ class VoiceRelay(
                     session.lastActive = System.currentTimeMillis()
                     if (!session.repliedOnce) {
                         session.repliedOnce = true
-                        log.info("Voicechat backend {} replied for the first time to {}", backendAddr, clientAddr)
+                        log.debug("Voicechat backend {} replied for the first time to '{}' {}", backendAddr, session.host, clientAddr)
                     }
                     // Reply to the datagram's actual sender (the fronting L4 proxy when
                     // proxyProtocol is on, otherwise the client itself) - see [Session.via].
@@ -286,15 +311,15 @@ class VoiceRelay(
                     // full reconnect (new ephemeral backend socket) on every subsequent packet -
                     // visible as "Opening voicechat relay session" logged over and over for the
                     // same client instead of a session actually holding. The channel stays open and
-                    // keeps trying; only real idle timeout ([evictIdleSessions]) or the player
+                    // keeps trying; only real idle timeout ([evictStaleSessions]) or the player
                     // logging out ([VoiceRouting.unregister]) tears a session down now.
-                    log.info("Voicechat backend session error for {}: {}", clientAddr, cause.toString())
+                    log.info("Voicechat backend {} session error for '{}' {}: {}", backendAddr, session.host, clientAddr, cause.toString())
                 }
             })
 
         bootstrap.connect(backendAddr).addListener(ChannelFutureListener { future ->
             if (!future.isSuccess) {
-                log.warn("Failed to open voicechat relay session for {} -> {}: {}", clientAddr, backendAddr, future.cause()?.toString())
+                log.warn("Failed to open voicechat relay session for '{}' {} -> {}: {}", session.host, clientAddr, backendAddr, future.cause()?.toString())
                 sessions.remove(clientAddr, session)
                 closeSession(session)
                 return@ChannelFutureListener
@@ -321,19 +346,28 @@ class VoiceRelay(
     private fun closeSession(session: Session) {
         byVia.remove(session.via, session)
         synchronized(session) {
+            if (session.dead) return
             session.dead = true
             session.backendChannel?.close()
             session.pending.forEach { it.release() }
             session.pending.clear()
         }
+        releaseIpSlot(session.clientIp)
     }
 
-    private fun evictIdleSessions() {
-        val cutoff = System.currentTimeMillis() - SESSION_IDLE_MILLIS
-        val idle = sessions.entries.filter { it.value.lastActive < cutoff }
-        for (entry in idle) {
-            sessions.remove(entry.key, entry.value)
-            closeSession(entry.value)
+    /** Tears down sessions that have gone quiet for [UdpThrottle.idleTimeoutMillis], plus - the
+     *  spoofed-source-flood defence - any whose backend has never once replied within
+     *  [UdpThrottle.noReplyTeardownMillis] of being opened. */
+    private fun evictStaleSessions() {
+        val now = System.currentTimeMillis()
+        val idleCutoff = UdpThrottle.idleTimeoutMillis
+        val noReply = UdpThrottle.noReplyTeardownMillis
+        val stale = sessions.entries.filter { (_, s) ->
+            now - s.lastActive > idleCutoff ||
+                (!s.repliedOnce && noReply > 0 && now - s.createdAt > noReply)
+        }
+        for (entry in stale) {
+            if (sessions.remove(entry.key, entry.value)) closeSession(entry.value)
         }
     }
 }

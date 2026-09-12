@@ -26,7 +26,10 @@ private const val ENTRY_IDLE_EVICT_MILLIS = 10 * 60_000L
  * an accepted limitation, since a UDP voice packet carries nothing else to disambiguate by.
  */
 object VoiceRouting {
-    private data class Entry(val backend: InetSocketAddress, @Volatile var lastSeen: Long)
+    /** [host] is the Minecraft hostname the player connected with (the route's `host:` pattern),
+     *  carried along purely so [VoiceRelay] can name it in logs the same way the TCP side does
+     *  (`Connected: 'host' from ... -> ...`) - UDP itself never carries a hostname. */
+    data class Entry(val host: String, val backend: InetSocketAddress, @Volatile var lastSeen: Long)
 
     private val entries = ConcurrentHashMap<String, Entry>()
     /** Set by [VoiceRelay.start]/cleared by [VoiceRelay.stop] - lets [unregister] tear down an
@@ -47,14 +50,14 @@ object VoiceRouting {
         this.relay = relay
     }
 
-    fun register(clientIp: String, backend: InetSocketAddress) {
-        entries[clientIp] = Entry(backend, System.currentTimeMillis())
+    fun register(clientIp: String, host: String, backend: InetSocketAddress) {
+        entries[clientIp] = Entry(host, backend, System.currentTimeMillis())
     }
 
-    fun resolve(clientIp: String): InetSocketAddress? {
+    fun resolve(clientIp: String): Entry? {
         val entry = entries[clientIp] ?: return null
         entry.lastSeen = System.currentTimeMillis()
-        return entry.backend
+        return entry
     }
 
     /** Drops [clientIp]'s routing entry and immediately closes any live UDP relay session for it -
