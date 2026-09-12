@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 use uuid::Uuid;
 
-use crate::varint::{length_prefix, read_string, read_var_int, write_string, write_var_int};
+use crate::protocol::varint::{length_prefix, read_string, read_var_int, write_string, write_var_int};
 
 /// PROXY protocol v1 preamble — required before the handshake on any backend connection when the
 /// route has `proxyProtocol: true`, including status/health-check probes: a backend enforcing it
@@ -120,21 +120,21 @@ mod tests {
     fn handshake_round_trip_shape() {
         let frame = encode_handshake(763, "play.example.com", 25565, 1);
         // frame-length varint, then packet-id 0x00, protocol varint, string, short port, state varint
-        let (len, mut pos) = crate::varint::read_var_int(&frame).unwrap();
+        let (len, mut pos) = crate::protocol::varint::read_var_int(&frame).unwrap();
         assert_eq!(len as usize, frame.len() - pos);
-        let (id, c) = crate::varint::read_var_int(&frame[pos..]).unwrap();
+        let (id, c) = crate::protocol::varint::read_var_int(&frame[pos..]).unwrap();
         pos += c;
         assert_eq!(id, 0);
-        let (protocol, c) = crate::varint::read_var_int(&frame[pos..]).unwrap();
+        let (protocol, c) = crate::protocol::varint::read_var_int(&frame[pos..]).unwrap();
         pos += c;
         assert_eq!(protocol, 763);
-        let (host, c) = crate::varint::read_string(&frame[pos..], 32767).unwrap();
+        let (host, c) = crate::protocol::varint::read_string(&frame[pos..], 32767).unwrap();
         pos += c;
         assert_eq!(host, "play.example.com");
         let port = u16::from_be_bytes(frame[pos..pos + 2].try_into().unwrap());
         pos += 2;
         assert_eq!(port, 25565);
-        let (next_state, _) = crate::varint::read_var_int(&frame[pos..]).unwrap();
+        let (next_state, _) = crate::protocol::varint::read_var_int(&frame[pos..]).unwrap();
         assert_eq!(next_state, 1);
     }
 
@@ -173,8 +173,8 @@ mod tests {
     #[test]
     fn pong_encodes_payload() {
         let frame = encode_pong(0x1234_5678_9abc_def0);
-        let (_, mut pos) = crate::varint::read_var_int(&frame).unwrap();
-        let (id, c) = crate::varint::read_var_int(&frame[pos..]).unwrap();
+        let (_, mut pos) = crate::protocol::varint::read_var_int(&frame).unwrap();
+        let (id, c) = crate::protocol::varint::read_var_int(&frame[pos..]).unwrap();
         pos += c;
         assert_eq!(id, 1);
         let payload = i64::from_be_bytes(frame[pos..pos + 8].try_into().unwrap());

@@ -2,10 +2,22 @@
 //! `printRoutes`, `metricsCommand`/`printMetrics`, `printWhois`, `formatDuration`,
 //! `formatBytes`).
 //!
-//! Uses `rustyline` as the closest analogue to JLine (line editing/history, an external-print
-//! hook so a log line arriving mid-command doesn't corrupt the prompt) with a plain-stdin
-//! fallback when `MCGATE_PLAIN_CONSOLE=true` is set or a real terminal isn't available — same
-//! shape as the Kotlin version's JLine-or-plain-`BufferedReader` fallback.
+//! Plain stdin (one command per line, no editing/history) is the default console, and that's
+//! deliberate: a hosting panel's "send command" box (Pterodactyl included) writes a whole typed
+//! line into the container's stdin in one shot rather than emulating real per-keystroke terminal
+//! input, even when the container does have a pty allocated (so a tty-detection heuristic can't
+//! tell the two apart). Feeding that into `rustyline` - which expects to see and echo every
+//! keystroke itself to track cursor position - produces exactly the symptoms that showed up in
+//! practice: a bare `>` prompt landing on its own line, the typed command echoed back on the next
+//! one instead of beside the prompt, and commands that only "take" after being sent more than
+//! once. None of that is a bug in the command handlers below; it's `rustyline` and a line-at-a-
+//! time input source disagreeing about what's on screen.
+//!
+//! Set `MCGATE_INTERACTIVE_CONSOLE=true` to opt into `rustyline` (line editing/history, an
+//! external-print hook so a log line arriving mid-command doesn't corrupt the prompt) instead -
+//! appropriate when actually running the binary directly in your own terminal. It still falls
+//! back to plain automatically if stdin/stdout turn out not to both be a real pty, or if
+//! `rustyline` fails to initialize.
 //!
 //! `kick` really disconnects a live session now (`PlayerSession::disconnect`, awaited alongside
 //! the relay splice in `server.rs`) but can't carry a message — see `state.rs`'s `PlayerSession`
@@ -18,13 +30,14 @@ use std::time::Duration;
 
 use rustyline::{DefaultEditor, ExternalPrinter};
 
-use crate::app_state::AppState;
-use crate::route_metrics_store::route_metrics_store;
+use crate::state::app_state::AppState;
+use crate::state::route_metrics_store::route_metrics_store;
 use crate::state::player_sessions;
 use crate::version::version;
 
 pub fn start(state: Arc<AppState>) {
-    let plain = std::env::var("MCGATE_PLAIN_CONSOLE").map(|v| v == "true").unwrap_or(false);
+    let interactive_requested = std::env::var("MCGATE_INTERACTIVE_CONSOLE").map(|v| v == "true").unwrap_or(false);
+    let plain = !interactive_requested || !(crate::logging::is_stdin_tty() && crate::logging::is_stdout_tty());
     std::thread::Builder::new()
         .name("console".into())
         .spawn(move || run(state, plain))
@@ -91,7 +104,12 @@ fn handle_command(state: &Arc<AppState>, line: &str) -> bool {
     match command.as_str() {
         "stop" | "shutdown" | "exit" => {
             tracing::info!("Stop command received, shutting down...");
-            std::process::exit(0);
+            // Route through the same shutdown path as Ctrl+C (`main.rs::shutdown_gracefully`)
+            // rather than a bare `process::exit` here: that kicks every connected player and
+            // flushes the SQLite writer threads first, instead of yanking the process out from
+            // under them. This runs on the console's own OS thread, not a tokio task, so it
+            // bridges into the runtime via `block_on` the same way `resolve_blocking` does below.
+            state.runtime_handle().block_on(crate::shutdown_gracefully());
         }
         "help" | "?" => print_help(),
         "players" | "list" | "playerlist" => print_players(),
@@ -260,7 +278,7 @@ fn format_bytes(bytes: i64) -> String {
 fn print_metrics(state: &Arc<AppState>) {
     let cfg = state.config();
     let store = route_metrics_store();
-    let rows: Vec<(usize, Arc<crate::route_metrics_store::RouteTrafficCounter>)> =
+    let rows: Vec<(usize, Arc<crate::state::route_metrics_store::RouteTrafficCounter>)> =
         cfg.routes.iter().enumerate().filter_map(|(i, r)| store.handle(r).map(|c| (i, c))).collect();
     if rows.is_empty() {
         tracing::info!("No routes have metrics accounting enabled.");

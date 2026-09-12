@@ -11,7 +11,7 @@ use crate::config::ReconnectMessages;
 
 /// Bundled default `messages.yml`, embedded at compile time (mirrors the Kotlin build packaging
 /// `default-messages.yml` as a jar resource read via the classloader).
-const DEFAULT_MESSAGES_YML: &str = include_str!("../resources/default-messages.yml");
+const DEFAULT_MESSAGES_YML: &str = include_str!("../../resources/default-messages.yml");
 
 /// Default text for all player-facing messages, loaded from messages.yml. Routes may still
 /// override any of these per-route via config.yml's `reconnect:` block. `kick_message` is its

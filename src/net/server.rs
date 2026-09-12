@@ -20,19 +20,19 @@ use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::app_state::AppState;
-use crate::backend_selector::order_backends;
-use crate::buffered_stream::BufferedStream;
+use crate::state::app_state::AppState;
+use crate::net::backend_selector::order_backends;
+use crate::net::buffered_stream::BufferedStream;
 use crate::config::Route;
-use crate::flood_control::{connection_rates, GlobalConnectionGuard};
-use crate::handshake::HandshakeError;
-use crate::minecraft_protocol::{encode_handshake, encode_proxy_protocol_header, encode_status_response};
-use crate::ping_cache::PingCache;
-use crate::route_metrics_store::route_metrics_store;
+use crate::net::flood_control::{connection_rates, GlobalConnectionGuard};
+use crate::protocol::handshake::HandshakeError;
+use crate::protocol::minecraft_protocol::{encode_handshake, encode_proxy_protocol_header, encode_status_response};
+use crate::net::ping_cache::PingCache;
+use crate::state::route_metrics_store::route_metrics_store;
 use crate::state::{player_sessions, PlayerSession, RouteRuntime};
-use crate::status_json::build_fallback_json;
-use crate::text_format::to_json_component;
-use crate::varint::{read_var_int, write_var_int, MAX_PACKET_BYTES};
+use crate::protocol::status_json::build_fallback_json;
+use crate::protocol::text_format::to_json_component;
+use crate::protocol::varint::{read_var_int, write_var_int, MAX_PACKET_BYTES};
 
 fn ping_cache() -> &'static PingCache {
     static INSTANCE: std::sync::OnceLock<PingCache> = std::sync::OnceLock::new();
@@ -40,7 +40,7 @@ fn ping_cache() -> &'static PingCache {
 }
 
 pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
-    crate::ping_cache::spawn_sweeper(ping_cache());
+    crate::net::ping_cache::spawn_sweeper(ping_cache());
     let bind = state.config().bind_address()?;
     let listener = TcpListener::bind(bind).await?;
     tracing::info!("Listening on {bind}");
@@ -82,7 +82,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
 
     let mut effective_addr = peer_addr;
     if cfg.proxy_protocol {
-        match crate::proxy_protocol_tcp::read_proxy_protocol_header(&mut stream).await {
+        match crate::protocol::proxy_protocol_tcp::read_proxy_protocol_header(&mut stream).await {
             Ok(Some(addr)) => effective_addr = addr,
             Ok(None) => {} // v2 LOCAL / degenerate header - fall back to the real TCP peer
             Err(e) => {
@@ -97,7 +97,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
     // otherwise look like it came from the upstream load balancer.
     let per_ip_limit = if cfg.proxy_protocol { 0 } else { cfg.max_connections_per_ip.max(0) as u32 };
     let ip_string = (!cfg.proxy_protocol).then(|| effective_addr.ip().to_string());
-    let Some(mut guard) = crate::connection_guard::PreLoginGuard::acquire(ip_string.as_deref(), per_ip_limit) else {
+    let Some(mut guard) = crate::net::connection_guard::PreLoginGuard::acquire(ip_string.as_deref(), per_ip_limit) else {
         tracing::debug!("Dropping connection from {effective_addr} - over per-IP pre-login limit ({per_ip_limit})");
         return;
     };
@@ -144,7 +144,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
     }
 }
 
-async fn resolve_ordered_backends(route: &Route, runtime: &RouteRuntime, captures: &[String]) -> Result<Vec<SocketAddr>, crate::dns_cache::DnsResolveError> {
+async fn resolve_ordered_backends(route: &Route, runtime: &RouteRuntime, captures: &[String]) -> Result<Vec<SocketAddr>, crate::net::dns_cache::DnsResolveError> {
     let resolved = route.resolve_backends(captures).await?;
     Ok(order_backends(route, runtime, &resolved))
 }
@@ -154,7 +154,7 @@ async fn handle_status(
     route: &Route,
     runtime: &RouteRuntime,
     captures: &[String],
-    handshake: &crate::handshake::Handshake,
+    handshake: &crate::protocol::handshake::Handshake,
     client_addr: SocketAddr,
 ) {
     // Status Request (packet id 0x00, no fields).
@@ -223,7 +223,7 @@ async fn handle_status(
 
 /// Dials `addr` just long enough to fetch and validate its Status Response JSON. `None` on any
 /// failure (connect, timeout, malformed response) - the caller fails over to the next backend.
-async fn fetch_backend_status(route: &Route, addr: SocketAddr, handshake: &crate::handshake::Handshake, client_addr: SocketAddr) -> Option<String> {
+async fn fetch_backend_status(route: &Route, addr: SocketAddr, handshake: &crate::protocol::handshake::Handshake, client_addr: SocketAddr) -> Option<String> {
     let connect = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await;
     let mut backend = match connect {
         Ok(Ok(s)) => s,
@@ -234,12 +234,8 @@ async fn fetch_backend_status(route: &Route, addr: SocketAddr, handshake: &crate
     };
     let _ = backend.set_nodelay(true);
 
-    if route.proxy_protocol {
-        // Never forward a degenerate source (loopback/wildcard/port 0) - a strict backend
-        // RST-drops such a PROXY header, which would look exactly like a dead backend.
-        if client_addr.port() != 0 && !client_addr.ip().is_unspecified() && !client_addr.ip().is_loopback() {
-            let _ = tokio::io::AsyncWriteExt::write_all(&mut backend, &encode_proxy_protocol_header(client_addr, addr)).await;
-        }
+    if route.proxy_protocol && should_forward_proxy_protocol(client_addr) {
+        let _ = tokio::io::AsyncWriteExt::write_all(&mut backend, &encode_proxy_protocol_header(client_addr, addr)).await;
     }
     // Forward the connecting client's real protocol version so version-multiplexing backends
     // resolve and report the version the client actually asked for.
@@ -264,7 +260,7 @@ async fn fetch_backend_status(route: &Route, addr: SocketAddr, handshake: &crate
     if packet_id != 0x00 {
         return None;
     }
-    let (json, _) = crate::varint::read_string(&frame[header_len + consumed..], 262_144).ok()?;
+    let (json, _) = crate::protocol::varint::read_string(&frame[header_len + consumed..], 262_144).ok()?;
     if !is_valid_status_json(&json) {
         tracing::warn!("Backend {addr} sent a malformed status response, treating as down");
         return None;
@@ -299,7 +295,7 @@ async fn handle_ping(stream: &mut BufferedStream<TcpStream>, client_addr: Socket
         return;
     }
     let payload = i64::from_be_bytes(frame[payload_start..payload_start + 8].try_into().unwrap());
-    if let Err(e) = tokio::io::AsyncWriteExt::write_all(stream, &crate::minecraft_protocol::encode_pong(payload)).await {
+    if let Err(e) = tokio::io::AsyncWriteExt::write_all(stream, &crate::protocol::minecraft_protocol::encode_pong(payload)).await {
         tracing::debug!("Failed to send pong to {client_addr}: {e}");
     }
 }
@@ -309,9 +305,9 @@ async fn handle_login(
     route: &Route,
     runtime: &Arc<RouteRuntime>,
     captures: &[String],
-    handshake: &crate::handshake::Handshake,
+    handshake: &crate::protocol::handshake::Handshake,
     client_addr: SocketAddr,
-    guard: &mut crate::connection_guard::PreLoginGuard,
+    guard: &mut crate::net::connection_guard::PreLoginGuard,
     state: &Arc<AppState>,
 ) {
     // Refuse outright if this route's cumulative usage has already reached its configured limit
@@ -338,7 +334,7 @@ async fn handle_login(
     };
     // login_start_frame already includes its own length prefix - parse_login_start expects
     // exactly that shape.
-    let parsed_login = crate::minecraft_protocol::parse_login_start(&login_start_frame);
+    let parsed_login = crate::protocol::minecraft_protocol::parse_login_start(&login_start_frame);
     let player_name = parsed_login.as_ref().map(|(name, _)| name.clone());
 
     guard.done(); // proven real - stop the login deadline / free the per-IP pre-login slot
@@ -365,11 +361,12 @@ async fn handle_login(
                 }
                 runtime.record_connect_opened(*addr);
                 runtime.record_latency(*addr, dial_start.elapsed().as_millis() as i64);
-                tracing::info!(
-                    "Connected: '{}'{} from {client_addr} -> {addr}",
-                    handshake.host,
-                    player_name.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
-                );
+                let player_tag = match (player_name.as_deref(), parsed_login.as_ref().and_then(|(_, uuid)| *uuid)) {
+                    (Some(name), Some(uuid)) => format!(" ({name}, {uuid})"),
+                    (Some(name), None) => format!(" ({name})"),
+                    (None, _) => String::new(),
+                };
+                tracing::info!("Connected: '{}'{player_tag} from {client_addr} -> {addr}", handshake.host);
 
                 register_voicechat_route(route, captures, client_addr, &handshake.host, state.config().log_connections).await;
 
@@ -402,7 +399,7 @@ async fn handle_login(
                 runtime.record_connect_closed(*addr);
                 if let Some(session) = &session {
                     player_sessions().remove(session.uuid);
-                    crate::connection_tracker::connection_tracker().record(crate::connection_tracker::ConnectionRecord {
+                    crate::state::connection_tracker::connection_tracker().record(crate::state::connection_tracker::ConnectionRecord {
                         uuid: session.uuid,
                         name: session.name.clone(),
                         ip: session.remote_address.clone(),
@@ -419,7 +416,7 @@ async fn handle_login(
                         disconnected_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0),
                     });
                 }
-                crate::voice_routing::voice_routing().unregister(&client_addr.ip().to_string());
+                crate::udp::voice_routing::voice_routing().unregister(&client_addr.ip().to_string());
                 tracing::info!("Disconnected: '{}' from {client_addr} -> {addr}", handshake.host);
                 return;
             }
@@ -439,17 +436,28 @@ async fn handle_login(
 }
 
 async fn kick(stream: &mut BufferedStream<TcpStream>, message: &str) {
-    let packet = crate::reconnect_protocol::encode_login_disconnect(&to_json_component(message));
+    let packet = crate::protocol::reconnect_protocol::encode_login_disconnect(&to_json_component(message));
     let _ = tokio::io::AsyncWriteExt::write_all(stream, &packet).await;
 }
 
-async fn dial_backend(route: &Route, addr: SocketAddr, handshake: &crate::handshake::Handshake, client_addr: SocketAddr) -> std::io::Result<TcpStream> {
+/// Whether `client_addr` is a real, forwardable source for an outbound PROXY protocol header -
+/// used by both `dial_backend` (login) and `fetch_backend_status` (status ping) so the two paths
+/// can't drift apart on this again. A degenerate source (loopback, unspecified/wildcard, or port
+/// 0 - e.g. a client that connected via `localhost`/`127.0.0.1`) must never be forwarded: a
+/// strict backend PROXY protocol implementation RST-drops, or worse, silently withholds any
+/// response to, a header claiming such a source - which looks identical to a hung/unreachable
+/// backend from the client's side, with no error logged anywhere.
+fn should_forward_proxy_protocol(client_addr: SocketAddr) -> bool {
+    client_addr.port() != 0 && !client_addr.ip().is_unspecified() && !client_addr.ip().is_loopback()
+}
+
+async fn dial_backend(route: &Route, addr: SocketAddr, handshake: &crate::protocol::handshake::Handshake, client_addr: SocketAddr) -> std::io::Result<TcpStream> {
     let mut backend = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
     let _ = backend.set_nodelay(true);
 
-    if route.proxy_protocol {
+    if route.proxy_protocol && should_forward_proxy_protocol(client_addr) {
         tokio::io::AsyncWriteExt::write_all(&mut backend, &encode_proxy_protocol_header(client_addr, addr)).await?;
     }
     if route.modify_virtual_host {
@@ -470,7 +478,7 @@ async fn dial_backend(route: &Route, addr: SocketAddr, handshake: &crate::handsh
 /// more once its own `write_all` call has returned, so a slow reader on one side naturally stalls
 /// reads from the other via normal `AsyncRead`/`AsyncWrite` polling - nothing extra to port for
 /// `FlowControl.kt`.
-async fn relay(client: &mut BufferedStream<TcpStream>, backend: TcpStream, session: Option<&PlayerSession>, route_counter: Option<&crate::route_metrics_store::RouteTrafficCounter>) {
+async fn relay(client: &mut BufferedStream<TcpStream>, backend: TcpStream, session: Option<&PlayerSession>, route_counter: Option<&crate::state::route_metrics_store::RouteTrafficCounter>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut client_r, mut client_w) = tokio::io::split(client);
@@ -545,7 +553,7 @@ async fn register_voicechat_route(route: &Route, captures: &[String], client_add
     }
     match route.resolve_voicechat(captures).await {
         Ok(Some(voice_backend)) => {
-            crate::voice_routing::voice_routing().register(&client_addr.ip().to_string(), host, voice_backend);
+            crate::udp::voice_routing::voice_routing().register(&client_addr.ip().to_string(), host, voice_backend);
             if log_connections {
                 tracing::info!("Voicechat route: host='{host}' from {client_addr} -> {voice_backend}");
             }

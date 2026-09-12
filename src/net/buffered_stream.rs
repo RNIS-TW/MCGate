@@ -16,8 +16,8 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
-use crate::handshake::{self, Handshake, HandshakeError, ParseOutcome};
-use crate::varint::read_var_int;
+use crate::protocol::handshake::{self, Handshake, HandshakeError, ParseOutcome};
+use crate::protocol::varint::read_var_int;
 
 pub struct BufferedStream<S> {
     inner: S,
@@ -121,7 +121,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for BufferedStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::minecraft_protocol::{encode_handshake, encode_login_start};
+    use crate::protocol::minecraft_protocol::{encode_handshake, encode_login_start};
     use std::io::Cursor;
 
     #[tokio::test]

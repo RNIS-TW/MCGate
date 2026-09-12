@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use crate::config::GateConfig;
 use crate::logging::LogLevelHandle;
-use crate::messages::GateMessages;
+use crate::config::messages::GateMessages;
 use crate::state::RouteRuntime;
 
 pub struct AppState {
@@ -48,9 +48,9 @@ impl AppState {
     ) -> Arc<Self> {
         let route_runtimes = (0..config.routes.len()).map(|i| (i, Arc::new(RouteRuntime::default()))).collect();
         crate::config::warm_static_backends(&config.routes, &runtime_handle);
-        crate::route_metrics_store::route_metrics_store().apply_config(&config.routes, Duration::from_millis(10_000));
-        crate::connection_tracker::connection_tracker().apply_config(config.connection_tracking.clone());
-        crate::udp_throttle::udp_throttle().apply(&config.udp_throttle);
+        crate::state::route_metrics_store::route_metrics_store().apply_config(&config.routes, Duration::from_millis(10_000));
+        crate::state::connection_tracker::connection_tracker().apply_config(config.connection_tracking.clone());
+        crate::udp::throttle::udp_throttle().apply(&config.udp_throttle);
         let state = Arc::new(Self {
             config_path,
             messages_path,
@@ -63,7 +63,7 @@ impl AppState {
             self_weak: OnceLock::new(),
         });
         let _ = state.self_weak.set(Arc::downgrade(&state));
-        crate::stats_logger::stats_logger().apply_config(config.stats_logging, state.clone());
+        crate::state::stats_logger::stats_logger().apply_config(config.stats_logging, state.clone());
         state
     }
 
@@ -107,11 +107,11 @@ impl AppState {
 
         self.log_level.apply(&new_config.log_level);
         crate::config::warm_static_backends(&new_config.routes, &self.runtime_handle);
-        crate::route_metrics_store::route_metrics_store().apply_config(&new_config.routes, Duration::from_millis(10_000));
-        crate::connection_tracker::connection_tracker().apply_config(new_config.connection_tracking.clone());
-        crate::udp_throttle::udp_throttle().apply(&new_config.udp_throttle);
+        crate::state::route_metrics_store::route_metrics_store().apply_config(&new_config.routes, Duration::from_millis(10_000));
+        crate::state::connection_tracker::connection_tracker().apply_config(new_config.connection_tracking.clone());
+        crate::udp::throttle::udp_throttle().apply(&new_config.udp_throttle);
         if let Some(state) = self.self_weak.get().and_then(Weak::upgrade) {
-            crate::stats_logger::stats_logger().apply_config(new_config.stats_logging.clone(), state);
+            crate::state::stats_logger::stats_logger().apply_config(new_config.stats_logging.clone(), state);
         }
         *self.config.lock().unwrap() = new_config;
     }

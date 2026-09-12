@@ -28,9 +28,9 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::proxy_protocol_datagram::parse_proxy_protocol_header;
-use crate::udp_throttle::udp_throttle;
-use crate::voice_routing::voice_routing;
+use crate::protocol::proxy_protocol_datagram::parse_proxy_protocol_header;
+use crate::udp::throttle::udp_throttle;
+use crate::udp::voice_routing::voice_routing;
 
 const REAPER_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_DATAGRAM_SIZE: usize = 65_527;
@@ -392,7 +392,7 @@ fn evict_stale_sessions(shared: &Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::voice_routing::voice_routing;
+    use crate::udp::voice_routing::voice_routing;
 
     // Both scenarios below share `voice_routing()`'s global singleton, keyed by client IP - and
     // every loopback test client is "127.0.0.1", so running them as two separate `#[tokio::test]`

@@ -284,7 +284,7 @@ fn enforce_limits(store: &RouteMetricsStore, routes: &[Route], kick_message: &st
 
 /// Spawns the periodic flush/enforce/auto-reset tick. Call once at startup, from within a tokio
 /// runtime. `state` supplies the current routes/kick-message fresh on every tick.
-pub fn spawn_ticker(state: Arc<crate::app_state::AppState>) {
+pub fn spawn_ticker(state: Arc<crate::state::app_state::AppState>) {
     tokio::spawn(async move {
         loop {
             let interval = *route_metrics_store().flush_interval.lock().unwrap();
@@ -308,7 +308,7 @@ mod tests {
 
     fn route_with_metrics(file: Option<&str>, upload_limit: i64) -> Route {
         Route {
-            host_patterns: vec![crate::host_pattern::HostPattern::new("a.example.com")],
+            host_patterns: vec![crate::config::host_pattern::HostPattern::new("a.example.com")],
             backend_templates: vec!["127.0.0.1:1".into()],
             strategy: crate::config::Strategy::Sequential,
             cache_ping_ttl_millis: 10_000,

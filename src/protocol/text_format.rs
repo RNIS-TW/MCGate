@@ -565,7 +565,7 @@ mod tests {
 
     #[test]
     fn real_bundled_metrics_limit_kick_message_renders_without_panicking() {
-        let messages = crate::messages::GateMessages::default();
+        let messages = crate::config::messages::GateMessages::default();
         let input = &messages.metrics_limit_kick_message;
 
         let legacy = to_legacy_text(input);

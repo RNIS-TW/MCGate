@@ -4,6 +4,11 @@
 //! `routing/LiveMetrics.kt`). `server.rs` now populates `PlayerSessions` on every real login and
 //! bumps `RouteRuntime` on every real connect/disconnect — this is live data, not a placeholder.
 
+pub mod app_state;
+pub mod connection_tracker;
+pub mod route_metrics_store;
+pub mod stats_logger;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU32};
@@ -274,7 +279,7 @@ pub async fn collect_metrics(routes: &[Route], runtime_supplier: impl Fn(&Route)
         .iter()
         .enumerate()
         .filter_map(|(index, route)| {
-            let counter = crate::route_metrics_store::route_metrics_store().handle(route)?;
+            let counter = crate::state::route_metrics_store::route_metrics_store().handle(route)?;
             use std::sync::atomic::Ordering;
             let file = counter.file.lock().unwrap().clone();
             Some(RouteMetric {
@@ -300,9 +305,9 @@ pub async fn collect_metrics(routes: &[Route], runtime_supplier: impl Fn(&Route)
         uptime_seconds: process_start().elapsed().as_secs_f64(),
         backends,
         players,
-        tracking_enabled: crate::connection_tracker::connection_tracker().is_enabled(),
-        tracking_queued_records: crate::connection_tracker::connection_tracker().queued_records(),
-        tracking_dropped_records_total: crate::connection_tracker::connection_tracker().dropped_records_total(),
+        tracking_enabled: crate::state::connection_tracker::connection_tracker().is_enabled(),
+        tracking_queued_records: crate::state::connection_tracker::connection_tracker().queued_records(),
+        tracking_dropped_records_total: crate::state::connection_tracker::connection_tracker().dropped_records_total(),
         route_metrics,
     }
 }

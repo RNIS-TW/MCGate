@@ -1,14 +1,54 @@
-# MCGate (Rust port)
+# MCGate
 
-An in-progress Rust/tokio port of the Java/Kotlin MCGate proxy in the repository root. Same
-purpose — a thin, host-based reverse proxy for Minecraft servers — same `config.yml`/
-`messages.yml` format, but compiled to a single native binary instead of running on a JVM.
+A thin, host-based reverse proxy for Minecraft servers, written in Rust/tokio and compiled to a
+single native binary — no JVM, no separate runtime.
 
-See [`plan.md`](plan.md) for exactly what's ported, what's deliberately out of scope, and how
+See [`plan.md`](plan.md) for the port history from the original Java/Kotlin implementation this
+was rewritten from, including exactly what was ported, what's deliberately out of scope, and how
 each piece was verified. Short version: every section is done — config, hot reload, the TCP
 relay (handshake/status/login), backend selection strategies, per-route traffic metrics, SQLite
 connection tracking and stats logging, the UDP/voicechat relays, the console REPL, and the HTTP
-API — except mid-session auto-reconnect-holding (`ReconnectHandler.kt`), which is not ported.
+API — except mid-session auto-reconnect-holding, which was deliberately not ported.
+
+## Project layout
+
+```
+src/
+  main.rs       entry point: CLI args, startup wiring, the shared graceful-shutdown path
+  console.rs    the admin REPL (help/players/kick/reload/stop/...)
+  logging.rs    console + rolling-file logging, colour/level handling
+  version.rs    build version string
+
+  protocol/     Minecraft wire format - pure parsing/encoding, no app state or I/O
+    varint.rs, minecraft_protocol.rs, handshake.rs, nbt.rs, compression.rs,
+    text_format.rs, status_json.rs, reconnect_protocol.rs,
+    proxy_protocol_tcp.rs, proxy_protocol_datagram.rs
+
+  config/       config.yml/messages.yml schema, parsing, and hot-reload
+    config.rs (schema + parsing, at the crate::config root), loader.rs (file
+    watching), messages.rs, duration.rs, host_pattern.rs
+
+  net/          the TCP relay: accept loop, backend dial/selection, anti-abuse
+                gating, and the HTTP status/metrics API
+    server.rs, backend_pinger.rs, backend_selector.rs, buffered_stream.rs,
+    connection_guard.rs, dns_cache.rs, flood_control.rs, network_info.rs,
+    ping_cache.rs, api.rs
+
+  udp/          UDP: standalone forwards, the voicechat relay + its routing
+                table, and the shared anti-abuse session/rate limits
+    proxy.rs, voice_relay.rs, voice_routing.rs, throttle.rs
+
+  state/        live process state: connected players, per-route runtime,
+                and the SQLite-backed connection-tracking/stats-logging writers
+    state.rs (sessions/route runtime, at the crate::state root),
+    app_state.rs, connection_tracker.rs, route_metrics_store.rs, stats_logger.rs
+```
+
+Each of `config`, `net`, `udp`, and `state` is a directory whose parent file (`config.rs`,
+`net.rs`, `udp.rs`, `state.rs`) just declares its submodules — `config.rs` and `state.rs` also
+hold that module's core types directly (`GateConfig`/`Route` and `PlayerSession`/`RouteRuntime`
+respectively), so e.g. `crate::config::Route` and `crate::config::host_pattern::HostPattern` are
+both valid, one from the parent file and one from a submodule.
 
 ## Build
 
@@ -22,9 +62,34 @@ minimal server image install `build-essential` (Debian/Ubuntu) or `gcc` (RHEL/Al
 cargo build --release
 ```
 
-Produces a single self-contained binary at `target/release/mcgate` — no JVM, no separate runtime,
-no other files to ship alongside it (`bundled` SQLite is statically linked in). Copy that one
-file to a server and run it; that's the whole deployment.
+Produces a single self-contained binary at `target/release/mcgate` — no separate runtime, no other
+files to ship alongside it (`bundled` SQLite is statically linked in). Copy that one file to a
+server and run it; that's the whole deployment.
+
+**The binary is only portable across machines with the same OS and CPU architecture as the one it
+was built on.** Running a macOS/arm64 (Apple Silicon) build on a Linux/x86_64 server, for
+example, fails with `cannot execute binary file: Exec format error`. That's not a corrupted
+binary, it's the wrong target. Either build directly on a machine matching the deployment target,
+or cross-compile.
+
+### Cross-compiling for a Linux server (e.g. Pterodactyl)
+
+Building on macOS but deploying to a Linux/x86_64 host (the common case: most VPS/hosting-panel
+servers, Pterodactyl included, are `x86_64-unknown-linux-gnu`)? Install
+[`cross`](https://github.com/cross-rs/cross) once (needs Docker running locally), then:
+
+```
+cargo install cross --git https://github.com/cross-rs/cross
+cross build --release --target x86_64-unknown-linux-gnu
+```
+
+That produces `target/x86_64-unknown-linux-gnu/release/mcgate` — copy that binary to the server.
+For an ARM64 Linux host (e.g. AWS Graviton, Oracle's ARM free tier) swap the target for
+`aarch64-unknown-linux-gnu` instead.
+
+Plain `cargo build --target ...` isn't enough for cross-OS builds — it still uses the host
+linker, which can't produce a Linux glibc binary from macOS. `cross` runs the build inside a
+Docker container with the right target toolchain instead.
 
 ## Run
 
@@ -33,12 +98,28 @@ file to a server and run it; that's the whole deployment.
 ```
 
 Both arguments are optional and default to `config.yml`/`messages.yml` in the current directory;
-a missing file is bootstrapped from the built-in defaults on first run, same as the Kotlin build.
+a missing file is bootstrapped from the built-in defaults on first run.
 
 ```
 ./target/release/mcgate --help       # usage
 ./target/release/mcgate --version    # prints the built version
 ```
+
+### Console
+
+Once running, type commands directly into stdin: `help`, `players`, `whois <player>`,
+`kick <player> [message]`, `routes`, `metrics [reset <index|host|all>]`, `reload`, `uptime`,
+`version`, `stop`/`shutdown`/`exit`. Plain stdin (one command per line) is the default and is
+what you want under a hosting panel like Pterodactyl — panel "send command" boxes write a whole
+line into the container's stdin at once rather than emulating real keystroke-by-keystroke
+terminal input, which line-editing libraries can't follow (it shows up as commands needing to be
+sent more than once, or the prompt and typed text landing on separate lines). Set
+`MCGATE_INTERACTIVE_CONSOLE=true` to opt into line editing/history instead, when actually running
+the binary directly in your own terminal.
+
+`stop`/`shutdown`/`exit` (and Ctrl+C) all go through the same graceful shutdown: every connected
+player is disconnected, the SQLite connection-tracking/stats-logging writers are flushed, then
+the process exits — rather than hanging until players happen to disconnect on their own.
 
 ### Running as a service
 

@@ -1,7 +1,7 @@
 //! Port of `protocol/StatusJson.kt`.
 
 use crate::config::FallbackStatus;
-use crate::text_format::{escape_json, to_json_component};
+use crate::protocol::text_format::{escape_json, to_json_component};
 use std::fmt::Write as _;
 
 pub fn build_fallback_json(fallback: &FallbackStatus) -> String {

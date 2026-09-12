@@ -14,7 +14,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use crate::app_state::AppState;
+use crate::state::app_state::AppState;
 use crate::config::Route;
 use crate::state::{collect_metrics, MetricsSnapshot, PlayerSession};
 
@@ -141,7 +141,7 @@ async fn route_metrics_handler(State(state): State<Arc<AppState>>, headers: Head
     }
     let cfg = state.config();
     let Some(route) = cfg.routes.get(index) else { return not_found() };
-    let Some(counter) = crate::route_metrics_store::route_metrics_store().handle(route) else { return not_found() };
+    let Some(counter) = crate::state::route_metrics_store::route_metrics_store().handle(route) else { return not_found() };
     use std::sync::atomic::Ordering;
     Json(json!({
         "index": index,
@@ -194,7 +194,7 @@ async fn ping_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Ax
     let mut pings = Vec::new();
     for (i, template) in route.backend_templates.iter().enumerate() {
         let addr = addrs[i];
-        let result = crate::backend_pinger::ping_backend_live(addr, -1, &virtual_host, addr.port(), std::time::Duration::from_secs(5), route.proxy_protocol).await;
+        let result = crate::net::backend_pinger::ping_backend_live(addr, -1, &virtual_host, addr.port(), std::time::Duration::from_secs(5), route.proxy_protocol).await;
         match result {
             Ok(r) => {
                 if let Some(rt) = &runtime {
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn route_json_shape() {
         let route = Route {
-            host_patterns: vec![crate::host_pattern::HostPattern::new("a.example.com")],
+            host_patterns: vec![crate::config::host_pattern::HostPattern::new("a.example.com")],
             backend_templates: vec!["127.0.0.1:25566".into()],
             strategy: crate::config::Strategy::Sequential,
             cache_ping_ttl_millis: 10_000,

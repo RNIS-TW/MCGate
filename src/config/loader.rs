@@ -17,8 +17,8 @@ use std::time::Duration;
 use anyhow::Result;
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebounceEventResult, Debouncer};
 
+use crate::config::messages::GateMessages;
 use crate::config::{self, GateConfig};
-use crate::messages::GateMessages;
 
 /// Matches Kotlin's 200ms debounce window.
 const DEBOUNCE: Duration = Duration::from_millis(200);

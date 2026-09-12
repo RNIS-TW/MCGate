@@ -25,7 +25,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::UdpProxyConfig;
-use crate::udp_throttle::udp_throttle;
+use crate::udp::throttle::udp_throttle;
 
 const REAPER_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_DATAGRAM_SIZE: usize = 65_527; // max UDP payload size

@@ -12,9 +12,9 @@
 
 use uuid::Uuid;
 
-use crate::compression::frame;
-use crate::nbt::write_root_compound;
-use crate::varint::{write_string, write_var_int};
+use crate::protocol::compression::frame;
+use crate::protocol::nbt::write_root_compound;
+use crate::protocol::varint::{write_string, write_var_int};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ReconnectPacketIds {
@@ -153,8 +153,8 @@ pub fn encode_start_configuration(ids: &ReconnectPacketIds, compression_threshol
 pub fn encode_play_disconnect(ids: &ReconnectPacketIds, rendered_reason_text: &str, compression_threshold: i32) -> Vec<u8> {
     let mut payload = Vec::new();
     write_var_int(&mut payload, ids.play_disconnect);
-    payload.push(crate::nbt::STRING);
-    crate::nbt::write_nbt_string(&mut payload, rendered_reason_text);
+    payload.push(crate::protocol::nbt::STRING);
+    crate::protocol::nbt::write_nbt_string(&mut payload, rendered_reason_text);
     frame(&payload, compression_threshold)
 }
 
@@ -257,8 +257,8 @@ pub fn encode_empty_chunk(ids: &ReconnectPacketIds, compression_threshold: i32, 
 pub fn encode_action_bar(ids: &ReconnectPacketIds, rendered_text: &str, compression_threshold: i32) -> Vec<u8> {
     let mut payload = Vec::new();
     write_var_int(&mut payload, ids.play_set_action_bar_text);
-    payload.push(crate::nbt::STRING);
-    crate::nbt::write_nbt_string(&mut payload, rendered_text);
+    payload.push(crate::protocol::nbt::STRING);
+    crate::protocol::nbt::write_nbt_string(&mut payload, rendered_text);
     frame(&payload, compression_threshold)
 }
 
@@ -267,8 +267,8 @@ pub fn encode_action_bar(ids: &ReconnectPacketIds, rendered_text: &str, compress
 pub fn encode_set_title_text(ids: &ReconnectPacketIds, rendered_text: &str, compression_threshold: i32) -> Vec<u8> {
     let mut payload = Vec::new();
     write_var_int(&mut payload, ids.play_set_title_text);
-    payload.push(crate::nbt::STRING);
-    crate::nbt::write_nbt_string(&mut payload, rendered_text);
+    payload.push(crate::protocol::nbt::STRING);
+    crate::protocol::nbt::write_nbt_string(&mut payload, rendered_text);
     frame(&payload, compression_threshold)
 }
 
@@ -277,8 +277,8 @@ pub fn encode_set_title_text(ids: &ReconnectPacketIds, rendered_text: &str, comp
 pub fn encode_set_subtitle_text(ids: &ReconnectPacketIds, rendered_text: &str, compression_threshold: i32) -> Vec<u8> {
     let mut payload = Vec::new();
     write_var_int(&mut payload, ids.play_set_subtitle_text);
-    payload.push(crate::nbt::STRING);
-    crate::nbt::write_nbt_string(&mut payload, rendered_text);
+    payload.push(crate::protocol::nbt::STRING);
+    crate::protocol::nbt::write_nbt_string(&mut payload, rendered_text);
     frame(&payload, compression_threshold)
 }
 
@@ -326,11 +326,11 @@ mod tests {
         let ids = reconnect_packet_ids(776);
         let wire = encode_transfer(&ids, "example.com", 25566, -1);
         // frame length varint, then packet-id varint, then string, then u16 port
-        let (_, mut pos) = crate::varint::read_var_int(&wire).unwrap();
-        let (id, c) = crate::varint::read_var_int(&wire[pos..]).unwrap();
+        let (_, mut pos) = crate::protocol::varint::read_var_int(&wire).unwrap();
+        let (id, c) = crate::protocol::varint::read_var_int(&wire[pos..]).unwrap();
         pos += c;
         assert_eq!(id, ids.play_transfer);
-        let (host, c) = crate::varint::read_string(&wire[pos..], 255).unwrap();
+        let (host, c) = crate::protocol::varint::read_string(&wire[pos..], 255).unwrap();
         pos += c;
         assert_eq!(host, "example.com");
         let port = u16::from_be_bytes(wire[pos..pos + 2].try_into().unwrap());

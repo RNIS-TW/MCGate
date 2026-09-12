@@ -14,7 +14,7 @@
 use std::fmt;
 use std::io::Write;
 
-use crate::varint::{length_prefix, read_var_int, write_var_int, MAX_PACKET_BYTES};
+use crate::protocol::varint::{length_prefix, read_var_int, write_var_int, MAX_PACKET_BYTES};
 
 #[derive(Debug)]
 pub enum CompressionError {
@@ -115,7 +115,7 @@ mod tests {
     fn uncompressed_round_trip() {
         let payload = payload_with_id(0x42, b"hello");
         let wire = frame(&payload, -1);
-        let (len, pos) = crate::varint::read_var_int(&wire).unwrap();
+        let (len, pos) = crate::protocol::varint::read_var_int(&wire).unwrap();
         assert_eq!(len as usize, wire.len() - pos);
         let (id, fields) = read_compressed_frame(&wire[pos..], -1).unwrap();
         assert_eq!(id, 0x42);
@@ -126,7 +126,7 @@ mod tests {
     fn compressed_below_threshold_stays_uncompressed() {
         let payload = payload_with_id(0x01, b"short");
         let wire = frame(&payload, 100); // threshold way above payload size
-        let (_, pos) = crate::varint::read_var_int(&wire).unwrap();
+        let (_, pos) = crate::protocol::varint::read_var_int(&wire).unwrap();
         let (id, fields) = read_compressed_frame(&wire[pos..], 100).unwrap();
         assert_eq!(id, 0x01);
         assert_eq!(fields, b"short");
@@ -137,7 +137,7 @@ mod tests {
         let big_fields = vec![b'x'; 500];
         let payload = payload_with_id(0x05, &big_fields);
         let wire = frame(&payload, 10); // well below payload size, forces compression
-        let (_, pos) = crate::varint::read_var_int(&wire).unwrap();
+        let (_, pos) = crate::protocol::varint::read_var_int(&wire).unwrap();
         let (id, fields) = read_compressed_frame(&wire[pos..], 10).unwrap();
         assert_eq!(id, 0x05);
         assert_eq!(fields, big_fields);

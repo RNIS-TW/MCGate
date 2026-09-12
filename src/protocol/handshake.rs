@@ -4,7 +4,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::varint::{read_var_int, VarIntError};
+use crate::protocol::varint::{read_var_int, VarIntError};
 
 /// Upper bound on a handshake frame's declared body length. A legitimate handshake is ~30-280
 /// bytes (the host field alone is capped at 255); this leaves a wide margin while still cutting
@@ -147,7 +147,7 @@ pub(crate) fn try_parse(buf: &[u8]) -> ParseOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::minecraft_protocol::encode_handshake;
+    use crate::protocol::minecraft_protocol::encode_handshake;
     use std::io::Cursor;
 
     #[tokio::test]
@@ -190,7 +190,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_oversized_declared_length() {
         let mut bogus = Vec::new();
-        crate::varint::write_var_int(&mut bogus, 10_000); // way past MAX_HANDSHAKE_FRAME_BYTES
+        crate::protocol::varint::write_var_int(&mut bogus, 10_000); // way past MAX_HANDSHAKE_FRAME_BYTES
         let mut cursor = Cursor::new(bogus);
         let err = read_handshake(&mut cursor).await.unwrap_err();
         assert!(matches!(err, HandshakeError::Malformed(_)));
@@ -199,8 +199,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_wrong_packet_id() {
         let mut payload = Vec::new();
-        crate::varint::write_var_int(&mut payload, 0x05); // not 0x00
-        let frame = crate::varint::length_prefix(&payload);
+        crate::protocol::varint::write_var_int(&mut payload, 0x05); // not 0x00
+        let frame = crate::protocol::varint::length_prefix(&payload);
         let mut cursor = Cursor::new(frame);
         let err = read_handshake(&mut cursor).await.unwrap_err();
         assert!(matches!(err, HandshakeError::Malformed(_)));

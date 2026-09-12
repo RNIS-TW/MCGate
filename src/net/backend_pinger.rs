@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use tokio::net::TcpStream;
 
-use crate::buffered_stream::BufferedStream;
-use crate::minecraft_protocol::{encode_handshake, encode_proxy_protocol_header};
-use crate::varint::{read_var_int, read_string, write_var_int};
+use crate::net::buffered_stream::BufferedStream;
+use crate::protocol::minecraft_protocol::{encode_handshake, encode_proxy_protocol_header};
+use crate::protocol::varint::{read_var_int, read_string, write_var_int};
 
 pub struct PingResult {
     pub status_json: String,

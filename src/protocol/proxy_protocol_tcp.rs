@@ -6,7 +6,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::proxy_protocol_datagram::{parse_proxy_protocol_header, ProxyProtocolFormatError, V1_PREFIX, V2_SIGNATURE};
+use crate::protocol::proxy_protocol_datagram::{parse_proxy_protocol_header, ProxyProtocolFormatError, V1_PREFIX, V2_SIGNATURE};
 use std::net::SocketAddr;
 
 fn err(msg: impl Into<String>) -> ProxyProtocolFormatError {

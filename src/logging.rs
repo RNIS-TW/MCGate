@@ -172,14 +172,32 @@ fn is_truthy(v: Option<String>) -> bool {
 }
 
 #[cfg(unix)]
-fn is_stdout_tty() -> bool {
+pub fn is_stdout_tty() -> bool {
     use std::os::unix::io::AsRawFd;
     libc_isatty(io::stdout().as_raw_fd())
 }
 #[cfg(not(unix))]
-fn is_stdout_tty() -> bool {
+pub fn is_stdout_tty() -> bool {
     false
 }
+
+/// Whether stdin is a real interactive terminal (as opposed to a pipe, or a hosting panel's
+/// console that feeds commands in without allocating a pty - Pterodactyl's "Wings" daemon runs
+/// containers with `tty: false` by default, so this is `false` there even though stdout still
+/// looks fine). `console::start` uses this to decide whether `rustyline`'s line editing/redraw
+/// is safe to attempt - without a real pty, its cursor-repositioning escape codes have nothing
+/// to act on, producing the exact "bare `>` on its own line, typed text echoed on the next line"
+/// glitch this was added to avoid; see `console.rs`'s plain-console fallback.
+#[cfg(unix)]
+pub fn is_stdin_tty() -> bool {
+    use std::os::unix::io::AsRawFd;
+    libc_isatty(io::stdin().as_raw_fd())
+}
+#[cfg(not(unix))]
+pub fn is_stdin_tty() -> bool {
+    false
+}
+
 #[cfg(unix)]
 fn libc_isatty(fd: i32) -> bool {
     // Avoids pulling in the `libc` crate for one syscall; matches its `isatty` signature exactly.

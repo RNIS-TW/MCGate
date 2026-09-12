@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use rusqlite::Connection;
 
-use crate::app_state::AppState;
+use crate::state::app_state::AppState;
 use crate::config::StatsLoggingConfig;
 use crate::state::MetricsSnapshot;
 

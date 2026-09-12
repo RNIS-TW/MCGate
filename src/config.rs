@@ -6,6 +6,11 @@
 //! (durations, byte sizes, `host:`/`backend:` as either a string or a list). This keeps every
 //! field's default and validation behavior identical to the original.
 
+pub mod duration;
+pub mod host_pattern;
+pub mod loader;
+pub mod messages;
+
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -13,8 +18,8 @@ use std::path::Path;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_yaml::Value;
 
-use crate::duration::{parse_byte_size, parse_duration_millis};
-use crate::host_pattern::HostPattern;
+use duration::{parse_byte_size, parse_duration_millis};
+use host_pattern::HostPattern;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -145,10 +150,10 @@ impl Route {
         self.host_patterns.iter().find_map(|p| p.match_host(hostname))
     }
 
-    pub async fn resolve_backends(&self, captures: &[String]) -> Result<Vec<SocketAddr>, crate::dns_cache::DnsResolveError> {
+    pub async fn resolve_backends(&self, captures: &[String]) -> Result<Vec<SocketAddr>, crate::net::dns_cache::DnsResolveError> {
         let mut out = Vec::with_capacity(self.backend_templates.len());
         for template in &self.backend_templates {
-            let substituted = crate::host_pattern::substitute_params(template, captures);
+            let substituted = crate::config::host_pattern::substitute_params(template, captures);
             out.push(resolve_backend_address(&substituted).await?);
         }
         Ok(out)
@@ -158,15 +163,15 @@ impl Route {
     /// lookup (an uncached hostname). Callers on the connection-accept path (section 3) use this
     /// to decide whether resolving inline is fine or whether to defer/buffer instead.
     pub fn backends_need_blocking_resolution(&self, captures: &[String]) -> bool {
-        self.backend_templates.iter().any(|t| needs_blocking_resolution(&crate::host_pattern::substitute_params(t, captures)))
+        self.backend_templates.iter().any(|t| needs_blocking_resolution(&crate::config::host_pattern::substitute_params(t, captures)))
     }
 
     /// Same resolution as `resolve_backends`, for the optional `voicechat:` backend. `None` when
     /// this route has none configured.
-    pub async fn resolve_voicechat(&self, captures: &[String]) -> Result<Option<SocketAddr>, crate::dns_cache::DnsResolveError> {
+    pub async fn resolve_voicechat(&self, captures: &[String]) -> Result<Option<SocketAddr>, crate::net::dns_cache::DnsResolveError> {
         match self.voicechat_templates.first() {
             None => Ok(None),
-            Some(t) => Ok(Some(resolve_backend_address(&crate::host_pattern::substitute_params(t, captures)).await?)),
+            Some(t) => Ok(Some(resolve_backend_address(&crate::config::host_pattern::substitute_params(t, captures)).await?)),
         }
     }
 }
@@ -180,15 +185,15 @@ fn split_host_port(value: &str, default_port: u16) -> (String, u16) {
 
 /// Like `parse_host_port` but resolves the hostname through the DNS cache instead of directly —
 /// see `dns_cache` for why that matters on the connection dispatch hot path.
-pub async fn resolve_backend_address(value: &str) -> Result<SocketAddr, crate::dns_cache::DnsResolveError> {
+pub async fn resolve_backend_address(value: &str) -> Result<SocketAddr, crate::net::dns_cache::DnsResolveError> {
     let (host, port) = split_host_port(value, 25565);
-    crate::dns_cache::dns_cache().resolve(&host, port).await
+    crate::net::dns_cache::dns_cache().resolve(&host, port).await
 }
 
 /// Whether `resolve_backend_address` for this `host:port` string would await a real DNS lookup.
 pub fn needs_blocking_resolution(value: &str) -> bool {
     let (host, port) = split_host_port(value, 25565);
-    !crate::dns_cache::dns_cache().will_resolve_without_blocking(&host, port)
+    !crate::net::dns_cache::dns_cache().will_resolve_without_blocking(&host, port)
 }
 
 /// Structural equality used to carry per-backend runtime state (active-connection counts,
@@ -478,7 +483,7 @@ const DEFAULT_CONFIG_YML: &str = include_str!("../resources/default-config.yml")
 /// Loads the config at `path`, first bootstrapping it from the bundled default-config.yml
 /// resource if missing. `messages` supplies the defaults for player-facing text that routes
 /// don't override.
-pub fn load_or_create_default(path: impl AsRef<Path>, messages: &crate::messages::GateMessages) -> Result<GateConfig> {
+pub fn load_or_create_default(path: impl AsRef<Path>, messages: &crate::config::messages::GateMessages) -> Result<GateConfig> {
     let path = path.as_ref();
     if !path.exists() {
         if let Some(parent) = path.parent() {
@@ -493,7 +498,7 @@ pub fn load_or_create_default(path: impl AsRef<Path>, messages: &crate::messages
     load_config(path, messages)
 }
 
-pub fn load_config(path: impl AsRef<Path>, messages: &crate::messages::GateMessages) -> Result<GateConfig> {
+pub fn load_config(path: impl AsRef<Path>, messages: &crate::config::messages::GateMessages) -> Result<GateConfig> {
     let path = path.as_ref();
     let text = fs::read_to_string(path).with_context(|| format!("Config file not found: {}", path.display()))?;
     let root: Value = serde_yaml::from_str(&text)?;
@@ -642,7 +647,7 @@ fn parse_stats_logging(c: Option<&serde_yaml::Mapping>) -> Result<StatsLoggingCo
     })
 }
 
-fn parse_route(r: &serde_yaml::Mapping, index: usize, messages: &crate::messages::GateMessages) -> Result<Route> {
+fn parse_route(r: &serde_yaml::Mapping, index: usize, messages: &crate::config::messages::GateMessages) -> Result<Route> {
     let host_raw = get(r, "host").ok_or_else(|| anyhow!("Route #{index} missing 'host'"))?;
     let hosts = string_list(host_raw);
     let host_patterns: Vec<HostPattern> = hosts.iter().map(HostPattern::new).collect();
@@ -745,10 +750,10 @@ fn parse_reconnect(r: Option<&serde_yaml::Mapping>, message_defaults: &Reconnect
 /// `animationInterval`, 500ms by default, for every player waiting to reconnect).
 fn render_reconnect_text(reconnect: ReconnectConfig) -> ReconnectConfig {
     ReconnectConfig {
-        title: crate::text_format::to_legacy_text(&reconnect.title),
-        subtitle: crate::text_format::to_legacy_text(&reconnect.subtitle),
-        attempt_suffix: crate::text_format::to_legacy_text(&reconnect.attempt_suffix),
-        action_bar_frames: reconnect.action_bar_frames.iter().map(|f| crate::text_format::to_legacy_text(f)).collect(),
+        title: crate::protocol::text_format::to_legacy_text(&reconnect.title),
+        subtitle: crate::protocol::text_format::to_legacy_text(&reconnect.subtitle),
+        attempt_suffix: crate::protocol::text_format::to_legacy_text(&reconnect.attempt_suffix),
+        action_bar_frames: reconnect.action_bar_frames.iter().map(|f| crate::protocol::text_format::to_legacy_text(f)).collect(),
         ..reconnect
     }
 }
@@ -850,7 +855,7 @@ pub fn warm_static_backends(routes: &[Route], handle: &tokio::runtime::Handle) {
                 continue;
             }
             let (host, port) = split_host_port(template, 25565);
-            crate::dns_cache::dns_cache().warm(handle, &host, port);
+            crate::net::dns_cache::dns_cache().warm(handle, &host, port);
         }
     }
 }
@@ -907,7 +912,7 @@ routes:
     backend: "127.0.0.1:25566"
 "#;
         let f = write_temp(yml);
-        let cfg = load_config(&f.path, &crate::messages::GateMessages::default()).unwrap();
+        let cfg = load_config(&f.path, &crate::config::messages::GateMessages::default()).unwrap();
         assert_eq!(cfg.bind, "0.0.0.0:25565");
         assert_eq!(cfg.routes.len(), 1);
         assert_eq!(cfg.routes[0].backend_templates, vec!["127.0.0.1:25566"]);
@@ -930,7 +935,7 @@ routes:
     priority: 5
 "#;
         let f = write_temp(yml);
-        let cfg = load_config(&f.path, &crate::messages::GateMessages::default()).unwrap();
+        let cfg = load_config(&f.path, &crate::config::messages::GateMessages::default()).unwrap();
         assert_eq!(cfg.routes[0].host_patterns[0].raw, "b.example.com");
         assert_eq!(cfg.routes[1].host_patterns[0].raw, "c.example.com");
         assert_eq!(cfg.routes[2].host_patterns[0].raw, "a.example.com");
@@ -943,7 +948,7 @@ routes:
   - host: "play.example.com"
 "#;
         let f = write_temp(yml);
-        assert!(load_config(&f.path, &crate::messages::GateMessages::default()).is_err());
+        assert!(load_config(&f.path, &crate::config::messages::GateMessages::default()).is_err());
     }
 
     #[test]
@@ -956,7 +961,7 @@ routes:
       file: "usage.json"
 "#;
         let f = write_temp(yml);
-        let cfg = load_config(&f.path, &crate::messages::GateMessages::default()).unwrap();
+        let cfg = load_config(&f.path, &crate::config::messages::GateMessages::default()).unwrap();
         assert!(cfg.routes[0].metrics.is_none());
     }
 
@@ -972,7 +977,7 @@ routes:
         limit: "100g"
 "#;
         let f = write_temp(yml);
-        let cfg = load_config(&f.path, &crate::messages::GateMessages::default()).unwrap();
+        let cfg = load_config(&f.path, &crate::config::messages::GateMessages::default()).unwrap();
         let m = cfg.routes[0].metrics.as_ref().unwrap();
         assert_eq!(m.upload.limit, 100i64 * 1024 * 1024 * 1024);
     }
@@ -1003,7 +1008,7 @@ routes:
         // Guards against the bundled default-config.yml drifting out of sync with the schema
         // this loader expects.
         let f = write_temp(DEFAULT_CONFIG_YML);
-        load_config(&f.path, &crate::messages::GateMessages::default()).unwrap();
+        load_config(&f.path, &crate::config::messages::GateMessages::default()).unwrap();
     }
 
     #[test]
@@ -1012,7 +1017,7 @@ routes:
         path.push(format!("mcgate-config-test-{}.yml", std::process::id()));
         let _ = std::fs::remove_file(&path);
         assert!(!path.exists());
-        load_or_create_default(&path, &crate::messages::GateMessages::default()).unwrap();
+        load_or_create_default(&path, &crate::config::messages::GateMessages::default()).unwrap();
         assert!(path.exists());
         std::fs::remove_file(&path).unwrap();
     }

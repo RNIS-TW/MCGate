@@ -2,45 +2,24 @@
 // plan.md for what's done vs. pending. Remove this once those land.
 #![allow(dead_code)]
 
-mod api_server;
-mod app_state;
-mod backend_pinger;
-mod backend_selector;
-mod buffered_stream;
-mod compression;
 mod config;
-mod config_loader;
-mod connection_guard;
-mod connection_tracker;
 mod console;
-mod dns_cache;
-mod duration;
-mod flood_control;
-mod handshake;
-mod host_pattern;
 mod logging;
-mod messages;
-mod minecraft_protocol;
-mod nbt;
-mod network_info;
-mod ping_cache;
-mod proxy_protocol_datagram;
-mod proxy_protocol_tcp;
-mod reconnect_protocol;
-mod route_metrics_store;
-mod server;
-mod stats_logger;
-mod udp_proxy;
-mod udp_throttle;
-mod voice_relay;
-mod voice_routing;
+mod net;
+mod protocol;
 mod state;
-mod status_json;
-mod text_format;
-mod varint;
+mod udp;
 mod version;
 
 use anyhow::Result;
+
+use config::loader as config_loader;
+use config::messages;
+use net::api as api_server;
+use net::{dns_cache, flood_control, network_info, server};
+use state::{app_state, connection_tracker, route_metrics_store, stats_logger};
+use udp::proxy as udp_proxy;
+use udp::{voice_relay, voice_routing};
 
 const BANNER: &str = r#"
   __  __  ____  ____       _
@@ -182,10 +161,37 @@ async fn main() -> Result<()> {
     tracing::info!("Shutdown signal received, stopping...");
     server_task.abort();
     api_task.abort();
+    shutdown_gracefully().await
+}
+
+/// Ends the process: kicks every connected player, flushes the SQLite writer threads, then forces
+/// the process down. Used by both the Ctrl+C handler above and the console `stop`/`shutdown`/
+/// `exit` commands (`console.rs`), so both paths actually drain state instead of one of them
+/// (previously the console commands) just calling `std::process::exit` directly.
+///
+/// The forced exit at the end isn't optional cleanup - it's load-bearing. `#[tokio::main]` drops
+/// the `Runtime` when `main` returns, and dropping a multi-thread `Runtime` blocks the current
+/// thread until every task spawned onto it finishes on its own. Each connected player's
+/// `server::relay` splice is one such task, and it only finishes when that player disconnects or
+/// its `session.disconnect` `Notify` fires. Without kicking sessions first, "shutdown" would hang
+/// until the last player happened to leave - observed as the process seeming to not shut down at
+/// all, then quietly dropping players one at a time as they naturally disconnected. Kicking every
+/// session first makes each `relay` task end (almost) immediately; the short sleep gives them a
+/// moment to actually observe the notification and unwind before `process::exit` guarantees the
+/// process goes down regardless.
+pub async fn shutdown_gracefully() -> ! {
+    let sessions = state::player_sessions().all();
+    if !sessions.is_empty() {
+        tracing::info!("Disconnecting {} player(s)...", sessions.len());
+        for s in &sessions {
+            s.disconnect.notify_waiters();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
     // Join the SQLite writer threads so a final flush actually lands on disk rather than racing
     // process exit - matches the Kotlin version's bounded-wait shutdown for the same reason.
     connection_tracker::connection_tracker().shutdown();
     stats_logger::stats_logger().shutdown();
     tracing::info!("Stopped.");
-    Ok(())
+    std::process::exit(0);
 }
