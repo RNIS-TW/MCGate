@@ -7,6 +7,7 @@
 //! field's default and validation behavior identical to the original.
 
 pub mod duration;
+pub mod editor;
 pub mod host_pattern;
 pub mod loader;
 pub mod messages;

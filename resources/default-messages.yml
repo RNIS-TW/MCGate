@@ -1,4 +1,8 @@
 messages:
+  # ============================================================================================
+  # FORMATTING - applies to every message below.
+  # ============================================================================================
+  #
   # Player-facing text for offline-backend situations. Routes can still override any of these
   # per-route in config.yml; these are just the defaults used when a route doesn't set its own.
   #
@@ -6,6 +10,10 @@ messages:
   # `<red>`, `<gradient:red:blue>text</gradient>`, `<bold>`, `<#ff0000>`, `<rainbow>`, etc. See
   # https://docs.advntr.dev/minimessage/format.html for the full tag reference. Mix both freely,
   # e.g. "&e<bold>Offline</bold>".
+
+  # ============================================================================================
+  # KICK MESSAGES
+  # ============================================================================================
 
   # Kick/disconnect message shown when a route's backends are all unreachable and the player is
   # kicked outright - whether or not `reconnect:` is enabled for that route (e.g. reconnect
@@ -27,7 +35,11 @@ messages:
     <gray>This server has used up its data-transfer allowance.</gray>
     <gradient:#8e9eab:#eef2f3>Please try again later.</gradient>
 
-  # Text for the auto-reconnect waiting screen (route `reconnect:` config).
+  # ============================================================================================
+  # AUTO-RECONNECT - the waiting screen shown while a route's `reconnect:` block (config.yml)
+  # holds a player instead of kicking them, for as long as every backend stays unreachable.
+  # ============================================================================================
+
   reconnect:
     # Title/subtitle shown while a player is held waiting to reconnect.
     title: "&eServer is currently offline."

@@ -32,6 +32,12 @@ impl<S: AsyncRead + Unpin> BufferedStream<S> {
         Self { inner, buf: Vec::new(), pos: 0 }
     }
 
+    /// A reference to the wrapped stream - e.g. so `net::client_ping::ClientPingProbe::capture`
+    /// can read its raw fd without needing to unwrap the `BufferedStream` itself.
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
     fn unread(&self) -> &[u8] {
         &self.buf[self.pos..]
     }

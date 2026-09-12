@@ -1,22 +1,57 @@
-//! Port of `api/ApiServer.kt` — a small read-only JSON-over-HTTP admin/status API.
+//! Port of `api/ApiServer.kt` — a JSON-over-HTTP admin/status API, plus route CRUD and
+//! interactive docs that have no Kotlin equivalent to port from.
 //!
-//! Endpoints and JSON field names/shapes are kept identical to the Kotlin version (camelCase
-//! keys) so existing dashboards/scripts against it don't need changes. Every endpoint is now
-//! fully real, backed by live `RouteRuntime`/`PlayerSessions`/`RouteMetricsStore` data — including
+//! Read endpoints' field names/shapes are kept identical to the Kotlin version (camelCase keys)
+//! so existing dashboards/scripts against it don't need changes. Every one of them is fully
+//! real, backed by live `RouteRuntime`/`PlayerSessions`/`RouteMetricsStore` data — including
 //! `GET /v1/routes/{i}/ping`, a genuine on-demand live backend dial (`backend_pinger.rs`).
+//!
+//! `POST`/`PUT`/`DELETE /v1/routes[/{i}]` add/replace/remove a route at runtime, validated
+//! through the exact same `config::load_config` a hand-edited `config.yml` goes through
+//! (`config::editor::write_validated`) before ever touching the real file, then hot-applied via
+//! `AppState::apply_config_change` - the same path the file-watcher reload uses.
+//!
+//! `GET /reference` serves a Scalar-rendered page for the hand-authored OpenAPI spec at
+//! `GET /openapi.json` (`resources/openapi.json`); `GET /` redirects there. Both are
+//! unauthenticated (static docs, not live data) - everything else still requires
+//! `Authorization: Bearer <token>` when `api.token` is set.
 
 use std::sync::Arc;
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::state::app_state::AppState;
 use crate::config::Route;
 use crate::state::{collect_metrics, MetricsSnapshot, PlayerSession};
+
+/// Hand-authored (not derived from the route handlers below via a macro/build step - this API
+/// predates adding one, and its surface is small and stable enough that keeping the two in sync
+/// by hand is little extra work) OpenAPI 3.0 spec, served at `GET /openapi.json` and rendered by
+/// the Scalar reference UI at `GET /reference`. Keep this in sync whenever a route below changes
+/// shape.
+const OPENAPI_JSON: &str = include_str!("../../resources/openapi.json");
+
+/// A minimal static page that loads Scalar (https://github.com/scalar/scalar) from its CDN
+/// build and points it at `/openapi.json` - the entire "docs site" is this one script tag; Scalar
+/// renders the interactive reference UI client-side from the spec.
+const REFERENCE_HTML: &str = r#"<!doctype html>
+<html>
+  <head>
+    <title>MCGate API Reference</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <script id="api-reference" data-url="/openapi.json"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+  </body>
+</html>
+"#;
 
 pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
     let cfg = state.config();
@@ -25,11 +60,16 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
     }
     let bind = cfg.api.bind_address()?;
     let app = Router::new()
+        .route("/", get(|| async { Redirect::temporary("/reference") }))
+        .route("/reference", get(reference_handler))
+        .route("/openapi.json", get(openapi_handler))
         .route("/metrics", get(metrics_handler))
-        .route("/v1/routes", get(routes_handler))
-        .route("/v1/routes/:index", get(route_handler))
+        .route("/v1/metrics/reset", post(metrics_reset_all_handler))
+        .route("/v1/routes", get(routes_handler).post(create_route_handler))
+        .route("/v1/routes/:index", get(route_handler).put(update_route_handler).delete(delete_route_handler))
         .route("/v1/routes/:index/backends", get(backends_handler))
         .route("/v1/routes/:index/metrics", get(route_metrics_handler))
+        .route("/v1/routes/:index/metrics/reset", post(route_metrics_reset_handler))
         .route("/v1/routes/:index/ping", get(ping_handler))
         .route("/v1/players", get(players_handler))
         .with_state(state);
@@ -54,6 +94,16 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+}
+
+/// Unauthenticated on purpose (unlike every data endpoint below) - these are static docs, not
+/// live server data, so there's nothing here worth gating behind `api.token`.
+async fn reference_handler() -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], REFERENCE_HTML).into_response()
+}
+
+async fn openapi_handler() -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], OPENAPI_JSON).into_response()
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Query(params): Query<std::collections::HashMap<String, String>>) -> Response {
@@ -95,6 +145,143 @@ async fn route_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, A
     match cfg.routes.get(index) {
         Some(route) => Json(route_json(index, route)).into_response(),
         None => not_found(),
+    }
+}
+
+/// Extracts a submitted route's `host` field (string or array, same as `config.yml`'s own
+/// shape) from the raw JSON request body - used to identify the route both before writing (as
+/// the `config::editor` lookup key for a PUT/DELETE) and after (to find its fresh index in the
+/// reloaded, re-sorted config for the response).
+fn route_hosts_from_json(v: &Value) -> Vec<String> {
+    match v.get("host") {
+        Some(Value::Array(arr)) => arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn route_matches_hosts(route: &Route, hosts: &[String]) -> bool {
+    let target: std::collections::HashSet<&str> = hosts.iter().map(String::as_str).collect();
+    let actual: std::collections::HashSet<&str> = route.host_patterns.iter().map(|p| p.raw.as_str()).collect();
+    actual == target
+}
+
+/// Runs a route mutation against `config.yml` on a blocking-I/O thread (reading/parsing/writing
+/// a file, and `config::editor::write_validated`'s own full config re-parse, aren't appropriate
+/// work for an async-runtime worker thread even though this endpoint is hit rarely), applies the
+/// result live via `AppState::apply_config_change` on success, and maps every failure mode to an
+/// HTTP response: a mutation that doesn't parse/validate is the caller's fault (400), anything
+/// else (I/O failure) is ours (500).
+async fn mutate_routes_file<F>(state: &Arc<AppState>, mutate: F) -> Result<crate::config::GateConfig, Response>
+where
+    F: FnOnce(&mut crate::config::editor::ConfigDocument) -> Result<(), String> + Send + 'static,
+{
+    let state = state.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<crate::config::GateConfig, String> {
+        let mut doc = crate::config::editor::ConfigDocument::read(&state.config_path).map_err(|e| e.to_string())?;
+        mutate(&mut doc)?;
+        let yaml = doc.to_yaml_string().map_err(|e| e.to_string())?;
+        let messages = state.messages();
+        let cfg = crate::config::editor::write_validated(&state.config_path, &yaml, &messages).map_err(|e| e.to_string())?;
+        state.apply_config_change(cfg.clone());
+        Ok(cfg)
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(cfg)) => Ok(cfg),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()),
+    }
+}
+
+/// `POST /v1/routes` - appends a new route. Body is a JSON object with the same shape as one
+/// `config.yml` route entry (`host`, `backend`, `strategy`, `priority`, `fallback`, `reconnect`,
+/// `metrics`, etc.) - it's converted straight to a YAML value and validated through the exact
+/// same `config::load_config` path a hand-edited `config.yml` goes through, so anything valid
+/// there is valid here.
+async fn create_route_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    let hosts = route_hosts_from_json(&body);
+    if hosts.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "route body must have a non-empty 'host' (string or array)"}))).into_response();
+    }
+    let route_yaml = match serde_yaml::to_value(&body) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let result = mutate_routes_file(&state, move |doc| {
+        doc.create_route(route_yaml);
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(cfg) => match cfg.routes.iter().position(|r| route_matches_hosts(r, &hosts)) {
+            Some(i) => (StatusCode::CREATED, Json(route_json(i, &cfg.routes[i]))).into_response(),
+            None => (StatusCode::CREATED, Json(json!({"routeCount": cfg.routes.len()}))).into_response(),
+        },
+        Err(resp) => resp,
+    }
+}
+
+/// `PUT /v1/routes/{index}` - replaces a route entirely (any field not in the body reverts to
+/// its default, same as a config.yml route missing that key would). `index` is resolved against
+/// the *current* live route list to find which route to replace (by its host set - see
+/// `config::editor`'s doc for why index alone isn't a stable identity across a reload).
+async fn update_route_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, AxumPath(index): AxumPath<usize>, Json(body): Json<Value>) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    let cfg = state.config();
+    let Some(existing) = cfg.routes.get(index) else { return not_found() };
+    let existing_hosts: Vec<String> = existing.host_patterns.iter().map(|p| p.raw.clone()).collect();
+    let new_hosts = route_hosts_from_json(&body);
+    if new_hosts.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "route body must have a non-empty 'host' (string or array)"}))).into_response();
+    }
+    let route_yaml = match serde_yaml::to_value(&body) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    };
+    let result = mutate_routes_file(&state, move |doc| {
+        if doc.replace_route(&existing_hosts, route_yaml) {
+            Ok(())
+        } else {
+            Err("that route's host set no longer matches anything in config.yml (it may have changed since this index was read) - re-fetch GET /v1/routes and retry".to_string())
+        }
+    })
+    .await;
+    match result {
+        Ok(cfg) => match cfg.routes.iter().position(|r| route_matches_hosts(r, &new_hosts)) {
+            Some(i) => Json(route_json(i, &cfg.routes[i])).into_response(),
+            None => Json(json!({"routeCount": cfg.routes.len()})).into_response(),
+        },
+        Err(resp) => resp,
+    }
+}
+
+/// `DELETE /v1/routes/{index}` - removes a route, identified (like `update_route_handler`) by
+/// its current host set rather than its raw index.
+async fn delete_route_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, AxumPath(index): AxumPath<usize>) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    let cfg = state.config();
+    let Some(existing) = cfg.routes.get(index) else { return not_found() };
+    let existing_hosts: Vec<String> = existing.host_patterns.iter().map(|p| p.raw.clone()).collect();
+    let result = mutate_routes_file(&state, move |doc| {
+        if doc.delete_route(&existing_hosts) {
+            Ok(())
+        } else {
+            Err("that route's host set no longer matches anything in config.yml (it may have changed since this index was read) - re-fetch GET /v1/routes and retry".to_string())
+        }
+    })
+    .await;
+    match result {
+        Ok(cfg) => Json(json!({"deleted": true, "routeCount": cfg.routes.len()})).into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -141,9 +328,19 @@ async fn route_metrics_handler(State(state): State<Arc<AppState>>, headers: Head
     }
     let cfg = state.config();
     let Some(route) = cfg.routes.get(index) else { return not_found() };
-    let Some(counter) = crate::state::route_metrics_store::route_metrics_store().handle(route) else { return not_found() };
+    match route_metrics_json(index, route) {
+        Some(json) => Json(json).into_response(),
+        None => not_found(),
+    }
+}
+
+/// Shared by `GET /v1/routes/{index}/metrics` and `POST /v1/routes/{index}/metrics/reset` (which
+/// returns the just-reset counters, same shape) - `None` if this route has no metrics counter
+/// (no `metrics:` block, or neither direction enabled).
+fn route_metrics_json(index: usize, route: &Route) -> Option<Value> {
+    let counter = crate::state::route_metrics_store::route_metrics_store().handle(route)?;
     use std::sync::atomic::Ordering;
-    Json(json!({
+    Some(json!({
         "index": index,
         "hosts": route.host_patterns.iter().map(|p| p.raw.clone()).collect::<Vec<_>>(),
         "file": *counter.file.lock().unwrap(),
@@ -162,7 +359,34 @@ async fn route_metrics_handler(State(state): State<Arc<AppState>>, headers: Head
         "resetIntervalMillis": counter.reset_interval_millis.load(Ordering::Relaxed),
         "resetAt": counter.reset_at.load(Ordering::Relaxed),
     }))
-    .into_response()
+}
+
+/// `POST /v1/routes/{index}/metrics/reset` - zeroes this one route's upload/download counters
+/// right now, same as the console's `metrics reset <index>`. Also restarts its rolling
+/// `resetInterval` window (if it has one) from this moment, matching `RouteMetricsStore::reset`.
+async fn route_metrics_reset_handler(State(state): State<Arc<AppState>>, headers: HeaderMap, AxumPath(index): AxumPath<usize>) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    let cfg = state.config();
+    let Some(route) = cfg.routes.get(index) else { return not_found() };
+    match crate::state::route_metrics_store::route_metrics_store().reset(route) {
+        Some(_) => match route_metrics_json(index, route) {
+            Some(json) => Json(json).into_response(),
+            None => not_found(),
+        },
+        None => (StatusCode::NOT_FOUND, Json(json!({"error": "this route has no metrics: block with a direction enabled"}))).into_response(),
+    }
+}
+
+/// `POST /v1/metrics/reset` - zeroes every route's upload/download counters at once, same as the
+/// console's `metrics reset all`.
+async fn metrics_reset_all_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return e;
+    }
+    let n = crate::state::route_metrics_store::route_metrics_store().reset_all();
+    Json(json!({ "reset": n })).into_response()
 }
 
 /// Process-wide cap on concurrent live `/ping` backend dials across all API connections —
@@ -280,6 +504,9 @@ fn player_json(s: &PlayerSession) -> Value {
         "bytesReceived": s.bytes_received.load(std::sync::atomic::Ordering::Relaxed),
         "compressionThreshold": s.compression_threshold,
         "encrypted": s.encrypted,
+        // Client <-> MCGate latency (not MCGate <-> backend, which is per-backend in
+        // /v1/routes/{i}/backends) - see net::client_ping. null on any platform besides Linux.
+        "pingMillis": s.client_ping.round_trip_millis(),
     })
 }
 

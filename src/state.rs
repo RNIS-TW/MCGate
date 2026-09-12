@@ -66,6 +66,10 @@ pub struct PlayerSession {
     pub bytes_received: AtomicI64,
     pub disconnect: Notify,
     pub pending_action: Mutex<SessionAction>,
+    /// Client <-> MCGate latency, read live from the kernel on demand (Linux only elsewhere;
+    /// always reports no ping) - see `net::client_ping` for why this isn't measured by MCGate
+    /// sending its own probes.
+    pub client_ping: crate::net::client_ping::ClientPingProbe,
 }
 
 /// Process-wide registry of currently connected players, keyed by UUID — mirrors
@@ -355,6 +359,7 @@ mod tests {
             bytes_received: AtomicI64::new(0),
             disconnect: Notify::new(),
             pending_action: Mutex::new(SessionAction::default()),
+            client_ping: crate::net::client_ping::ClientPingProbe::unavailable(),
         })
     }
 

@@ -23,6 +23,13 @@ rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 crossbeam-channel = "0.5"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only for reading the kernel's live TCP_INFO (round-trip-time estimate) off a client socket, on
+# the one OS whose layout for it this actually targets - see net::client_ping. Already pulled in
+# transitively via tokio/mio on every platform regardless, so this costs nothing extra in the
+# dependency graph; it's just promoted to a direct (and Linux-only) dependency here.
+libc = "0.2"
+
 [profile.release]
 # Thin LTO (not `true`/"fat") + the default codegen-units: fat LTO with codegen-units = 1 forces
 # a single, fully serial whole-program link-time-optimization pass, which is what made the final

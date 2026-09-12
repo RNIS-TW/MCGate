@@ -643,6 +643,7 @@ dependencies = [
  "crossbeam-channel",
  "flate2",
  "if-addrs",
+ "libc",
  "notify-debouncer-mini",
  "rand",
  "regex",

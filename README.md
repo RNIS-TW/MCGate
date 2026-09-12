@@ -176,6 +176,28 @@ buffer-cache overhead that scales off a container's misreported CPU count). The 
 set is close to its actual working set: a small fixed amount for the runtime plus a modest
 per-connection cost, not a pre-reserved heap. Nothing to configure for typical deployments.
 
+### HTTP API
+
+With `api.enabled: true` (see `config.yml`), MCGate exposes a small JSON admin/status API plus
+interactive docs:
+
+- `GET /reference` — a [Scalar](https://github.com/scalar/scalar)-rendered API reference page.
+  `GET /` redirects here.
+- `GET /openapi.json` — the OpenAPI 3.0 spec backing that page (hand-authored, in
+  `resources/openapi.json`).
+- `GET /metrics`, `GET /v1/routes[/{index}[/backends|/metrics|/ping]]`, `GET /v1/players` — the
+  existing read-only status/metrics endpoints.
+- `POST /v1/routes`, `PUT /v1/routes/{index}`, `DELETE /v1/routes/{index}` — add, replace, or
+  remove a route at runtime. The body is the same shape as one `config.yml` route entry; a
+  mutation is validated through the exact same loader a hand-edited `config.yml` goes through
+  (via `config::editor`) before it's written to disk and hot-applied, so an invalid body is
+  rejected without ever touching the real file. A route is identified by its `host` set, not its
+  raw position — routes are re-sorted by priority on load, so an index alone isn't a stable
+  identity across a reload.
+
+`/reference` and `/openapi.json` are unauthenticated (static docs, not live data); every other
+endpoint requires `Authorization: Bearer <token>` when `api.token` is set, same as before.
+
 ## Test
 
 ```

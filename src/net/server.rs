@@ -123,6 +123,18 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
                 return;
             }
         }
+
+        // The check above (before this header was even read) had to skip banning entirely,
+        // since `peer_addr` was the fronting load balancer's address at that point, not the real
+        // client's - banning that would ban the load balancer. Now that the real address is
+        // known, check again: unconditional on `proxy_protocol` (unlike every other per-IP guard
+        // in this function), because this time `effective_addr` genuinely is the real client, so
+        // there's no reason a manual `ban <ip>` (or a violation recorded for this same address
+        // from some other, non-proxied route) shouldn't be enforced.
+        if cfg.auto_ban.enabled && crate::net::ip_ban::ip_ban_list().is_banned(&effective_addr.ip().to_string()) {
+            tracing::debug!("Dropping connection from {effective_addr} (via {peer_addr}) - source IP is temporarily auto-banned");
+            return;
+        }
     }
 
     // Front of the pipeline: bound the pre-login phase so a connection-flood/slow-loris can't
@@ -421,6 +433,18 @@ async fn handle_login(
                 // now-dead backend fails the same way in `relay`'s own read loop either way.
                 let mut backend = BufferedStream::new(backend);
                 let (compression_threshold, encrypted) = sniff_backend_login(stream, &mut backend).await.unwrap_or((-1, false));
+                // Under proxy_protocol, this socket is MCGate <-> the fronting load balancer/L4
+                // proxy, not MCGate <-> the real client - the PROXY header only tells MCGate what
+                // the real client's address *was*, it doesn't change whose TCP connection this
+                // actually is. TCP_INFO on it would report the load-balancer-to-MCGate hop's RTT,
+                // not the player's, which is worse than not reporting a ping at all: a plausible-
+                // looking wrong number reads as trustworthy in a way "n/a" doesn't. Don't even
+                // capture a real probe in that case - `unavailable()` always reports no ping.
+                let client_ping = if state.config().proxy_protocol {
+                    crate::net::client_ping::ClientPingProbe::unavailable()
+                } else {
+                    crate::net::client_ping::ClientPingProbe::capture(stream.get_ref())
+                };
 
                 let session = parsed_login.as_ref().and_then(|(name, uuid)| {
                     let uuid = (*uuid)?;
@@ -441,6 +465,7 @@ async fn handle_login(
                         bytes_received: std::sync::atomic::AtomicI64::new(0),
                         disconnect: tokio::sync::Notify::new(),
                         pending_action: std::sync::Mutex::new(crate::state::SessionAction::default()),
+                        client_ping,
                     });
                     player_sessions().put(session.clone());
                     Some(session)
@@ -879,6 +904,7 @@ mod tests {
             bytes_received: std::sync::atomic::AtomicI64::new(0),
             disconnect: tokio::sync::Notify::new(),
             pending_action: std::sync::Mutex::new(crate::state::SessionAction::default()),
+            client_ping: crate::net::client_ping::ClientPingProbe::unavailable(),
         };
         assert!(can_inject_packet(&base(776, false)));
         assert!(!can_inject_packet(&base(776, true)), "an encrypted session must never be injected into");

@@ -35,7 +35,7 @@ use rustyline::{DefaultEditor, ExternalPrinter};
 
 use crate::state::app_state::AppState;
 use crate::state::route_metrics_store::route_metrics_store;
-use crate::state::player_sessions;
+use crate::state::{player_sessions, PlayerSession};
 use crate::version::version;
 
 pub fn start(state: Arc<AppState>) {
@@ -133,6 +133,7 @@ fn handle_command(state: &Arc<AppState>, line: &str) -> bool {
                 print_whois(rest);
             }
         }
+        "ping" => ping_command(rest),
         "" => {}
         _ => tracing::info!("Unknown command: '{trimmed}' (try 'help')"),
     }
@@ -144,6 +145,7 @@ fn print_help() {
     tracing::info!("  help                     - show this list");
     tracing::info!("  players, list, playerlist - list connected players");
     tracing::info!("  whois <player>           - show full session detail for one player");
+    tracing::info!("  ping [player]            - show client<->MCGate latency for one player, or every player");
     tracing::info!("  kick <player> [message]  - disconnect a player, optionally with a message");
     tracing::info!("  transfer <player> <host:port> - send a player directly to another Minecraft server");
     tracing::info!("  routes                   - list configured routes and backend status");
@@ -166,7 +168,18 @@ fn print_players() {
     tracing::info!("{} player(s) connected:", sessions.len());
     for s in sessions {
         let status = s.backend.map(|b| b.to_string()).unwrap_or_else(|| "waiting to reconnect".to_string());
-        tracing::info!("  {} ({}) from {} on '{}' -> {} ping=n/a", s.name, s.uuid, s.remote_address, s.host, status);
+        let ping = format_ping(&s);
+        tracing::info!("  {} ({}) from {} on '{}' -> {} ping={ping}", s.name, s.uuid, s.remote_address, s.host, status);
+    }
+}
+
+/// Client <-> MCGate latency (not MCGate <-> backend - see `net::client_ping`'s doc) for the
+/// `players`/`whois` display. `n/a` on any platform besides Linux, or if the kernel can't report
+/// it for some other reason (e.g. the connection just ended).
+fn format_ping(s: &PlayerSession) -> String {
+    match s.client_ping.round_trip_millis() {
+        Some(ms) => format!("{ms}ms"),
+        None => "n/a".to_string(),
     }
 }
 
@@ -180,9 +193,30 @@ fn print_whois(name: &str) {
     tracing::info!("  From:      {}", s.remote_address);
     tracing::info!("  Host:      {}", s.host);
     tracing::info!("  Status:    {status}");
-    tracing::info!("  Ping:      n/a");
+    tracing::info!("  Ping:      {}", format_ping(&s));
     tracing::info!("  Sent:      {} packet(s), {} byte(s)", s.packets_sent.load(Ordering::Relaxed), s.bytes_sent.load(Ordering::Relaxed));
     tracing::info!("  Received:  {} packet(s), {} byte(s)", s.packets_received.load(Ordering::Relaxed), s.bytes_received.load(Ordering::Relaxed));
+}
+
+/// `ping [player]` - client <-> MCGate latency (see `format_ping`'s doc), for one named player
+/// or every connected player when called with no argument.
+fn ping_command(rest: &str) {
+    let name = rest.trim();
+    if name.is_empty() {
+        let sessions = player_sessions().all();
+        if sessions.is_empty() {
+            tracing::info!("No players connected.");
+            return;
+        }
+        for s in sessions {
+            tracing::info!("  {}: {}", s.name, format_ping(&s));
+        }
+        return;
+    }
+    match player_sessions().find_by_name(name) {
+        None => tracing::info!("No player named '{name}' is connected."),
+        Some(s) => tracing::info!("{}: {}", s.name, format_ping(&s)),
+    }
 }
 
 fn kick_command(rest: &str) {
