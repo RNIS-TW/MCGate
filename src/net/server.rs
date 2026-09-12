@@ -495,7 +495,7 @@ async fn handle_login(
                     });
                 }
                 crate::udp::voice_routing::voice_routing().unregister(&client_addr.ip().to_string());
-                tracing::info!("Disconnected: '{}' from {client_addr} -> {addr}", handshake.host);
+                tracing::info!("Disconnected: '{}'{player_tag} from {client_addr} -> {addr}", handshake.host);
                 return;
             }
             Err(e) => {

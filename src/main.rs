@@ -190,7 +190,8 @@ async fn main() -> Result<()> {
 pub async fn shutdown_gracefully() -> ! {
     let sessions = state::player_sessions().all();
     if !sessions.is_empty() {
-        tracing::info!("Disconnecting {} player(s)...", sessions.len());
+        let names: Vec<&str> = sessions.iter().map(|s| s.name.as_str()).collect();
+        tracing::info!("Disconnecting {} player(s): {}", sessions.len(), names.join(", "));
         for s in &sessions {
             s.disconnect.notify_waiters();
         }
