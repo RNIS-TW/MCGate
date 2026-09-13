@@ -115,7 +115,8 @@ fn handle_command(state: &Arc<AppState>, line: &str) -> bool {
             state.runtime_handle().block_on(crate::shutdown_gracefully());
         }
         "help" | "?" => print_help(),
-        "players" | "list" | "playerlist" => print_players(),
+        "players" | "playerlist" => print_players(),
+        "list" => list_command(rest),
         "routes" => print_routes(state),
         "metrics" => metrics_command(state, rest),
         "version" => tracing::info!("MCGate v{}", version()),
@@ -143,7 +144,8 @@ fn handle_command(state: &Arc<AppState>, line: &str) -> bool {
 fn print_help() {
     tracing::info!("Commands:");
     tracing::info!("  help                     - show this list");
-    tracing::info!("  players, list, playerlist - list connected players");
+    tracing::info!("  players, playerlist        - list connected players (detailed)");
+    tracing::info!("  list [-a]                - list connected player names; -a for detailed view");
     tracing::info!("  whois <player>           - show full session detail for one player");
     tracing::info!("  ping [player]            - show client<->MCGate latency for one player, or every player");
     tracing::info!("  kick <player> [message]  - disconnect a player, optionally with a message");
@@ -157,6 +159,23 @@ fn print_help() {
     tracing::info!("  uptime                   - show how long MCGate has been running");
     tracing::info!("  version                  - show the running MCGate version");
     tracing::info!("  stop, shutdown, exit     - stop the server");
+}
+
+/// `list [-a]` - vanilla-Minecraft-style player list. Plain `list` prints just a comma-separated
+/// name summary ("There are N players online: name1, name2, ..."); `list -a` falls through to
+/// the detailed per-player view (`print_players`).
+fn list_command(rest: &str) {
+    if rest.trim() == "-a" {
+        print_players();
+        return;
+    }
+    let sessions = player_sessions().all();
+    if sessions.is_empty() {
+        tracing::info!("There are 0 players online.");
+        return;
+    }
+    let names = sessions.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+    tracing::info!("There are {} player(s) online: {names}", sessions.len());
 }
 
 fn print_players() {
