@@ -1,176 +1,218 @@
 # MCGate
 
-A Java/Kotlin thin, host-based reverse proxy for Minecraft servers. It routes client connections to backend servers by the hostname the client dialed, without acting as a full proxy - no session handling, no server switching, just fast connection forwarding.
+A thin, host-based reverse proxy for Minecraft servers, written in Rust/tokio and compiled to a
+single native binary — no JVM, no separate runtime.
 
-## Features
-
-- **Host-based routing** with `*` / `?` wildcards and `$1`, `$2`, ... parameter substitution in backend addresses
-- **Per-route `priority`** - higher priority routes are matched before lower ones, regardless of file order (default `0`, ties keep file order)
-- **Multiple backends per route** with load balancing strategies: `sequential`, `random`, `round-robin`, `least-connections`, `lowest-latency`, plus automatic failover on connect failure
-- **Status ping caching** per backend, with a configurable `cachePingTTL` (or `-1s` to disable)
-- **Fallback status response** (motd/version/players/favicon) when all of a route's backends are down
-- **`modifyVirtualHost`** - rewrites the handshake hostname before forwarding to the backend
-- **Per-route `proxyProtocol`** - sends a PROXY protocol v1 header so the backend sees the real client IP
-- **DDoS / flood hardening** - `loginTimeout` closes half-open connections (slow-loris); the backend dial *and* backend DNS resolution are both deferred until the client's Login Start arrives, so a connection flood (e.g. to random subdomains on a wildcard route) never reaches the backend or the resolver; oversized handshake frames are rejected on sight; the ping and DNS caches are size-capped; optional `maxConnectionsPerIp` and `connectionThrottle` cap concurrent/new pre-login connections per source IP and process-wide; `udpThrottle` bounds the voicechat/`udpProxy` UDP relay paths (per-IP and total session caps, plus an early teardown for sessions whose backend never replies - the spoofed-source-flood defence)
-- **Hot config reload** - edits to the config file are picked up live, no restart needed (except for the `bind` address)
-- **Per-route traffic metrics** - optional cumulative upload/download byte accounting per route (`metrics:`), persisted to a JSON file off the event loop, with optional byte limits that kick players and refuse new logins once reached
-- **Bootstraps a default config** on first run if none exists
-
-## Build
-
-Requires JDK 17+ and Maven.
-
-```
-mvn package -DskipTests
-```
-
-Produces `target/MCGate-1.0-SNAPSHOT.jar`.
-
-## Run
-
-```
-java -jar target/MCGate-1.0-SNAPSHOT.jar [path/to/config.yml]
-```
-
-If the config path doesn't exist yet, it's created from a bundled example covering every feature. Defaults to `config.yml` in the working directory.
-
-### Memory / JVM flags
-
-MCGate is a byte-relay: its own working set is tiny (a few hundred KiB per connected player). Almost all of the RSS you see is the JVM heap reservation and Netty's pooled buffer arenas, both of which size themselves off the CPU/RAM the JVM *thinks* it has. On a shared hosting node (Pterodactyl and similar) the JVM often sees the whole physical box, not your slice, and over-reserves badly - e.g. ~900 MiB resident with only ~50 players.
-
-The build already shrinks Netty's side of this (small fixed arena count, capped worker threads, a 96 MiB direct-memory ceiling - see `tuneNettyMemoryFootprint` in `Main.kt`). For the heap, pass explicit flags - for a 1 GiB container:
-
-```
-java -Xms128m -Xmx512m \
-     -XX:+UseSerialGC \
-     -XX:MaxDirectMemorySize=128m \
-     -XX:+ExitOnOutOfMemoryError \
-     -jar MCGate-1.0-SNAPSHOT.jar
-```
-
-`-Xmx512m` leaves headroom for direct buffers, thread stacks, and metaspace under the 1 GiB cap. `-XX:+UseSerialGC` has the smallest footprint and actually returns freed memory to the OS, which G1 (the default) largely won't at this heap size. Scale `-Xmx` with the container: roughly `limit - 256m - (players / 500)m`.
-
-## Continuous integration
-
-`Jenkinsfile` defines a declarative pipeline:
-
-| Stage | What it does |
-| --- | --- |
-| Checkout | `checkout scm` and records the commit SHA; posts a `PENDING` GitHub commit status (`ci/jenkins`) |
-| Build | `mvn -B clean compile` |
-| Test | `mvn -B test -DskipTests=false` (the pom skips tests by default), publishes JUnit results, zips `surefire-reports` and archives `test-reports.zip` |
-| Package | `mvn -B package -DskipTests`, archives `target/MCGate-*.jar` |
-
-On completion it sets the GitHub commit status to `SUCCESS` / `FAILURE` (the check shown on commits and PRs). On pull-request builds (a Multibranch Pipeline job) it also comments on the PR with a pass/fail/skipped table and a link to the archived test report.
-
-**Jenkins setup:**
-
-- Tools named `JDK 21` and `Maven 3` configured under *Manage Jenkins → Tools*.
-- Plugins: *GitHub API for Pipeline* (`githubNotify`), *JUnit*; for PR builds/comments also *GitHub Branch Source* and *Pipeline: GitHub*.
-- A global **Username with password** credential `github-rnis` (username = a GitHub user with write access to `RNIS-TW/MCGate`, password = a token with *Commit statuses* and *Pull requests* read/write). Update `GITHUB_ACCOUNT` / `GITHUB_REPO` / `GITHUB_CRED` in `Jenkinsfile` if these differ.
-- For automatic PR builds, use a *Multibranch Pipeline* job with "Discover pull requests" and a GitHub webhook to `/github-webhook/`.
-
-**If a new branch / PR gets no build ("Checks 0"):** the job hasn't *discovered* it yet — the `pollSCM` trigger in `Jenkinsfile` only re-polls branches that already have a job, it does not discover new ones.
-- Immediate: open the Multibranch job → **Scan Repository Now**.
-- Permanent: set *Scan Repository Triggers → "Periodically if not otherwise run"* (e.g. 1 hour) as a fallback, and add a GitHub webhook (repo *Settings → Webhooks → `https://<jenkins>/github-webhook/`*, JSON, "push" + "pull request" events).
-- The Branch Source **Behaviours** must include *"Discover branches"* and *"Discover pull requests from origin"* (add *"…from forks"* if PRs come from forks).
-- If the job is a plain single-branch *Pipeline* (not *Multibranch*), it will never build PRs — recreate it as *Multibranch Pipeline*; this `Jenkinsfile` already assumes that (`env.CHANGE_ID`).
-- Note: with the PR "merge" discovery strategy, `git rev-parse HEAD` is the ephemeral merge commit, so the `ci/jenkins` status lands on a commit GitHub doesn't show on the PR. Use the *"The current pull request revision"* (head) strategy so the status attaches to the PR head.
-
-## Configuration
-
-```yaml
-config:
-  bind: 0.0.0.0:25565
-  routes:
-    - host: survival.example.com
-      backend: 127.0.0.1:25566
-
-    - host: "*.wildcard.example.com"
-      backend: "$1.servers.svc:25568"
-
-    - host: vip.wildcard.example.com
-      backend: 127.0.0.1:25573
-      priority: 10
-
-    - host: lobby.example.com
-      backend: [127.0.0.1:25569, 127.0.0.1:25570]
-      strategy: round-robin
-      cachePingTTL: 60s
-
-    - host: localhost
-      backend: 127.0.0.1:25572
-      fallback:
-        motd: Server is offline.
-        version:
-          name: "Try again later!"
-          protocol: -1
-
-    - host: metered.example.com
-      backend: 127.0.0.1:25566
-      metrics:
-        file: data/metered.example.com.json   # cumulative totals, persisted here (survives restarts)
-        upload:                                # client -> backend bytes
-          enabled: true
-          limit: -1                            # -1 = unlimited; a cap kicks players + refuses logins when reached
-        download:                              # backend -> client bytes
-          enabled: true
-          limit: 100g                          # bytes, or a k/m/g/t/p suffix (x1024); 100g = 100 GiB
-```
-
-Per-route `metrics:` accounting keeps two atomics per route in memory (no per-connection state) and flushes them to `file` as JSON from a single background thread — never on a Netty event loop. Totals load back on startup, carry across hot reloads, and are exposed via the API (`/v1/routes/{index}/metrics`, `/metrics`) and the console `metrics` command.
-
-Routes are matched in descending `priority` order (ties keep the order they appear in the file), so a specific host like `vip.wildcard.example.com` can win over an overlapping wildcard such as `*.wildcard.example.com` even though the wildcard is listed first.
-
-See `src/main/resources/default-config.yml` for a complete annotated example.
-
-## API
-
-MCGate can expose a small read-only JSON/HTTP status API. Disabled by default:
-
-```yaml
-config:
-  api:
-    enabled: false
-    bind: localhost:8080
-```
-
-Endpoints (all `GET`):
-
-| Path | Description |
-| --- | --- |
-| `/v1/routes` | All routes: hosts, backend templates, strategy, TTL, flags |
-| `/v1/routes/{index}` | A single route by its index in the config |
-| `/v1/routes/{index}/backends` | Last-known per-backend stats (active connections, latency) for non-wildcard routes |
-| `/v1/routes/{index}/ping` | Dials each backend of the route **right now** (bypassing the ping cache) and returns live online status, latency, and the raw status JSON, or an error per backend that's unreachable |
-| `/v1/routes/{index}/metrics` | This route's cumulative upload/download byte usage, configured limits, and whether a limit is exceeded (`404` unless the route enables `metrics:`) |
-| `/metrics` | Prometheus text format; per-route byte usage appears as `mcgate_route_bytes_uploaded_total` / `mcgate_route_bytes_downloaded_total` when configured. Add `?type=json` for the same data (plus per-player detail and `routeMetrics`) as JSON |
-
-The API only binds when `enabled: true`; bind it to `localhost` or a private interface unless it's behind your own auth/network controls.
+See [`plan.md`](plan.md) for the port history from the original Java/Kotlin implementation this
+was rewritten from, including exactly what was ported, what's deliberately out of scope, and how
+each piece was verified. Short version: every section is done — config, hot reload, the TCP
+relay (handshake/status/login), backend selection strategies, per-route traffic metrics, SQLite
+connection tracking and stats logging, the UDP/voicechat relays, the console REPL, and the HTTP
+API — except mid-session auto-reconnect-holding, which was deliberately not ported.
 
 ## Project layout
 
 ```
-src/main/kotlin/me/hippodev/
-  Main.kt               - bootstrap, config hot-reload wiring, connection dispatch
-  ConfigLoader.kt        - default-config bootstrapping + file watcher
-  Config.kt               - YAML config model and parsing
-  HostPattern.kt          - wildcard host matching and $N substitution
-  BackendSelector.kt      - load balancing strategies and per-route runtime state
-  HandshakeSniffer.kt     - reads just enough of the handshake packet to route
-  LoginRelayHandler.kt    - raw TCP relay for real (login) connections
-  StatusHandler.kt        - status ping handling, caching, fallback
-  PingCache.kt            - TTL cache for backend status responses
-  StatusJson.kt           - fallback status JSON building
-  MinecraftProtocol.kt    - varint/string/packet encode-decode helpers
-src/main/resources/
-  default-config.yml      - bundled example config, copied on first run
+src/
+  main.rs       entry point: CLI args, startup wiring, the shared graceful-shutdown path
+  console.rs    the admin REPL (help/players/kick/reload/stop/...)
+  logging.rs    console + rolling-file logging, colour/level handling
+  version.rs    build version string
+
+  protocol/     Minecraft wire format - pure parsing/encoding, no app state or I/O
+    varint.rs, minecraft_protocol.rs, handshake.rs, nbt.rs, compression.rs,
+    text_format.rs, status_json.rs, reconnect_protocol.rs,
+    proxy_protocol_tcp.rs, proxy_protocol_datagram.rs
+
+  config/       config.yml/messages.yml schema, parsing, and hot-reload
+    config.rs (schema + parsing, at the crate::config root), loader.rs (file
+    watching), messages.rs, duration.rs, host_pattern.rs
+
+  net/          the TCP relay: accept loop, backend dial/selection, anti-abuse
+                gating, and the HTTP status/metrics API
+    server.rs, backend_pinger.rs, backend_selector.rs, buffered_stream.rs,
+    connection_guard.rs, dns_cache.rs, flood_control.rs, network_info.rs,
+    ping_cache.rs, api.rs
+
+  udp/          UDP: standalone forwards, the voicechat relay + its routing
+                table, and the shared anti-abuse session/rate limits
+    proxy.rs, voice_relay.rs, voice_routing.rs, throttle.rs
+
+  state/        live process state: connected players, per-route runtime,
+                and the SQLite-backed connection-tracking/stats-logging writers
+    state.rs (sessions/route runtime, at the crate::state root),
+    app_state.rs, connection_tracker.rs, route_metrics_store.rs, stats_logger.rs
+```
+
+Each of `config`, `net`, `udp`, and `state` is a directory whose parent file (`config.rs`,
+`net.rs`, `udp.rs`, `state.rs`) just declares its submodules — `config.rs` and `state.rs` also
+hold that module's core types directly (`GateConfig`/`Route` and `PlayerSession`/`RouteRuntime`
+respectively), so e.g. `crate::config::Route` and `crate::config::host_pattern::HostPattern` are
+both valid, one from the parent file and one from a submodule.
+
+## Build
+
+Requires the Rust toolchain (stable — install via [rustup](https://rustup.rs) if you don't have
+it: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`). The `rusqlite` dependency
+compiles SQLite from source (`bundled` feature), so a C compiler needs to be on `PATH` — already
+true on macOS (Xcode command line tools) and virtually every Linux distro's build tooling; on a
+minimal server image install `build-essential` (Debian/Ubuntu) or `gcc` (RHEL/Alpine) first.
+
+```
+cargo build --release
+```
+
+Produces a single self-contained binary at `target/release/mcgate` — no separate runtime, no other
+files to ship alongside it (`bundled` SQLite is statically linked in). Copy that one file to a
+server and run it; that's the whole deployment.
+
+**The binary is only portable across machines with the same OS and CPU architecture as the one it
+was built on.** Running a macOS/arm64 (Apple Silicon) build on a Linux/x86_64 server, for
+example, fails with `cannot execute binary file: Exec format error`. That's not a corrupted
+binary, it's the wrong target. Either build directly on a machine matching the deployment target,
+or cross-compile.
+
+### Cross-compiling for a Linux server (e.g. Pterodactyl)
+
+Building on macOS but deploying to a Linux/x86_64 host (the common case: most VPS/hosting-panel
+servers, Pterodactyl included, are `x86_64-unknown-linux-gnu`)? Install
+[`cross`](https://github.com/cross-rs/cross) once (needs Docker running locally), then:
+
+```
+cargo install cross --git https://github.com/cross-rs/cross
+cross build --release --target x86_64-unknown-linux-gnu
+```
+
+That produces `target/x86_64-unknown-linux-gnu/release/mcgate` — copy that binary to the server.
+For an ARM64 Linux host (e.g. AWS Graviton, Oracle's ARM free tier) swap the target for
+`aarch64-unknown-linux-gnu` instead.
+
+Plain `cargo build --target ...` isn't enough for cross-OS builds — it still uses the host
+linker, which can't produce a Linux glibc binary from macOS. `cross` runs the build inside a
+Docker container with the right target toolchain instead.
+
+`cross` writes the binary back out through a bind mount from inside that container, so it doesn't
+always come back execute-bit-set (or even owned by you) on the host side — if the server says
+`Permission denied` on startup, `chmod +x mcgate` (or `sudo chown` first, if it's owned by root)
+before running it. [`build.sh`](build.sh) does this for you automatically (see below).
+
+### `build.sh`: an interactive build picker
+
+```
+./build.sh
+```
+
+An arrow-key menu over the targets above — `Up`/`Down` to move, `Space` to check one or more,
+`A` to select all, `Enter` to build. Installs the needed `rustup` target and `cross` automatically,
+picks plain `cargo build` vs. `cross build` per target the same way this section does, and
+`chmod +x`'s the result. Non-interactive: `./build.sh <target-triple> [<target-triple> ...]`,
+`./build.sh --all`, or `./build.sh --list` to see the known targets.
+
+## Run
+
+```
+./target/release/mcgate [config.yml] [messages.yml]
+```
+
+Both arguments are optional and default to `config.yml`/`messages.yml` in the current directory;
+a missing file is bootstrapped from the built-in defaults on first run.
+
+```
+./target/release/mcgate --help       # usage
+./target/release/mcgate --version    # prints the built version
+```
+
+### Console
+
+Once running, type commands directly into stdin: `help`, `players`, `whois <player>`,
+`kick <player> [message]`, `routes`, `metrics [reset <index|host|all>]`, `reload`, `uptime`,
+`version`, `stop`/`shutdown`/`exit`. Plain stdin (one command per line) is the default and is
+what you want under a hosting panel like Pterodactyl — panel "send command" boxes write a whole
+line into the container's stdin at once rather than emulating real keystroke-by-keystroke
+terminal input, which line-editing libraries can't follow (it shows up as commands needing to be
+sent more than once, or the prompt and typed text landing on separate lines). Set
+`MCGATE_INTERACTIVE_CONSOLE=true` to opt into line editing/history instead, when actually running
+the binary directly in your own terminal.
+
+`stop`/`shutdown`/`exit` (and Ctrl+C) all go through the same graceful shutdown: every connected
+player is disconnected, the SQLite connection-tracking/stats-logging writers are flushed, then
+the process exits — rather than hanging until players happen to disconnect on their own.
+
+### Running as a service
+
+A minimal systemd unit (adjust `User`, `WorkingDirectory`, and the binary path):
+
+```ini
+[Unit]
+Description=MCGate
+After=network.target
+
+[Service]
+Type=simple
+User=mcgate
+WorkingDirectory=/opt/mcgate
+ExecStart=/opt/mcgate/mcgate config.yml messages.yml
+Restart=on-failure
+RestartSec=5
+# The process handles SIGINT itself (graceful shutdown - see main.rs); SIGTERM's default
+# behavior (immediate termination) is fine too since state is either persisted continuously
+# (SQLite, route metrics) or doesn't need draining.
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ```
-Jenkinsfile               - CI pipeline: checkout, build, test, package, GitHub status + PR comment
+sudo systemctl enable --now mcgate
+journalctl -u mcgate -f     # logs (also written to ./log/latest.log regardless)
 ```
 
-## License
+### Memory
 
-MIT - see [LICENSE](LICENSE).
+Unlike the JVM build, there's no separate heap/arena sizing story here: no `-Xmx`, no
+`MaxDirectMemorySize`, no allocator arena tuning (see `plan.md`'s section 3 note on why
+`tuneNettyMemoryFootprint`'s equivalent isn't needed — tokio has no comparable fixed per-thread
+buffer-cache overhead that scales off a container's misreported CPU count). The binary's resident
+set is close to its actual working set: a small fixed amount for the runtime plus a modest
+per-connection cost, not a pre-reserved heap. Nothing to configure for typical deployments.
+
+### HTTP API
+
+With `api.enabled: true` (see `config.yml`), MCGate exposes a small JSON admin/status API plus
+interactive docs:
+
+- `GET /reference` — a [Scalar](https://github.com/scalar/scalar)-rendered API reference page.
+  `GET /` redirects here.
+- `GET /openapi.json` — the OpenAPI 3.0 spec backing that page (hand-authored, in
+  `resources/openapi.json`).
+- `GET /metrics`, `GET /v1/routes[/{index}[/backends|/metrics|/ping]]`, `GET /v1/players` — the
+  existing read-only status/metrics endpoints.
+- `POST /v1/routes`, `PUT /v1/routes/{index}`, `DELETE /v1/routes/{index}` — add, replace, or
+  remove a route at runtime. The body is the same shape as one `config.yml` route entry; a
+  mutation is validated through the exact same loader a hand-edited `config.yml` goes through
+  (via `config::editor`) before it's written to disk and hot-applied, so an invalid body is
+  rejected without ever touching the real file. A route is identified by its `host` set, not its
+  raw position — routes are re-sorted by priority on load, so an index alone isn't a stable
+  identity across a reload.
+
+`/reference` and `/openapi.json` are unauthenticated (static docs, not live data); every other
+endpoint requires `Authorization: Bearer <token>` when `api.token` is set, same as before.
+
+## Test
+
+```
+cargo test              # unit tests + real-socket integration tests (TCP/UDP, no mocks)
+cargo build --release   # the release binary CI also builds
+```
+
+## Continuous integration
+
+`.github/workflows/rust.yml` (GitHub Actions) runs on any push or pull request:
+
+| Job | What it does |
+| --- | --- |
+| `test` | `cargo test --locked` on Linux and macOS |
+| `build` | `cargo build --release --locked`, uploads the resulting binary as a workflow artifact |
+
+Both jobs cache the cargo registry and build output (`Swatinem/rust-cache`) so most runs only
+recompile what actually changed.

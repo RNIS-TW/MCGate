@@ -1,0 +1,43 @@
+[package]
+name = "mcgate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+notify-debouncer-mini = "0.4"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+flate2 = "1"
+if-addrs = "0.13"
+rustyline = "14"
+axum = "0.7"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
+crossbeam-channel = "0.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only for reading the kernel's live TCP_INFO (round-trip-time estimate) off a client socket, on
+# the one OS whose layout for it this actually targets - see net::client_ping. Already pulled in
+# transitively via tokio/mio on every platform regardless, so this costs nothing extra in the
+# dependency graph; it's just promoted to a direct (and Linux-only) dependency here.
+libc = "0.2"
+
+[profile.release]
+# Thin LTO (not `true`/"fat") + the default codegen-units: fat LTO with codegen-units = 1 forces
+# a single, fully serial whole-program link-time-optimization pass, which is what made the final
+# "Building .../179: mcgate(bin)" step take most of the build's total time - every dependency
+# crate was already done; that step alone was the slow part. Thin LTO still does cross-crate
+# inlining (most of fat LTO's runtime benefit) but processes translation units in parallel
+# instead of serially merging all of them into one, which is dramatically faster to link while
+# giving up only a small amount of runtime optimization - a good trade for a network proxy that's
+# I/O-bound, not CPU-bound in its hot path.
+lto = "thin"
+strip = true

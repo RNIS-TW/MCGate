@@ -1,0 +1,324 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "MCGate API",
+    "version": "1",
+    "description": "Read-only status/metrics plus route management for a running MCGate instance. Every response is JSON except `GET /metrics` without `?type=json`, which is Prometheus text exposition format. Authentication (if `api.token` is set in config.yml) is an `Authorization: Bearer <token>` header on every endpoint except `/`, `/reference`, and `/openapi.json` (static docs, not live data).",
+    "license": { "name": "MIT", "url": "https://github.com/RNIS-TW/MCGate/blob/main/LICENSE" }
+  },
+  "servers": [{ "url": "/", "description": "This MCGate instance's api.bind address" }],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Required only when config.yml's api.token is set."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": { "error": { "type": "string" } },
+        "required": ["error"]
+      },
+      "RouteInput": {
+        "type": "object",
+        "description": "Same shape as one entry in config.yml's routes: list. Used as the request body for POST /v1/routes and PUT /v1/routes/{index}.",
+        "properties": {
+          "host": {
+            "description": "One hostname/pattern, or a list of them. `*` and `?` are wildcards.",
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          },
+          "backend": {
+            "description": "One backend host:port, or a list of them for load balancing.",
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          },
+          "strategy": { "type": "string", "enum": ["sequential", "random", "round-robin", "least-connections", "lowest-latency"], "default": "sequential" },
+          "priority": { "type": "integer", "default": 0, "description": "Higher matches before lower, regardless of file order." },
+          "cachePingTTL": { "type": "string", "example": "10s", "description": "Duration string; -1s disables the ping cache." },
+          "modifyVirtualHost": { "type": "boolean", "default": false },
+          "proxyProtocol": { "type": "boolean", "default": false, "description": "Send a PROXY protocol header to this route's backend." },
+          "kickMessage": { "type": "string" },
+          "voicechat": { "type": "string", "description": "Backend host:port for the Simple Voice Chat UDP relay." },
+          "fallback": {
+            "type": "object",
+            "description": "Status response served when every backend is unreachable.",
+            "properties": {
+              "motd": { "type": "string" },
+              "version": {
+                "type": "object",
+                "properties": { "name": { "type": "string" }, "protocol": { "type": "integer" } }
+              },
+              "favicon": { "type": "string", "description": "Path to a PNG, or a data:image/png;base64,... string." }
+            }
+          },
+          "reconnect": {
+            "type": "object",
+            "description": "Auto-reconnect holding page instead of a fallback/kick, for 1.20.2+ clients.",
+            "properties": {
+              "enabled": { "type": "boolean", "default": false },
+              "onMidSessionDrop": { "type": "boolean" },
+              "retryInterval": { "type": "string", "example": "5s" },
+              "maxRetryInterval": { "type": "string", "example": "30s" },
+              "backoffMultiplier": { "type": "number", "example": 2.0 },
+              "maxWait": { "type": "string", "example": "10m" },
+              "title": { "type": "string" },
+              "subtitle": { "type": "string" },
+              "attemptSuffix": { "type": "string" },
+              "actionBarFrames": { "type": "array", "items": { "type": "string" } },
+              "animationInterval": { "type": "string", "example": "500ms" }
+            }
+          },
+          "metrics": {
+            "type": "object",
+            "description": "Per-route upload/download byte accounting.",
+            "properties": {
+              "file": { "type": "string", "description": "JSON file the running totals are persisted to." },
+              "resetInterval": { "type": "string", "example": "30d", "description": "0 or omitted never auto-resets." },
+              "upload": { "$ref": "#/components/schemas/RouteMetricDirection" },
+              "download": { "$ref": "#/components/schemas/RouteMetricDirection" }
+            }
+          }
+        },
+        "required": ["host", "backend"]
+      },
+      "RouteMetricDirection": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "limit": { "type": "integer", "format": "int64", "default": -1, "description": "Cumulative byte ceiling; -1 = unlimited. Accepts a k/m/g/t/p suffix as a string too (e.g. \"100g\")." }
+        }
+      },
+      "Route": {
+        "type": "object",
+        "properties": {
+          "index": { "type": "integer" },
+          "hosts": { "type": "array", "items": { "type": "string" } },
+          "backends": { "type": "array", "items": { "type": "string" } },
+          "strategy": { "type": "string" },
+          "priority": { "type": "integer" },
+          "cachePingTtlMillis": { "type": "integer", "format": "int64" },
+          "modifyVirtualHost": { "type": "boolean" },
+          "proxyProtocol": { "type": "boolean" },
+          "hasFallback": { "type": "boolean" },
+          "hasMetrics": { "type": "boolean" }
+        }
+      },
+      "Backend": {
+        "type": "object",
+        "properties": {
+          "address": { "type": "string" },
+          "activeConnections": { "type": "integer", "nullable": true },
+          "latencyMillis": { "type": "integer", "format": "int64", "nullable": true }
+        }
+      },
+      "RouteMetrics": {
+        "type": "object",
+        "properties": {
+          "index": { "type": "integer" },
+          "hosts": { "type": "array", "items": { "type": "string" } },
+          "file": { "type": "string", "nullable": true },
+          "upload": { "$ref": "#/components/schemas/MetricCounter" },
+          "download": { "$ref": "#/components/schemas/MetricCounter" },
+          "resetIntervalMillis": { "type": "integer", "format": "int64" },
+          "resetAt": { "type": "integer", "format": "int64" }
+        }
+      },
+      "MetricCounter": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "bytes": { "type": "integer", "format": "int64" },
+          "limit": { "type": "integer", "format": "int64" },
+          "exceeded": { "type": "boolean" }
+        }
+      },
+      "Player": {
+        "type": "object",
+        "properties": {
+          "uuid": { "type": "string", "format": "uuid" },
+          "name": { "type": "string" },
+          "ip": { "type": "string" },
+          "host": { "type": "string" },
+          "backend": { "type": "string", "nullable": true },
+          "protocolVersion": { "type": "integer" },
+          "connectedAt": { "type": "integer", "format": "int64", "description": "Unix millis." },
+          "loginAttempts": { "type": "integer" },
+          "packetsSent": { "type": "integer", "format": "int64" },
+          "packetsReceived": { "type": "integer", "format": "int64" },
+          "bytesSent": { "type": "integer", "format": "int64" },
+          "bytesReceived": { "type": "integer", "format": "int64" },
+          "compressionThreshold": { "type": "integer" },
+          "encrypted": { "type": "boolean" },
+          "pingMillis": { "type": "integer", "nullable": true, "description": "Client <-> MCGate round-trip time, read from the kernel's TCP_INFO. Only available on Linux." }
+        }
+      }
+    }
+  },
+  "security": [{ "bearerAuth": [] }, {}],
+  "paths": {
+    "/reference": {
+      "get": {
+        "summary": "This page",
+        "description": "The Scalar-rendered interactive API reference you're looking at.",
+        "security": [],
+        "responses": { "200": { "description": "HTML page", "content": { "text/html": {} } } }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This OpenAPI spec",
+        "security": [],
+        "responses": { "200": { "description": "OpenAPI 3.0 document", "content": { "application/json": {} } } }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Live stats, Prometheus text or JSON",
+        "description": "Players online, per-host player counts, uptime, per-backend active connections/latency, and per-route byte counters. Prometheus text exposition format by default; pass ?type=json for the same data as JSON (also including the player list).",
+        "parameters": [
+          { "name": "type", "in": "query", "schema": { "type": "string", "enum": ["json"] }, "description": "Set to 'json' for a JSON body instead of Prometheus text." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Metrics",
+            "content": {
+              "text/plain": { "schema": { "type": "string" } },
+              "application/json": { "schema": { "type": "object" } }
+            }
+          },
+          "401": { "description": "Missing/invalid bearer token", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/v1/metrics/reset": {
+      "post": {
+        "summary": "Reset every route's traffic counters",
+        "description": "Zeroes upload/download byte counters for every route with a metrics: block, and restarts each one's rolling resetInterval window (if it has one) from now - same as the console's 'metrics reset all'.",
+        "responses": {
+          "200": { "description": "How many counters were reset", "content": { "application/json": { "schema": { "type": "object", "properties": { "reset": { "type": "integer", "description": "Number of routes whose counters were reset." } } } } } },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      }
+    },
+    "/v1/routes": {
+      "get": {
+        "summary": "List every configured route",
+        "responses": {
+          "200": { "description": "Routes", "content": { "application/json": { "schema": { "type": "object", "properties": { "routes": { "type": "array", "items": { "$ref": "#/components/schemas/Route" } } } } } } },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      },
+      "post": {
+        "summary": "Add a new route",
+        "description": "Appends a route to config.yml and hot-reloads it - validated through the exact same loader a hand-edited config.yml goes through, so an invalid body is rejected without touching the file.",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RouteInput" } } } },
+        "responses": {
+          "201": { "description": "Created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Route" } } } },
+          "400": { "description": "Invalid route body", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      }
+    },
+    "/v1/routes/{index}": {
+      "get": {
+        "summary": "One route's config",
+        "parameters": [{ "name": "index", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": {
+          "200": { "description": "Route", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Route" } } } },
+          "404": { "description": "No route at that index", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      },
+      "put": {
+        "summary": "Replace a route",
+        "description": "Full replace - any field omitted from the body reverts to its default, same as an empty key in config.yml would. Identified by this index's current host set, not its raw file position (routes are re-sorted by priority on load).",
+        "parameters": [{ "name": "index", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RouteInput" } } } },
+        "responses": {
+          "200": { "description": "Updated route", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Route" } } } },
+          "400": { "description": "Invalid route body, or the route no longer matches (config.yml changed underneath this index)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "No route at that index", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      },
+      "delete": {
+        "summary": "Remove a route",
+        "parameters": [{ "name": "index", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": {
+          "200": { "description": "Deleted", "content": { "application/json": { "schema": { "type": "object", "properties": { "deleted": { "type": "boolean" }, "routeCount": { "type": "integer" } } } } } },
+          "400": { "description": "The route no longer matches (config.yml changed underneath this index)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "No route at that index", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      }
+    },
+    "/v1/routes/{index}/backends": {
+      "get": {
+        "summary": "A route's backends and their live stats",
+        "parameters": [{ "name": "index", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": {
+          "200": { "description": "Backends", "content": { "application/json": { "schema": { "type": "object", "properties": { "backends": { "type": "array", "items": { "$ref": "#/components/schemas/Backend" } } } } } } },
+          "404": { "description": "No route at that index" },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      }
+    },
+    "/v1/routes/{index}/metrics": {
+      "get": {
+        "summary": "A route's traffic counters",
+        "parameters": [{ "name": "index", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": {
+          "200": { "description": "Route metrics", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RouteMetrics" } } } },
+          "404": { "description": "No route at that index, or it has no metrics: block configured" },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      }
+    },
+    "/v1/routes/{index}/metrics/reset": {
+      "post": {
+        "summary": "Reset this route's traffic counters",
+        "description": "Zeroes this route's upload/download byte counters right now, and restarts its rolling resetInterval window (if it has one) from now - same as the console's 'metrics reset <index>'.",
+        "parameters": [{ "name": "index", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": {
+          "200": { "description": "The just-reset counters", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RouteMetrics" } } } },
+          "404": { "description": "No route at that index, or it has no metrics: block configured" },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      }
+    },
+    "/v1/routes/{index}/ping": {
+      "get": {
+        "summary": "Live-dial a route's backend(s) right now",
+        "description": "Not cached - a genuine on-demand connection to each backend. Capped at 4 concurrent live pings process-wide. Cannot target a wildcard route with no concrete host.",
+        "parameters": [{ "name": "index", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": {
+          "200": { "description": "Ping results", "content": { "application/json": { "schema": { "type": "object", "properties": { "index": { "type": "integer" }, "pings": { "type": "array", "items": { "type": "object" } } } } } } },
+          "400": { "description": "Wildcard route with no concrete host" },
+          "404": { "description": "No route at that index" },
+          "429": { "description": "Too many concurrent live pings" },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      }
+    },
+    "/v1/players": {
+      "get": {
+        "summary": "Connected players, paged",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer" }, "description": "Defaults to (and is capped at) api.playersPageLimit." },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "default": 0 } }
+        ],
+        "responses": {
+          "200": { "description": "Players", "content": { "application/json": { "schema": { "type": "object", "properties": { "total": { "type": "integer" }, "offset": { "type": "integer" }, "limit": { "type": "integer" }, "players": { "type": "array", "items": { "$ref": "#/components/schemas/Player" } } } } } } },
+          "401": { "description": "Missing/invalid bearer token" }
+        }
+      }
+    }
+  }
+}
