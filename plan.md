@@ -147,6 +147,39 @@ What IS real: handshake parsing, every anti-abuse guard, inbound/outbound PROXY 
       login deadline itself is a `tokio::time::timeout` wrapping the handshake read in `server.rs`
       rather than a separate scheduled task, since there's no separate "deadline handler" to own
       it the way a Netty pipeline stage would.
+  - **One real production bug, found from an actual OOM kill, not from review**: `server.rs`'s
+    call site for this guard unconditionally disabled the per-IP cap (`per_ip_limit = 0`,
+    `ip_string = None`) whenever `proxyProtocol: true` - stale reasoning copied from the
+    *process-wide per-IP rate limit* a few lines above it (which genuinely can't trust the address
+    yet, since it runs *before* the PROXY header is read). But this guard runs *after* the header
+    parse, where `effective_addr` is already the real client address - so on any proxy_protocol
+    deployment (the reported production config), `maxConnectionsPerIp` was silently inert and
+    there was no cap anywhere on concurrent pre-login connections (`connectionThrottle.
+    maxConnections: 0` in that config meant no global cap either). During a backend outage, a
+    reconnect storm from real clients could grow concurrent pre-login tasks/sockets without bound
+    - exactly the shape of a Docker OOM kill correlated with "backend became unavailable," and
+    what looked like a RAM leak on the dashboard was actually unbounded concurrency with no cap to
+    hit. Fixed by using `effective_addr` unconditionally, since it's already correct at this point
+    regardless of proxy_protocol. Regression-tested end-to-end in `tests/e2e.rs`
+    (`per_ip_pre_login_cap_applies_under_proxy_protocol`): drives real PROXY v1 headers reporting
+    the same real client IP over real loopback sockets against the actual compiled binary,
+    confirms a 3rd concurrent pre-login connection from that IP is rejected once the cap is hit,
+    and that freeing a slot admits a new one - verified this test actually fails against the
+    pre-fix code (not just that it passes post-fix) by re-running it with the fix reverted.
+  - **A second, real bug turned up while investigating (dead code in this deployment, not the
+    actual OOM cause, but still a genuine leak)**: `udp/proxy.rs` and `udp/voice_relay.rs`'s
+    per-session `spawn_backend_reader` task only checked its session's `dead` flag *after* a
+    successful `recv()` from the backend socket - session teardown (idle timeout, no-reply
+    teardown, player disconnect) never touched the task itself, so once a backend stopped sending
+    anything (the normal case once a player leaves), the task stayed parked in
+    `recv().await` forever, leaking the task, its 64 KiB buffer, and the backend socket fd on
+    every session that ended without further backend traffic. Fixed by storing the reader task's
+    `JoinHandle` on `Session` and `.abort()`-ing it from `close_session` in both modules, with a
+    direct regression test in each asserting the task's `AbortHandle::is_finished()` flips to
+    `true` shortly after close - not just that routing behavior still looks right afterward. Only
+    reachable when `udpProxy:` is non-empty or a route configures `voicechat:`; neither is true in
+    the reported production config, so this was not what caused the OOM - worth having fixed
+    regardless, for any deployment (or future config change) that does use either.
 - [x] `flood_control.rs` — port of `FloodControl.kt`: `GlobalConnections`
       (+ `GlobalConnectionGuard` RAII wrapper), `ConnectionRates` (fixed-window per-IP rate limit,
       periodic stale-window sweep), and `HeldReconnectSessions`'s counter/cap (wired to
@@ -335,6 +368,10 @@ to a fake voice backend, both directions, over real loopback sockets.
     them into one sequential test (register → verify relay → unregister → verify drop), which
     makes cross-test interleaving impossible rather than papering over it. Confirmed fixed with 6
     consecutive clean full-suite runs, not just one.
+  - **One real RAM leak found post-port, from a live node's dashboard, not from review** (a
+    `spawn_backend_reader` task in each of `udp_proxy.rs`/`voice_relay.rs` leaking forever once
+    its session closed) — full writeup under section 3's `connection_guard.rs` entry, alongside
+    the actual production OOM root cause found in the same investigation.
 
 ## 7. Operational surface — DONE (verified end-to-end; see caveats below)
 

@@ -195,6 +195,39 @@ fn start_mcgate(dir: &std::path::Path, mcgate_port: u16, backend_addr: SocketAdd
     McGateProcess { child }
 }
 
+/// Same as `start_mcgate` but with `proxyProtocol: true` and a small `maxConnectionsPerIp`, for
+/// exercising the pre-login per-IP guard under PROXY protocol.
+fn start_mcgate_proxy_protocol(dir: &std::path::Path, mcgate_port: u16, backend_addr: SocketAddr, max_connections_per_ip: u32) -> McGateProcess {
+    let config_path = dir.join("config.yml");
+    let messages_path = dir.join("messages.yml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "config:\n  bind: \"127.0.0.1:{mcgate_port}\"\n  proxyProtocol: true\n  maxConnectionsPerIp: {max_connections_per_ip}\n  logConnections: true\n  routes:\n    - host: \"test.example.com\"\n      backend: \"127.0.0.1:{}\"\n",
+            backend_addr.port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(&messages_path, "messages:\n  kickMessage: \"no backend\"\n").unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_mcgate"))
+        .arg(&config_path)
+        .arg(&messages_path)
+        .current_dir(dir)
+        .env("MCGATE_PLAIN_CONSOLE", "true")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start mcgate binary - did `cargo build` run first?");
+    McGateProcess { child }
+}
+
+fn write_proxy_v1_header(stream: &mut TcpStream, src_ip: &str, src_port: u16, dst_port: u16) {
+    let header = format!("PROXY TCP4 {src_ip} 127.0.0.1 {src_port} {dst_port}\r\n");
+    stream.write_all(header.as_bytes()).unwrap();
+}
+
 fn wait_for_port(addr: SocketAddr) {
     for _ in 0..50 {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
@@ -264,6 +297,73 @@ fn status_ping_and_login_relay_over_real_sockets() {
         let n = stream.read(&mut buf).unwrap_or(0);
         assert_eq!(n, 0, "expected the connection to be closed for an unmatched host");
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression test for a real bug: `maxConnectionsPerIp` was unconditionally disabled whenever
+/// `proxyProtocol: true`, even though the real client address (from the PROXY header) is already
+/// known by the point that guard runs - so under proxy_protocol (as in the reported production
+/// config) there was no cap at all on concurrent pre-login connections per real client, which is
+/// exactly what lets a reconnect storm during a backend outage grow memory without bound. This
+/// drives real PROXY v1 headers (all reporting the same real client IP) over real loopback
+/// sockets against the actual compiled binary, and asserts the cap is now enforced.
+#[test]
+fn per_ip_pre_login_cap_applies_under_proxy_protocol() {
+    let dir = std::env::temp_dir().join(format!("mcgate-e2e-proxyproto-captest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let backend_addr = spawn_fake_backend();
+    let mcgate_port = free_tcp_port();
+    let mcgate_addr: SocketAddr = format!("127.0.0.1:{mcgate_port}").parse().unwrap();
+    let _process = start_mcgate_proxy_protocol(&dir, mcgate_port, backend_addr, 2);
+    wait_for_port(mcgate_addr);
+
+    let real_client_ip = "203.0.113.42"; // same reported "real" client IP on every connection below
+
+    // Two connections at the cap: send only the PROXY header (no handshake yet) so each holds its
+    // pre-login slot open rather than completing and releasing it.
+    let mut held = Vec::new();
+    for i in 0..2u16 {
+        let mut stream = TcpStream::connect(mcgate_addr).unwrap();
+        write_proxy_v1_header(&mut stream, real_client_ip, 40000 + i, mcgate_port);
+        held.push(stream);
+    }
+    // Give mcgate a moment to actually read each header and acquire its guard before the next
+    // connection below tests the cap.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // A third connection from the same real client IP (different TCP peer port, same PROXY
+    // header address) must be rejected outright - the fixed bug would have let this through
+    // unconditionally.
+    let mut third = TcpStream::connect(mcgate_addr).unwrap();
+    write_proxy_v1_header(&mut third, real_client_ip, 40010, mcgate_port);
+    third.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 1];
+    // Distinguish an actual close (rejected - what we want) from a read timeout (the guard did
+    // NOT reject it, mcgate is just still waiting on a handshake that never arrives) - collapsing
+    // both to "0 bytes" via `unwrap_or(0)` would make this assertion pass either way and defeat
+    // the whole point of the test.
+    match third.read(&mut buf) {
+        Ok(0) => {} // closed immediately - rejected, as expected
+        Ok(n) => panic!("expected the connection to be closed, got {n} unexpected byte(s)"),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            panic!("connection is still open after 2s - maxConnectionsPerIp did not reject the 3rd connection from the same real client IP under proxyProtocol")
+        }
+        Err(e) => panic!("unexpected read error: {e}"),
+    }
+
+    // Freeing one held slot must admit a new connection from that same IP again.
+    drop(held.remove(0));
+    std::thread::sleep(Duration::from_millis(200));
+    let mut fourth = TcpStream::connect(mcgate_addr).unwrap();
+    write_proxy_v1_header(&mut fourth, real_client_ip, 40020, mcgate_port);
+    fourth.write_all(&encode_handshake(767, "test.example.com", mcgate_port, 1)).unwrap();
+    fourth.write_all(&encode_status_request()).unwrap();
+    fourth.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut first_byte = [0u8; 1];
+    fourth.read_exact(&mut first_byte).expect("a freed per-IP slot should admit a new connection from the same real client IP");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

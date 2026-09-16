@@ -48,6 +48,11 @@ struct Session {
     backend_replied: AtomicBool,
     backend_socket: Arc<UdpSocket>,
     dead: AtomicBool,
+    /// The `spawn_backend_reader` task for this session. It otherwise blocks forever in
+    /// `backend_socket.recv().await` — it only notices `dead` after a packet actually arrives —
+    /// so once a session is closed (idle timeout, no-reply teardown, or the player logging out)
+    /// the task and its `backend_socket`/buffer would leak indefinitely unless aborted here.
+    reader_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct Shared {
@@ -261,6 +266,7 @@ async fn handle_for_client(shared: &Arc<Shared>, client_addr: SocketAddr, via: S
         backend_replied: AtomicBool::new(false),
         backend_socket: backend_socket.clone(),
         dead: AtomicBool::new(false),
+        reader_handle: Mutex::new(None),
     });
     shared.sessions.lock().unwrap().insert(client_addr, session.clone());
     if shared.expect_proxy_protocol {
@@ -268,7 +274,8 @@ async fn handle_for_client(shared: &Arc<Shared>, client_addr: SocketAddr, via: S
     }
     drop(_guard);
 
-    spawn_backend_reader(shared.clone(), client_addr, route.backend, session.clone(), backend_socket);
+    let handle = spawn_backend_reader(shared.clone(), client_addr, route.backend, session.clone(), backend_socket);
+    *session.reader_handle.lock().unwrap() = Some(handle);
     forward(&session, &content).await;
 }
 
@@ -323,7 +330,7 @@ async fn forward(session: &Session, content: &[u8]) {
     let _ = session.backend_socket.send(content).await;
 }
 
-fn spawn_backend_reader(shared: Arc<Shared>, client_addr: SocketAddr, backend_addr: SocketAddr, session: Arc<Session>, backend_socket: Arc<UdpSocket>) {
+fn spawn_backend_reader(shared: Arc<Shared>, client_addr: SocketAddr, backend_addr: SocketAddr, session: Arc<Session>, backend_socket: Arc<UdpSocket>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
         let mut replied_once = false;
@@ -352,7 +359,7 @@ fn spawn_backend_reader(shared: Arc<Shared>, client_addr: SocketAddr, backend_ad
             let via = *session.via.lock().unwrap();
             let _ = shared.public.send_to(&buf[..n], via).await;
         }
-    });
+    })
 }
 
 fn close_session(shared: &Shared, session: &Session) {
@@ -361,6 +368,12 @@ fn close_session(shared: &Shared, session: &Session) {
     shared.by_via.lock().unwrap().retain(|_, s| !std::ptr::eq(s.as_ref(), session));
     session.dead.store(true, Ordering::Relaxed);
     release_ip_slot(shared, &session.client_ip);
+    // The reader task otherwise blocks forever in `backend_socket.recv().await` once the backend
+    // stops sending - it only notices `dead` after a packet arrives - so abort it explicitly
+    // rather than leaking the task, its buffer, and the backend socket fd.
+    if let Some(handle) = session.reader_handle.lock().unwrap().take() {
+        handle.abort();
+    }
 }
 
 fn evict_stale_sessions(shared: &Arc<Shared>) {
@@ -435,5 +448,45 @@ mod tests {
         client.send_to(b"should-be-dropped", relay_addr).await.unwrap();
         let result = tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await;
         assert!(result.is_err(), "expected no reply for an unregistered client");
+    }
+
+    /// Regression test for the leak this fix addresses: without a backend ever sending another
+    /// packet, `spawn_backend_reader`'s task used to sit parked in `recv().await` forever once its
+    /// session was closed, silently leaking the task, its buffer, and the backend socket fd on
+    /// every session that ends without further backend traffic (the common case). Asserts the
+    /// reader task actually terminates promptly on `close_session`, not just that routing behaves
+    /// correctly afterward.
+    #[tokio::test]
+    async fn closing_a_session_actually_terminates_its_backend_reader_task() {
+        // A backend that never sends anything back - the exact condition that used to hang the
+        // reader task forever.
+        let backend_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_socket.local_addr().unwrap();
+
+        let shared = Arc::new(Shared {
+            public: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            expect_proxy_protocol: false,
+            sessions: Mutex::new(HashMap::new()),
+            by_via: Mutex::new(HashMap::new()),
+            sessions_per_ip: Mutex::new(HashMap::new()),
+            create_lock: AsyncMutex::new(()),
+            last_drop_log_at: AtomicI64::new(0),
+        });
+
+        let client_ip = "127.0.0.2";
+        voice_routing().register(client_ip, "voice.example.com", backend_addr);
+        let client_addr: SocketAddr = format!("{client_ip}:40000").parse().unwrap();
+        handle_for_client(&shared, client_addr, client_addr, b"hi".to_vec()).await;
+
+        let session = shared.sessions.lock().unwrap().get(&client_addr).cloned().unwrap();
+        let abort_handle = session.reader_handle.lock().unwrap().as_ref().unwrap().abort_handle();
+        assert!(!abort_handle.is_finished(), "reader task should still be running while the session is live");
+
+        close_session(&shared, &session);
+        // abort() only requests cancellation; give the runtime a tick to actually drop the task.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(abort_handle.is_finished(), "reader task must terminate as soon as its session is closed, even with no further backend traffic");
+
+        voice_routing().unregister(client_ip);
     }
 }
