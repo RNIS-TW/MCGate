@@ -138,10 +138,16 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
     }
 
     // Front of the pipeline: bound the pre-login phase so a connection-flood/slow-loris can't
-    // tie up tasks/fds. Per-IP capping is skipped under proxy_protocol - every connection would
-    // otherwise look like it came from the upstream load balancer.
-    let per_ip_limit = if cfg.proxy_protocol { 0 } else { cfg.max_connections_per_ip.max(0) as u32 };
-    let ip_string = (!cfg.proxy_protocol).then(|| effective_addr.ip().to_string());
+    // tie up tasks/fds. Unlike the process-wide per-IP rate limit above (which genuinely can't
+    // trust the address yet - it runs *before* the PROXY header is read), `effective_addr` here
+    // is already the real client address under proxy_protocol too (resolved a few lines up), so
+    // this cap applies unconditionally - there's no reason to disable it once the real IP is
+    // known. Leaving it disabled here previously meant `maxConnectionsPerIp` was silently inert
+    // on any proxy_protocol deployment, removing the one guard that bounds concurrent pre-login
+    // connections per real client - exactly the gap a reconnect storm during a backend outage
+    // can turn into unbounded memory growth (and, on a memory-capped container, an OOM kill).
+    let per_ip_limit = cfg.max_connections_per_ip.max(0) as u32;
+    let ip_string = Some(effective_addr.ip().to_string());
     let Some(mut guard) = crate::net::connection_guard::PreLoginGuard::acquire(ip_string.as_deref(), per_ip_limit) else {
         tracing::debug!("Dropping connection from {effective_addr} - over per-IP pre-login limit ({per_ip_limit})");
         if let Some(ip) = &ip_string {
