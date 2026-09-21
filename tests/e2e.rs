@@ -367,3 +367,101 @@ fn per_ip_pre_login_cap_applies_under_proxy_protocol() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A fake version-multiplexing backend (like Velocity/ViaVersion): its status response echoes the
+/// pinging client's protocol version and the virtual host it asked for.
+fn spawn_echoing_status_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let _length = read_var_int(&mut stream);
+                let _packet_id = read_var_int(&mut stream);
+                let protocol = read_var_int(&mut stream);
+                let host_len = read_var_int(&mut stream) as usize;
+                let mut host_buf = vec![0u8; host_len];
+                stream.read_exact(&mut host_buf).unwrap();
+                let host = String::from_utf8(host_buf).unwrap();
+                let mut port_buf = [0u8; 2];
+                stream.read_exact(&mut port_buf).unwrap();
+                let _next_state = read_var_int(&mut stream);
+                let _req_len = read_var_int(&mut stream);
+                let _req_id = read_var_int(&mut stream);
+                let json = format!(r#"{{"version":{{"name":"proto-{protocol}","protocol":{protocol}}},"description":{{"text":"motd-for-{host}"}}}}"#);
+                let mut payload = Vec::new();
+                write_var_int(&mut payload, 0x00);
+                write_string(&mut payload, &json);
+                let mut frame = Vec::new();
+                write_var_int(&mut frame, payload.len() as i32);
+                frame.extend_from_slice(&payload);
+                let _ = stream.write_all(&frame);
+            });
+        }
+    });
+    addr
+}
+
+fn status_ping(mcgate_addr: SocketAddr, protocol: i32, host: &str) -> String {
+    let mut stream = TcpStream::connect(mcgate_addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(&encode_handshake(protocol, host, mcgate_addr.port(), 1)).unwrap();
+    stream.write_all(&encode_status_request()).unwrap();
+    let _length = read_var_int(&mut stream);
+    let _packet_id = read_var_int(&mut stream);
+    let json_len = read_var_int(&mut stream) as usize;
+    let mut json_buf = vec![0u8; json_len];
+    stream.read_exact(&mut json_buf).unwrap();
+    String::from_utf8(json_buf).unwrap()
+}
+
+/// Regression test for a real bug: status responses were cached per backend address only, so
+/// within the cache TTL every client got whichever client pinged first's response - a
+/// version-multiplexing backend's echoed protocol showed up as an "incompatible" red version
+/// for clients on any other version, and hostnames sharing a backend shared one MOTD.
+#[test]
+fn status_cache_is_per_protocol_version_and_host() {
+    let dir = std::env::temp_dir().join(format!("mcgate-e2e-statuscache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let backend_addr = spawn_echoing_status_backend();
+    let mcgate_port = free_tcp_port();
+    let mcgate_addr: SocketAddr = format!("127.0.0.1:{mcgate_port}").parse().unwrap();
+    std::fs::write(
+        dir.join("config.yml"),
+        format!(
+            "config:\n  bind: \"127.0.0.1:{mcgate_port}\"\n  routes:\n    - host:\n        - \"a.example.com\"\n        - \"b.example.com\"\n      backend: \"127.0.0.1:{}\"\n      cachePingTTL: 60s\n",
+            backend_addr.port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("messages.yml"), "messages:\n  kickMessage: \"no backend\"\n").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_mcgate"))
+        .arg(dir.join("config.yml"))
+        .arg(dir.join("messages.yml"))
+        .current_dir(&dir)
+        .env("MCGATE_PLAIN_CONSOLE", "true")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _process = McGateProcess { child };
+    wait_for_port(mcgate_addr);
+
+    // Different client versions, same host, well within the cache TTL.
+    let v767 = status_ping(mcgate_addr, 767, "a.example.com");
+    assert!(v767.contains(r#""protocol":767"#), "{v767}");
+    let v47 = status_ping(mcgate_addr, 47, "a.example.com");
+    assert!(v47.contains(r#""protocol":47"#), "1.8 client got another version's cached status: {v47}");
+    let v767_again = status_ping(mcgate_addr, 767, "a.example.com");
+    assert!(v767_again.contains(r#""protocol":767"#), "{v767_again}");
+
+    // Different host sharing the same backend must get its own MOTD, not a's cached one.
+    let b = status_ping(mcgate_addr, 767, "b.example.com");
+    assert!(b.contains("motd-for-b.example.com"), "b.example.com got another host's cached MOTD: {b}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

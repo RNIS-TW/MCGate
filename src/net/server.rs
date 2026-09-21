@@ -240,10 +240,16 @@ async fn handle_status(
     };
 
     for addr in &backends {
-        // Cache key is host:port only, NOT host:port:protocolVersion - keying per protocol
-        // version would let a status flood trivially bypass the cache.
+        // Responses are cached per backend + virtual host + protocol version: version-multiplexing
+        // backends (Velocity, ViaVersion) echo the pinging client's protocol back, and forced-host
+        // setups answer per hostname, so a per-backend-only key served whichever client happened
+        // to ping first to everyone else - other versions then saw an "incompatible" red version
+        // string, and other hostnames the wrong MOTD. A status flood cycling hosts/protocols to
+        // miss the cache is still bounded by the per-backend dial cap below, and past that cap
+        // gets the backend's last-known response (`down_key` entry) rather than a fresh dial.
         let down_key = format!("{}:{}", addr.ip(), addr.port());
-        if let Some(cached) = ping_cache().get(&down_key) {
+        let response_key = status_cache_key(&down_key, &handshake.host, handshake.protocol_version);
+        if let Some(cached) = ping_cache().get(&response_key) {
             let _ = tokio::io::AsyncWriteExt::write_all(stream, &encode_status_response(&cached)).await;
             handle_ping(stream, client_addr).await;
             return;
@@ -252,6 +258,11 @@ async fn handle_status(
             continue;
         }
         if !runtime.try_begin_status_dial(*addr, crate::state::MAX_CONCURRENT_STATUS_DIALS) {
+            if let Some(last_known) = ping_cache().get(&down_key) {
+                let _ = tokio::io::AsyncWriteExt::write_all(stream, &encode_status_response(&last_known)).await;
+                handle_ping(stream, client_addr).await;
+                return;
+            }
             tracing::debug!("Too many in-flight status dials to {addr}, failing over");
             continue;
         }
@@ -261,6 +272,7 @@ async fn handle_status(
         match result {
             Some(json) => {
                 runtime.record_latency(*addr, start.elapsed().as_millis() as i64);
+                ping_cache().put(&response_key, json.clone(), route.cache_ping_ttl_millis);
                 ping_cache().put(&down_key, json.clone(), route.cache_ping_ttl_millis);
                 let _ = tokio::io::AsyncWriteExt::write_all(stream, &encode_status_response(&json)).await;
                 handle_ping(stream, client_addr).await;
@@ -279,6 +291,14 @@ async fn handle_status(
         let _ = tokio::io::AsyncWriteExt::write_all(stream, &encode_status_response(&json)).await;
         handle_ping(stream, client_addr).await;
     }
+}
+
+/// Ping-cache key for one backend's status response as seen by a given virtual host and client
+/// protocol version. The protocol is always the last `|`-separated field, so keys stay unambiguous
+/// even for a (client-supplied) host containing `|`, and never collide with the bare `ip:port`
+/// last-known/down key.
+fn status_cache_key(backend_key: &str, host: &str, protocol_version: i32) -> String {
+    format!("{backend_key}|{}|{protocol_version}", host.to_ascii_lowercase())
 }
 
 /// Dials `addr` just long enough to fetch and validate its Status Response JSON. `None` on any
@@ -776,6 +796,15 @@ async fn register_voicechat_route(route: &Route, captures: &[String], client_add
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn status_cache_key_separates_protocol_and_host() {
+        let a = status_cache_key("10.0.0.1:25565", "Play.Example.com", 767);
+        assert_eq!(a, status_cache_key("10.0.0.1:25565", "play.example.com", 767));
+        assert_ne!(a, status_cache_key("10.0.0.1:25565", "play.example.com", 47));
+        assert_ne!(a, status_cache_key("10.0.0.1:25565", "other.example.com", 767));
+        assert_ne!(a, "10.0.0.1:25565");
+    }
 
     #[test]
     fn is_valid_status_json_requires_numeric_protocol() {
