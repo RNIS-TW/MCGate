@@ -19,6 +19,11 @@ TARGETS=(
   "Linux x86_64 (glibc)|x86_64-unknown-linux-gnu"
   "Linux ARM64 (glibc)|aarch64-unknown-linux-gnu"
   "Windows x86_64 (gnu)|x86_64-pc-windows-gnu"
+  "Linux x86_64 (static musl, any distro)|x86_64-unknown-linux-musl"
+  "Linux ARM64 (static musl, any distro)|aarch64-unknown-linux-musl"
+  "Linux x86 32-bit (static musl)|i686-unknown-linux-musl"
+  "Linux ARMv7 32-bit (static musl, e.g. Pi)|armv7-unknown-linux-musleabihf"
+  "Windows x86 32-bit (gnu)|i686-pc-windows-gnu"
 )
 
 host_os=$(uname -s)

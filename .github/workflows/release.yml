@@ -1,7 +1,7 @@
 name: Release (MCGate)
 
-# Manual only - pick a tag/version, this builds every platform in build.sh's TARGETS list and
-# publishes them all as assets on a GitHub Release.
+# Manual only - pick a tag/version, this builds every platform in build.sh's TARGETS list, plus one
+# all-in-one mcgate-<tag>.jar bundling all of them, and publishes them as assets on a GitHub Release.
 on:
   workflow_dispatch:
     inputs:
@@ -41,6 +41,23 @@ jobs:
             cross: true
           - os: ubuntu-latest
             target: x86_64-pc-windows-gnu
+            cross: true
+          # Static musl Linux builds and the 32-bit targets - these are what the all-in-one jar
+          # bundles for Linux (any distro) and for older/32-bit machines.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: i686-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            cross: true
+          - os: ubuntu-latest
+            target: i686-pc-windows-gnu
             cross: true
     steps:
       - uses: actions/checkout@v4
@@ -96,9 +113,61 @@ jobs:
           path: ${{ steps.package.outputs.asset }}
           if-no-files-found: error
 
+      # The bare binary too, laid out as <target>/mcgate[.exe], for the jar job below.
+      - name: Stage binary for the jar
+        shell: bash
+        run: |
+          mkdir -p "jarbin/${{ matrix.target }}"
+          cp target/${{ matrix.target }}/release/mcgate* "jarbin/${{ matrix.target }}/"
+          rm -f "jarbin/${{ matrix.target }}/mcgate.d"
+
+      - name: Upload binary for the jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarbin-${{ matrix.target }}
+          path: jarbin/
+          if-no-files-found: error
+
+  jar:
+    name: Build all-in-one jar
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download every platform's binary
+        uses: actions/download-artifact@v4
+        with:
+          pattern: jarbin-*
+          path: jarbin
+          merge-multiple: true
+
+      # build-jar.sh bundles whatever sits under target/<triple>/release/.
+      - name: Build jar
+        run: |
+          for dir in jarbin/*/; do
+            triple=$(basename "$dir")
+            mkdir -p "target/$triple/release"
+            cp "$dir"* "target/$triple/release/"
+          done
+          ./build-jar.sh
+          mv target/mcgate.jar "mcgate-${{ inputs.tag }}.jar"
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcgate-${{ inputs.tag }}.jar
+          path: mcgate-${{ inputs.tag }}.jar
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, jar]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -106,6 +175,7 @@ jobs:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: mcgate-*
           path: dist
           merge-multiple: true
 
