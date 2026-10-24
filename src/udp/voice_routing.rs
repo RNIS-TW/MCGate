@@ -28,6 +28,9 @@ pub struct Entry {
     pub host: String,
     pub backend: SocketAddr,
     last_seen: Instant,
+    /// Live Minecraft connections from this IP currently holding the entry - several players
+    /// behind one NAT/CGNAT address share it, and it must outlive all but the last of them.
+    refs: u32,
 }
 
 #[derive(Default)]
@@ -51,7 +54,9 @@ impl VoiceRouting {
     }
 
     pub fn register(&self, client_ip: &str, host: &str, backend: SocketAddr) {
-        self.entries.lock().unwrap().insert(client_ip.to_string(), Entry { host: host.to_string(), backend, last_seen: Instant::now() });
+        let mut entries = self.entries.lock().unwrap();
+        let refs = entries.get(client_ip).map_or(0, |e| e.refs) + 1;
+        entries.insert(client_ip.to_string(), Entry { host: host.to_string(), backend, last_seen: Instant::now(), refs });
     }
 
     pub fn resolve(&self, client_ip: &str) -> Option<Entry> {
@@ -61,11 +66,21 @@ impl VoiceRouting {
         Some(entry.clone())
     }
 
-    /// Drops `client_ip`'s routing entry and immediately closes any live UDP relay session for
-    /// it — called when a player's Minecraft connection actually ends, so voice chat "logs out"
-    /// together with the game connection instead of lingering for up to the relay's idle timeout.
+    /// Releases one connection's hold on `client_ip`'s routing entry; once the last one from
+    /// that IP is gone, drops the entry and immediately closes any live UDP relay session for it
+    /// — so voice chat "logs out" together with the game connection instead of lingering for up
+    /// to the relay's idle timeout, without cutting off other players still on the same IP.
     pub fn unregister(&self, client_ip: &str) {
-        self.entries.lock().unwrap().remove(client_ip);
+        {
+            let mut entries = self.entries.lock().unwrap();
+            if let Some(entry) = entries.get_mut(client_ip) {
+                if entry.refs > 1 {
+                    entry.refs -= 1;
+                    return;
+                }
+            }
+            entries.remove(client_ip);
+        }
         if let Some(hook) = self.disconnect_hook.lock().unwrap().as_ref() {
             hook(client_ip);
         }
@@ -126,5 +141,26 @@ mod tests {
         routing.unregister("1.2.3.4");
         assert!(routing.resolve("1.2.3.4").is_none());
         assert!(called.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn shared_ip_entry_survives_until_last_connection_leaves() {
+        let routing = VoiceRouting::default();
+        let backend: SocketAddr = "127.0.0.1:24454".parse().unwrap();
+        routing.register("1.2.3.4", "voice.example.com", backend);
+        routing.register("1.2.3.4", "voice.example.com", backend);
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        routing.attach_relay(Some(Box::new(move |_: &str| {
+            calls_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })));
+
+        routing.unregister("1.2.3.4");
+        assert!(routing.resolve("1.2.3.4").is_some(), "second player on the same IP lost its voice route");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0, "relay session torn down while still in use");
+        routing.unregister("1.2.3.4");
+        assert!(routing.resolve("1.2.3.4").is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

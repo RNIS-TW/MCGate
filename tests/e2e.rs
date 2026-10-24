@@ -371,6 +371,12 @@ fn per_ip_pre_login_cap_applies_under_proxy_protocol() {
 /// A fake version-multiplexing backend (like Velocity/ViaVersion): its status response echoes the
 /// pinging client's protocol version and the virtual host it asked for.
 fn spawn_echoing_status_backend() -> SocketAddr {
+    spawn_slow_echoing_status_backend(Duration::ZERO)
+}
+
+/// `spawn_echoing_status_backend`, but each response is held back by `delay` so concurrent pings
+/// pile up in flight.
+fn spawn_slow_echoing_status_backend(delay: Duration) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -389,6 +395,7 @@ fn spawn_echoing_status_backend() -> SocketAddr {
                 let _next_state = read_var_int(&mut stream);
                 let _req_len = read_var_int(&mut stream);
                 let _req_id = read_var_int(&mut stream);
+                std::thread::sleep(delay);
                 let json = format!(r#"{{"version":{{"name":"proto-{protocol}","protocol":{protocol}}},"description":{{"text":"motd-for-{host}"}}}}"#);
                 let mut payload = Vec::new();
                 write_var_int(&mut payload, 0x00);
@@ -462,6 +469,131 @@ fn status_cache_is_per_protocol_version_and_host() {
     // Different host sharing the same backend must get its own MOTD, not a's cached one.
     let b = status_ping(mcgate_addr, 767, "b.example.com");
     assert!(b.contains("motd-for-b.example.com"), "b.example.com got another host's cached MOTD: {b}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression test for a real bug: past the per-backend concurrent status-dial cap (8), extra
+/// pings were answered with the backend's last-known response regardless of which client version
+/// it was for - under load a 26.2 client saw a Velocity echo meant for a 1.21.11 client (774) and
+/// a red "incompatible version" in its server list.
+#[test]
+fn status_over_dial_cap_never_serves_another_versions_response() {
+    let dir = std::env::temp_dir().join(format!("mcgate-e2e-statuscap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let backend_addr = spawn_slow_echoing_status_backend(Duration::from_millis(400));
+    let mcgate_port = free_tcp_port();
+    let mcgate_addr: SocketAddr = format!("127.0.0.1:{mcgate_port}").parse().unwrap();
+    // Long TTL so the 774 seed stays as the backend's last-known response; 776 pings still miss
+    // their own per-version cache entry and need a dial.
+    std::fs::write(
+        dir.join("config.yml"),
+        format!(
+            "config:\n  bind: \"127.0.0.1:{mcgate_port}\"\n  maxConnectionsPerIp: 0\n  connectionThrottle:\n    maxPerIpPerWindow: 0\n  routes:\n    - host: \"a.example.com\"\n      backend: \"127.0.0.1:{}\"\n      cachePingTTL: 60s\n",
+            backend_addr.port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("messages.yml"), "messages:\n  kickMessage: \"no backend\"\n").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_mcgate"))
+        .arg(dir.join("config.yml"))
+        .arg(dir.join("messages.yml"))
+        .current_dir(&dir)
+        .env("MCGATE_PLAIN_CONSOLE", "true")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _process = McGateProcess { child };
+    wait_for_port(mcgate_addr);
+
+    // Seed a last-known response for protocol 774.
+    let seed = status_ping(mcgate_addr, 774, "a.example.com");
+    assert!(seed.contains(r#""protocol":774"#), "{seed}");
+
+    // 24 concurrent pings, 12 of them 776 cache misses - past the 8-dial cap.
+    let handles: Vec<_> = (0..24)
+        .map(|i| {
+            let protocol = if i % 2 == 0 { 776 } else { 774 };
+            std::thread::spawn(move || (protocol, status_ping(mcgate_addr, protocol, "a.example.com")))
+        })
+        .collect();
+    for h in handles {
+        let (protocol, json) = h.join().unwrap();
+        assert!(json.contains(&format!(r#""protocol":{protocol}"#)), "protocol {protocol} client got: {json}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Regression test for a real bug: `loginTimeout` only covered reading the handshake, so a
+/// socket that went silent before the PROXY header, or after the handshake but before its status
+/// request / Login Start, was held open forever - each one pinning a global connection slot
+/// (`connectionThrottle.maxConnections`) until the server stopped accepting anyone.
+#[test]
+fn silent_connections_are_closed_at_the_login_deadline() {
+    let dir = std::env::temp_dir().join(format!("mcgate-e2e-deadline-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let backend_addr = spawn_echoing_status_backend();
+    let mcgate_port = free_tcp_port();
+    let mcgate_addr: SocketAddr = format!("127.0.0.1:{mcgate_port}").parse().unwrap();
+    std::fs::write(
+        dir.join("config.yml"),
+        format!(
+            "config:\n  bind: \"127.0.0.1:{mcgate_port}\"\n  proxyProtocol: true\n  loginTimeout: 1s\n  autoBan:\n    enabled: false\n  routes:\n    - host: \"a.example.com\"\n      backend: \"127.0.0.1:{}\"\n",
+            backend_addr.port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("messages.yml"), "messages:\n  kickMessage: \"no backend\"\n").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_mcgate"))
+        .arg(dir.join("config.yml"))
+        .arg(dir.join("messages.yml"))
+        .current_dir(&dir)
+        .env("MCGATE_PLAIN_CONSOLE", "true")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _process = McGateProcess { child };
+    wait_for_port(mcgate_addr);
+
+    let proxy_header = b"PROXY TCP4 203.0.113.7 127.0.0.1 40000 25565\r\n".to_vec();
+    let mut status_stall = proxy_header.clone();
+    status_stall.extend_from_slice(&encode_handshake(776, "a.example.com", mcgate_port, 1));
+    let mut login_stall = proxy_header.clone();
+    login_stall.extend_from_slice(&encode_handshake(776, "a.example.com", mcgate_port, 2));
+
+    for (what, prefix) in [("before PROXY header", Vec::new()), ("before status request", status_stall), ("before Login Start", login_stall)] {
+        let mut stream = TcpStream::connect(mcgate_addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+        stream.write_all(&prefix).unwrap();
+        let mut buf = [0u8; 1];
+        match stream.read(&mut buf) {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            other => panic!("connection silent {what} was not closed at the 1s login deadline: {other:?}"),
+        }
+    }
+
+    // A real status ping right after must still work normally.
+    let mut stream = TcpStream::connect(mcgate_addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(&proxy_header).unwrap();
+    stream.write_all(&encode_handshake(776, "a.example.com", mcgate_port, 1)).unwrap();
+    stream.write_all(&encode_status_request()).unwrap();
+    let _length = read_var_int(&mut stream);
+    let _packet_id = read_var_int(&mut stream);
+    let json_len = read_var_int(&mut stream) as usize;
+    let mut json_buf = vec![0u8; json_len];
+    stream.read_exact(&mut json_buf).unwrap();
+    assert!(String::from_utf8(json_buf).unwrap().contains(r#""protocol":776"#));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

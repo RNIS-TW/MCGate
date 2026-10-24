@@ -113,9 +113,21 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
 
     let _ = stream.set_nodelay(true);
 
+    // One deadline for the whole pre-login phase - PROXY header, handshake, and the status
+    // request or Login Start after it. Each of those reads previously either had no timeout at
+    // all or its own, so a socket that connected and went silent at the right point held its
+    // global (and per-IP) slot forever.
+    let login_timeout = cfg.login_timeout_millis.max(0) as u64;
+    let deadline = (login_timeout > 0).then(|| tokio::time::Instant::now() + Duration::from_millis(login_timeout));
+
     let mut effective_addr = peer_addr;
     if cfg.proxy_protocol {
-        match crate::protocol::proxy_protocol_tcp::read_proxy_protocol_header(&mut stream).await {
+        let Some(header) = within(deadline, crate::protocol::proxy_protocol_tcp::read_proxy_protocol_header(&mut stream)).await else {
+            // Not a violation: `peer_addr` is the fronting proxy here, not the silent client.
+            tracing::debug!("Closing {peer_addr} - no PROXY protocol header within {login_timeout} ms");
+            return;
+        };
+        match header {
             Ok(Some(addr)) => effective_addr = addr,
             Ok(None) => {} // v2 LOCAL / degenerate header - fall back to the real TCP peer
             Err(e) => {
@@ -157,21 +169,13 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
     };
 
     let mut stream = BufferedStream::new(stream);
-    let login_timeout = cfg.login_timeout_millis.max(0) as u64;
 
-    let handshake_result = if login_timeout > 0 {
-        match tokio::time::timeout(Duration::from_millis(login_timeout), stream.read_handshake()).await {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::debug!("Closing {effective_addr} - did not complete login within {login_timeout} ms");
-                if let Some(ip) = &ip_string {
-                    record_ip_violation(&cfg, ip);
-                }
-                return;
-            }
+    let Some(handshake_result) = within(deadline, stream.read_handshake()).await else {
+        tracing::debug!("Closing {effective_addr} - did not complete login within {login_timeout} ms");
+        if let Some(ip) = &ip_string {
+            record_ip_violation(&cfg, ip);
         }
-    } else {
-        stream.read_handshake().await
+        return;
     };
     let handshake = match handshake_result {
         Ok(h) => h,
@@ -198,9 +202,17 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, state: 
     let runtime = state.route_runtime(route_index).unwrap_or_default();
 
     if handshake.next_state == 1 {
-        handle_status(&mut stream, &route, &runtime, &captures, &handshake, effective_addr).await;
+        handle_status(&mut stream, &route, &runtime, &captures, &handshake, effective_addr, deadline).await;
     } else {
-        handle_login(&mut stream, &route, &runtime, &captures, &handshake, effective_addr, &mut guard, &state).await;
+        handle_login(&mut stream, &route, &runtime, &captures, &handshake, effective_addr, &mut guard, &state, deadline).await;
+    }
+}
+
+/// Runs `fut` to completion, or `None` once `deadline` passes. No deadline = no timeout.
+async fn within<F: std::future::Future>(deadline: Option<tokio::time::Instant>, fut: F) -> Option<F::Output> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, fut).await.ok(),
+        None => Some(fut.await),
     }
 }
 
@@ -216,9 +228,14 @@ async fn handle_status(
     captures: &[String],
     handshake: &crate::protocol::handshake::Handshake,
     client_addr: SocketAddr,
+    deadline: Option<tokio::time::Instant>,
 ) {
     // Status Request (packet id 0x00, no fields).
-    let request = match stream.read_frame(MAX_PACKET_BYTES).await {
+    let Some(request) = within(deadline, stream.read_frame(MAX_PACKET_BYTES)).await else {
+        tracing::debug!("Closing {client_addr} - no status request before the login deadline");
+        return;
+    };
+    let request = match request {
         Ok(f) => f,
         Err(e) => {
             tracing::debug!("Rejecting status connection from {client_addr}: {e}");
@@ -258,13 +275,28 @@ async fn handle_status(
             continue;
         }
         if !runtime.try_begin_status_dial(*addr, crate::state::MAX_CONCURRENT_STATUS_DIALS) {
-            if let Some(last_known) = ping_cache().get(&down_key) {
+            // The last-known response is only safe to reuse if it was answered for this same
+            // protocol: version-multiplexing backends echo the pinger's protocol, so another
+            // version's response shows this client a red "incompatible version" in its list.
+            if let Some(last_known) = ping_cache().get(&down_key).filter(|j| status_protocol(j) == Some(handshake.protocol_version as i64)) {
                 let _ = tokio::io::AsyncWriteExt::write_all(stream, &encode_status_response(&last_known)).await;
                 handle_ping(stream, client_addr).await;
                 return;
             }
-            tracing::debug!("Too many in-flight status dials to {addr}, failing over");
-            continue;
+            // Otherwise wait briefly for an in-flight dial to free a slot (or to fill this exact
+            // key's cache entry) instead of answering with the wrong version.
+            match wait_for_status_slot(runtime, *addr, &response_key).await {
+                StatusSlot::Cached(cached) => {
+                    let _ = tokio::io::AsyncWriteExt::write_all(stream, &encode_status_response(&cached)).await;
+                    handle_ping(stream, client_addr).await;
+                    return;
+                }
+                StatusSlot::Acquired => {}
+                StatusSlot::TimedOut => {
+                    tracing::debug!("Too many in-flight status dials to {addr}, failing over");
+                    continue;
+                }
+            }
         }
         let start = std::time::Instant::now();
         let result = fetch_backend_status(route, *addr, handshake, client_addr).await;
@@ -291,6 +323,36 @@ async fn handle_status(
         let _ = tokio::io::AsyncWriteExt::write_all(stream, &encode_status_response(&json)).await;
         handle_ping(stream, client_addr).await;
     }
+}
+
+enum StatusSlot {
+    Cached(String),
+    Acquired,
+    TimedOut,
+}
+
+/// How long a status ping waits for a dial slot when its backend is at the concurrent-dial cap.
+const STATUS_SLOT_WAIT: Duration = Duration::from_secs(3);
+
+/// Polls until either `response_key` gets cached by another in-flight dial or a dial slot to
+/// `addr` frees up (in which case the slot is now held and must be released by the caller).
+async fn wait_for_status_slot(runtime: &RouteRuntime, addr: SocketAddr, response_key: &str) -> StatusSlot {
+    let deadline = tokio::time::Instant::now() + STATUS_SLOT_WAIT;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(cached) = ping_cache().get(response_key) {
+            return StatusSlot::Cached(cached);
+        }
+        if runtime.try_begin_status_dial(addr, crate::state::MAX_CONCURRENT_STATUS_DIALS) {
+            return StatusSlot::Acquired;
+        }
+    }
+    StatusSlot::TimedOut
+}
+
+/// `version.protocol` of a status response JSON, if present and numeric.
+fn status_protocol(json: &str) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(json).ok()?.get("version")?.get("protocol")?.as_i64()
 }
 
 /// Ping-cache key for one backend's status response as seen by a given virtual host and client
@@ -389,6 +451,7 @@ async fn handle_login(
     client_addr: SocketAddr,
     guard: &mut crate::net::connection_guard::PreLoginGuard,
     state: &Arc<AppState>,
+    deadline: Option<tokio::time::Instant>,
 ) {
     // Refuse outright if this route's cumulative usage has already reached its configured limit
     // - just an atomic read, no I/O. Players already on the route are kicked by
@@ -403,9 +466,14 @@ async fn handle_login(
 
     // Wait for Login Start before dialing a backend - a connection-flood/slow-loris that
     // completes the handshake but never logs in would otherwise make MCGate open (and hold) a
-    // backend socket per bot. ConnectionGuardHandler's deadline (already wrapping this whole
-    // function via the caller's timeout) closes the connection if it never comes.
-    let login_start_frame = match stream.read_frame(MAX_PACKET_BYTES).await {
+    // backend socket per bot. The caller's pre-login deadline closes the connection if it never
+    // comes.
+    let Some(login_start_frame) = within(deadline, stream.read_frame(MAX_PACKET_BYTES)).await else {
+        tracing::debug!("Closing {client_addr} - no Login Start within the login deadline");
+        record_ip_violation(&state.config(), &client_addr.ip().to_string());
+        return;
+    };
+    let login_start_frame = match login_start_frame {
         Ok(f) => f,
         Err(e) => {
             tracing::debug!("Rejecting login connection from {client_addr}: {e}");
@@ -448,7 +516,7 @@ async fn handle_login(
                 };
                 tracing::info!("Connected: '{}'{player_tag} from {client_addr} -> {addr}", handshake.host);
 
-                register_voicechat_route(route, captures, client_addr, &handshake.host, state.config().log_connections).await;
+                let voice_registered = register_voicechat_route(route, captures, client_addr, &handshake.host, state.config().log_connections).await;
 
                 // Observe the backend's real Login-state response just long enough to learn its
                 // actual compression threshold and whether it's encrypted - needed for `kick
@@ -520,7 +588,9 @@ async fn handle_login(
                         disconnected_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0),
                     });
                 }
-                crate::udp::voice_routing::voice_routing().unregister(&client_addr.ip().to_string());
+                if voice_registered {
+                    crate::udp::voice_routing::voice_routing().unregister(&client_addr.ip().to_string());
+                }
                 tracing::info!("Disconnected: '{}'{player_tag} from {client_addr} -> {addr}", handshake.host);
                 return;
             }
@@ -776,9 +846,10 @@ fn can_inject_packet(session: &PlayerSession) -> bool {
 /// voice traffic once it starts arriving. UDP carries no hostname to route by, so this is the
 /// only point where that association can be made — resolution failures here must only skip voice
 /// routing for this connection, never break the player's actual TCP login.
-async fn register_voicechat_route(route: &Route, captures: &[String], client_addr: SocketAddr, host: &str, log_connections: bool) {
+/// Returns whether an entry was registered, i.e. whether the caller must `unregister` it later.
+async fn register_voicechat_route(route: &Route, captures: &[String], client_addr: SocketAddr, host: &str, log_connections: bool) -> bool {
     if route.voicechat_templates.is_empty() {
-        return;
+        return false;
     }
     match route.resolve_voicechat(captures).await {
         Ok(Some(voice_backend)) => {
@@ -786,9 +857,13 @@ async fn register_voicechat_route(route: &Route, captures: &[String], client_add
             if log_connections {
                 tracing::info!("Voicechat route: host='{host}' from {client_addr} -> {voice_backend}");
             }
+            true
         }
-        Ok(None) => {}
-        Err(e) => tracing::warn!("Failed to resolve voicechat backend for host '{host}': {e}"),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!("Failed to resolve voicechat backend for host '{host}': {e}");
+            false
+        }
     }
 }
 
