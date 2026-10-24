@@ -1,0 +1,52 @@
+{
+    "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - PTERODACTYL.IO",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-10-19T00:00:00+00:00",
+    "name": "MCGate",
+    "author": "support@hippodev.app",
+    "description": "A thin, host-based reverse proxy for Minecraft servers, written in Rust. Routes players to backends by the hostname they connect with, with load balancing, fallback MOTDs, a voicechat UDP relay, and built-in anti-abuse. https://github.com/RNIS-TW/MCGate",
+    "features": null,
+    "docker_images": {
+        "Debian": "ghcr.io/parkervcp/yolks:debian"
+    },
+    "file_denylist": [],
+    "startup": "./mcgate config.yml messages.yml",
+    "config": {
+        "files": "{\n    \"config.yml\": {\n        \"parser\": \"file\",\n        \"find\": {\n            \"  bind:\": \"  bind: 0.0.0.0:{{server.build.default.port}}\"\n        }\n    }\n}",
+        "startup": "{\r\n    \"done\": \"Listening on \"\r\n}",
+        "logs": "{}",
+        "stop": "stop"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/bash\r\n# MCGate installation script\r\n# Downloads the release binary matching this node's CPU architecture from GitHub Releases.\r\nset -e\r\n\r\napt-get update -qq && apt-get install -y -qq curl jq ca-certificates tar >/dev/null\r\n\r\nREPO=\"RNIS-TW/MCGate\"\r\nmkdir -p /mnt/server\r\ncd /mnt/server\r\n\r\ncase \"$(uname -m)\" in\r\n    x86_64|amd64) ARCH=x86_64 ;;\r\n    aarch64|arm64) ARCH=aarch64 ;;\r\n    *) echo \"Unsupported architecture: $(uname -m)\"; exit 1 ;;\r\nesac\r\n\r\nif [ -z \"${VERSION}\" ] || [ \"${VERSION}\" = \"latest\" ]; then\r\n    RELEASE_URL=\"https://api.github.com/repos/${REPO}/releases/latest\"\r\nelse\r\n    RELEASE_URL=\"https://api.github.com/repos/${REPO}/releases/tags/${VERSION}\"\r\nfi\r\n\r\nRELEASE=$(curl -fsSL \"${RELEASE_URL}\") || { echo \"Could not find release '${VERSION}' in ${REPO}\"; exit 1; }\r\nTAG=$(echo \"${RELEASE}\" | jq -r '.tag_name')\r\n\r\n# Prefer the static musl build (runs on any distro), fall back to glibc.\r\nDOWNLOAD_URL=\"\"\r\nfor TRIPLE in \"${ARCH}-unknown-linux-musl\" \"${ARCH}-unknown-linux-gnu\"; do\r\n    DOWNLOAD_URL=$(echo \"${RELEASE}\" | jq -r --arg t \"${TRIPLE}\" '.assets[] | select(.name | endswith(\"-\" + $t + \".tar.gz\")) | .browser_download_url' | head -n1)\r\n    [ -n \"${DOWNLOAD_URL}\" ] && break\r\ndone\r\n\r\nif [ -z \"${DOWNLOAD_URL}\" ]; then\r\n    echo \"Release ${TAG} has no Linux ${ARCH} build\"\r\n    exit 1\r\nfi\r\n\r\necho \"Installing MCGate ${TAG} (${DOWNLOAD_URL##*/})\"\r\nTMP=$(mktemp -d)\r\ncurl -fsSL -o \"${TMP}/mcgate.tar.gz\" \"${DOWNLOAD_URL}\"\r\ntar xzf \"${TMP}/mcgate.tar.gz\" -C \"${TMP}\"\r\ninstall -m 755 \"$(find \"${TMP}\" -type f -name mcgate | head -n1)\" /mnt/server/mcgate\r\nrm -rf \"${TMP}\"\r\n\r\n# Seed config.yml from the release's bundled default so the startup command can set the bind\r\n# port on first boot. Existing configs are left alone on reinstall.\r\nif [ ! -f /mnt/server/config.yml ]; then\r\n    curl -fsSL -o /mnt/server/config.yml \"https://raw.githubusercontent.com/${REPO}/${TAG}/resources/default-config.yml\" \\\r\n        || echo \"Could not fetch default config.yml; MCGate will create one on first start\"\r\nfi\r\n\r\necho \"MCGate ${TAG} installed\"\r\n",
+            "container": "ghcr.io/parkervcp/installers:debian",
+            "entrypoint": "bash"
+        }
+    },
+    "variables": [
+        {
+            "name": "Version",
+            "description": "MCGate release tag to install (e.g. v0.1.0), or \"latest\". Reinstall the server to apply a change.",
+            "env_variable": "VERSION",
+            "default_value": "latest",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:30",
+            "field_type": "text"
+        },
+        {
+            "name": "Interactive Console",
+            "description": "Enable line editing/history in the console. Leave off under Pterodactyl: the panel's command box sends whole lines, which line editing can't follow.",
+            "env_variable": "MCGATE_INTERACTIVE_CONSOLE",
+            "default_value": "false",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:true,false",
+            "field_type": "text"
+        }
+    ]
+}
