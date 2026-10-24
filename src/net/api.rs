@@ -59,6 +59,11 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
         return Ok(());
     }
     let bind = cfg.api.bind_address()?;
+    if cfg.api.token.is_none() && !bind.ip().is_loopback() {
+        tracing::warn!(
+            "API on {bind} has no api.token - anyone who can reach it can add/replace/delete routes and list every player's IP. Set api.token or bind it to 127.0.0.1."
+        );
+    }
     let app = Router::new()
         .route("/", get(|| async { Redirect::temporary("/reference") }))
         .route("/reference", get(reference_handler))
