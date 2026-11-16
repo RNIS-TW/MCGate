@@ -21,3 +21,6 @@ log/
 
 # Runtime state written by mcgate.sh (pid file, backend marker, nohup output)
 .run/
+
+# Runtime connection database
+data/
