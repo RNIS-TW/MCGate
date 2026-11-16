@@ -597,3 +597,95 @@ fn silent_connections_are_closed_at_the_login_deadline() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Backend that answers a login with a Login Disconnect (0x00) whose text is the exact host
+/// string it received in the handshake, so the client can see what was forwarded.
+fn spawn_host_reporting_login_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let _length = read_var_int(&mut stream);
+                let _packet_id = read_var_int(&mut stream);
+                let _protocol = read_var_int(&mut stream);
+                let host_len = read_var_int(&mut stream) as usize;
+                let mut host_buf = vec![0u8; host_len];
+                stream.read_exact(&mut host_buf).unwrap();
+                let mut payload = Vec::new();
+                write_var_int(&mut payload, 0x00);
+                write_string(&mut payload, &format!(r#"{{"text":"{}"}}"#, String::from_utf8(host_buf).unwrap()));
+                let mut frame = Vec::new();
+                write_var_int(&mut frame, payload.len() as i32);
+                frame.extend_from_slice(&payload);
+                let _ = stream.write_all(&frame);
+            });
+        }
+    });
+    addr
+}
+
+/// Issue #8: 26.4+ clients that followed an SRV redirect send `<srv target>?_o=<typed host>:<port>`.
+/// MCGate must route on the typed host, and still forward the client's original handshake on login.
+#[test]
+fn routes_on_srv_origin_host_over_real_sockets() {
+    let dir = std::env::temp_dir().join(format!("mcgate-e2e-srvorigin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let status_backend = spawn_echoing_status_backend();
+    let login_backend = spawn_host_reporting_login_backend();
+    let mcgate_port = free_tcp_port();
+    let mcgate_addr: SocketAddr = format!("127.0.0.1:{mcgate_port}").parse().unwrap();
+    std::fs::write(
+        dir.join("config.yml"),
+        format!(
+            "config:\n  bind: \"127.0.0.1:{mcgate_port}\"\n  routes:\n    - host: \"survival.example.com\"\n      backend: \"127.0.0.1:{}\"\n    - host: \"creative.example.com\"\n      backend: \"127.0.0.1:{}\"\n",
+            status_backend.port(),
+            login_backend.port()
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("messages.yml"), "messages:\n  kickMessage: \"no backend\"\n").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_mcgate"))
+        .arg(dir.join("config.yml"))
+        .arg(dir.join("messages.yml"))
+        .current_dir(&dir)
+        .env("MCGATE_PLAIN_CONSOLE", "true")
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _process = McGateProcess { child };
+    wait_for_port(mcgate_addr);
+
+    // Status: routed by `_o`, and the backend is pinged with the typed host.
+    let survival = status_ping(mcgate_addr, 775, "gateway.example.net?_o=survival.example.com:25565");
+    assert!(survival.contains("motd-for-survival.example.com"), "{survival}");
+
+    // Login: routed by `_o` to the other route, backend gets the client's raw host string untouched.
+    let raw = "gateway.example.net?_o=creative.example.com:25565";
+    let mut stream = TcpStream::connect(mcgate_addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(&encode_handshake(775, raw, 25565, 2)).unwrap();
+    stream.write_all(&encode_login_start("Steve")).unwrap();
+    let _length = read_var_int(&mut stream);
+    let _packet_id = read_var_int(&mut stream);
+    let text_len = read_var_int(&mut stream) as usize;
+    let mut text = vec![0u8; text_len];
+    stream.read_exact(&mut text).unwrap();
+    let text = String::from_utf8(text).unwrap();
+    assert!(text.contains(raw), "backend did not get the original handshake host: {text}");
+
+    // Old client (no `_o`) hitting the SRV target directly: no route, connection closed.
+    let mut stream = TcpStream::connect(mcgate_addr).unwrap();
+    stream.write_all(&encode_handshake(775, "gateway.example.net", 25565, 2)).unwrap();
+    stream.write_all(&encode_login_start("Steve")).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(stream.read(&mut buf).unwrap_or(0), 0, "expected close for unrouted SRV target");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
