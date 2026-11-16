@@ -7,9 +7,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::protocol::varint::{read_var_int, VarIntError};
 
 /// Upper bound on a handshake frame's declared body length. A legitimate handshake is ~30-280
-/// bytes (the host field alone is capped at 255); this leaves a wide margin while still cutting
-/// off the slow-loris amplification vector of a declared-huge-frame-then-dribble attack.
-const MAX_HANDSHAKE_FRAME_BYTES: i32 = 512;
+/// bytes (the host field is capped at 1024 since 26.4's `?_o=` origin suffix); this leaves a margin
+/// while still cutting off the slow-loris amplification vector of a declared-huge-frame-then-dribble attack.
+const MAX_HANDSHAKE_FRAME_BYTES: i32 = 1100;
+const MAX_HOST_BYTES: i32 = 1024;
 
 #[derive(Debug)]
 pub enum HandshakeError {
@@ -110,7 +111,7 @@ pub(crate) fn try_parse(buf: &[u8]) -> ParseOutcome {
         Err(_) => return ParseOutcome::Malformed("bad host length".into()),
     };
     pos += consumed;
-    if !(0..=255).contains(&host_length) {
+    if !(0..=MAX_HOST_BYTES).contains(&host_length) {
         return ParseOutcome::Malformed(format!("bogus host length {host_length}"));
     }
     let host_length = host_length as usize;
@@ -127,6 +128,7 @@ pub(crate) fn try_parse(buf: &[u8]) -> ParseOutcome {
     if let Some(nul) = host.find('\0') {
         host.truncate(nul);
     }
+    host = routing_host(&host).to_owned();
     // Strip a trailing DNS root dot (e.g. "sv.xxx.com."), which some clients/launchers send.
     while host.ends_with('.') {
         host.pop();
@@ -142,6 +144,19 @@ pub(crate) fn try_parse(buf: &[u8]) -> ParseOutcome {
 
     let frame_end = header_len + length;
     ParseOutcome::Complete(Handshake { protocol_version, host, port, next_state, raw_frame: buf[..frame_end].to_vec() })
+}
+
+/// 26.4+ clients that followed an SRV redirect send `<srv target>?_o=<typed host>:<port>`; route on
+/// the typed host so many domains can share one SRV target. Falls back to the primary host.
+/// Client-controlled like the plain host field, so it is only a routing hint.
+fn routing_host(host: &str) -> &str {
+    let Some((primary, query)) = host.split_once('?') else { return host };
+    let origin = query.split('&').find_map(|kv| kv.strip_prefix("_o=")).unwrap_or("");
+    let origin = match origin.rsplit_once(':') {
+        Some((h, port)) if port.parse::<u16>().is_ok() => h,
+        _ => origin,
+    };
+    if origin.is_empty() { primary } else { origin }
 }
 
 #[cfg(test)]
@@ -212,6 +227,21 @@ mod tests {
         let mut cursor = Cursor::new(frame);
         let h = read_handshake(&mut cursor).await.unwrap();
         assert_eq!(h.host, "play.example.com");
+    }
+
+    #[test]
+    fn routes_on_srv_origin_host() {
+        let raw = "gateway.example.net?_o=survival.example.com.:25565";
+        let frame = encode_handshake(775, raw, 25570, 2);
+        let ParseOutcome::Complete(h) = try_parse(&frame) else { panic!("expected complete") };
+        assert_eq!(h.host, "survival.example.com");
+        assert_eq!(h.port, 25570);
+        assert_eq!(h.raw_frame, frame, "backend must still get the original handshake");
+        assert_eq!(routing_host("gw.net?_o="), "gw.net");
+        assert_eq!(routing_host("gw.net?x=1&_o=a.com"), "a.com");
+        assert_eq!(routing_host("gw.net?x=1"), "gw.net");
+        let long = format!("gw.net?_o={}.com:1", "a".repeat(900));
+        assert!(matches!(try_parse(&encode_handshake(775, &long, 1, 1)), ParseOutcome::Complete(_)));
     }
 
     #[tokio::test]
